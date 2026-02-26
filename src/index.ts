@@ -4,30 +4,30 @@
  * TUI-driven social knowledge extraction from Zulip.
  *
  * Usage:
- *   npm start
+ *   npm start                  # Ink TUI mode (requires TTY)
+ *   npm start -- --no-tui      # Readline mode (works in pipes/CI)
  *
  * Environment variables:
  *   ANTHROPIC_API_KEY   - Required
  *   ZULIP_MCP_CMD       - Path to Zulip MCP server (default: node ../zulip-mcp/build/index.js)
- *   ZULIPRC             - Path to .zuliprc file (for Zulip MCP)
+ *   ZULIP_RC_PATH       - Path to .zuliprc file (for Zulip MCP)
  *   MODEL               - Model to use (default: claude-sonnet-4-5-20250929)
  *   STORE_PATH          - Chronicle store path (default: ./data/store)
  */
 
 import 'dotenv/config';
-import React from 'react';
-import { render } from 'ink';
 import { Membrane, AnthropicAdapter, NativeFormatter } from 'membrane';
 import { AgentFramework, PassthroughStrategy } from '@connectome/agent-framework';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { App } from './tui/app.js';
 import { SYSTEM_PROMPT } from './prompts/system.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const noTui = process.argv.includes('--no-tui') || !process.stdin.isTTY;
 
 const config = {
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -43,11 +43,7 @@ if (!config.apiKey) {
   process.exit(1);
 }
 
-async function main() {
-  const adapter = new AnthropicAdapter({ apiKey: config.apiKey! });
-  const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
-
-  // Build env for Zulip MCP subprocess
+async function createFramework(membrane: Membrane) {
   const zulipEnv: Record<string, string> = {
     ENABLE_ZULIP: 'true',
     ENABLE_DISCORD: 'false',
@@ -85,10 +81,150 @@ async function main() {
     ],
   });
 
-  // Wire up the framework reference (chicken-and-egg: module needs framework, framework needs module)
   subagentModule.setFramework(framework);
+  return framework;
+}
 
-  framework.start();
+// ---------------------------------------------------------------------------
+// Readline mode (--no-tui)
+// ---------------------------------------------------------------------------
+
+async function runReadline(framework: AgentFramework) {
+  const { createInterface } = await import('node:readline');
+  const { handleCommand } = await import('./commands.js');
+
+  // Trace listener: stream tokens and tool calls to stdout
+  let inferenceActive = false;
+  let inferenceResolve: (() => void) | null = null;
+
+  framework.onTrace((event) => {
+    // Cast to access dynamic properties — TraceEvent is a discriminated union
+    // but tool/token events have extra fields beyond the base type
+    const e = event as unknown as Record<string, unknown>;
+    switch (event.type) {
+      case 'inference:started':
+        inferenceActive = true;
+        process.stdout.write('\n');
+        break;
+      case 'inference:tokens': {
+        const content = e.content as string;
+        if (content) process.stdout.write(content);
+        break;
+      }
+      case 'inference:completed':
+        process.stdout.write('\n');
+        inferenceActive = false;
+        inferenceResolve?.();
+        inferenceResolve = null;
+        break;
+      case 'inference:failed':
+        console.error(`\nError: ${e.error}`);
+        inferenceActive = false;
+        inferenceResolve?.();
+        inferenceResolve = null;
+        break;
+      case 'inference:tool_calls_yielded': {
+        const calls = e.calls as Array<{ name: string }>;
+        console.log(`\n[tools] ${calls.map(c => c.name).join(', ')}`);
+        break;
+      }
+      case 'inference:stream_resumed':
+        break;
+      case 'tool:started': {
+        const toolInput = e.input ? JSON.stringify(e.input) : '';
+        const truncated = toolInput.length > 120 ? toolInput.slice(0, 120) + '...' : toolInput;
+        console.log(`[tool] ${e.tool}${truncated ? ' ' + truncated : ''}`);
+        break;
+      }
+    }
+  });
+
+  /** Wait for any active inference to complete. */
+  function waitForInference(): Promise<void> {
+    if (!inferenceActive) return Promise.resolve();
+    return new Promise(resolve => { inferenceResolve = resolve; });
+  }
+
+  /** Process a single input line. Returns true if should quit. */
+  async function processLine(line: string): Promise<boolean> {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+
+    if (trimmed.startsWith('/')) {
+      const result = handleCommand(trimmed, framework);
+      if (result.quit) return true;
+      for (const l of result.lines) {
+        console.log(l.text);
+      }
+    } else {
+      framework.pushEvent({
+        type: 'external-message',
+        source: 'cli',
+        content: trimmed,
+        metadata: {},
+        triggerInference: true,
+      });
+      // Wait for inference to complete before processing next line
+      await waitForInference();
+    }
+    return false;
+  }
+
+  // If stdin is a pipe (not TTY), read all lines and process sequentially
+  if (!process.stdin.isTTY) {
+    const lines: string[] = [];
+    const rl = createInterface({ input: process.stdin });
+    for await (const line of rl) {
+      lines.push(line);
+    }
+
+    console.log(`Processing ${lines.length} commands...`);
+    for (const line of lines) {
+      console.log(`> ${line}`);
+      const quit = await processLine(line);
+      if (quit) break;
+    }
+
+    console.log('Done.');
+    await framework.stop();
+    return;
+  }
+
+  // Interactive TTY readline
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: '> ',
+  });
+
+  console.log('Zulip Knowledge App (readline mode). Type /help for commands.');
+  rl.prompt();
+
+  rl.on('line', async (line: string) => {
+    const quit = await processLine(line);
+    if (quit) {
+      rl.close();
+      return;
+    }
+    rl.prompt();
+  });
+
+  await new Promise<void>((resolve) => {
+    rl.on('close', resolve);
+  });
+
+  console.log('\nShutting down...');
+  await framework.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Ink TUI mode
+// ---------------------------------------------------------------------------
+
+async function runTui(framework: AgentFramework) {
+  const React = await import('react');
+  const { render } = await import('ink');
+  const { App } = await import('./tui/app.js');
 
   const { waitUntilExit } = render(React.createElement(App, { framework }));
 
@@ -96,6 +232,24 @@ async function main() {
     await waitUntilExit();
   } finally {
     await framework.stop();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const adapter = new AnthropicAdapter({ apiKey: config.apiKey! });
+  const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
+  const framework = await createFramework(membrane);
+
+  framework.start();
+
+  if (noTui) {
+    await runReadline(framework);
+  } else {
+    await runTui(framework);
   }
 }
 
