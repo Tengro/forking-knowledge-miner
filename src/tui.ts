@@ -10,43 +10,41 @@
  *   │  > input                    │  ← Fixed at row N (readline)
  *   └─────────────────────────────┘
  *
- * The scroll region means text written at the bottom pushes content up
- * naturally, like a normal terminal. Status bar and input stay fixed.
+ * Key insight: the cursor lives in the scroll region while tokens stream.
+ * We only jump out to redraw status bar / input, then jump back.
  */
 
-import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
+import { createInterface } from 'node:readline';
 import type { AgentFramework } from '@connectome/agent-framework';
 import type { SubagentModule, ActiveSubagent } from './modules/subagent-module.js';
 import { handleCommand } from './commands.js';
 
 // ANSI escape helpers
 const ESC = '\x1b[';
-const alt = (on: boolean) => ESC + (on ? '?1049h' : '?1049l');  // alternate screen
-const clear = () => ESC + '2J' + ESC + 'H';
-const scrollRegion = (top: number, bottom: number) => `${ESC}${top};${bottom}r`;
+const alt = (on: boolean) => ESC + (on ? '?1049h' : '?1049l');
+const clearScreen = () => ESC + '2J' + ESC + 'H';
+const setScrollRegion = (top: number, bottom: number) => `${ESC}${top};${bottom}r`;
 const moveTo = (row: number, col: number) => `${ESC}${row};${col}H`;
 const eraseLine = () => ESC + '2K';
-const sgr = (code: string) => `${ESC}${code}m`;
-const RESET = sgr('0');
-const DIM = sgr('2');
-const BOLD = sgr('1');
-const FG_GREEN = sgr('32');
-const FG_YELLOW = sgr('33');
-const FG_CYAN = sgr('36');
-const FG_MAGENTA = sgr('35');
-const FG_RED = sgr('31');
-const FG_GRAY = sgr('90');
-const SHOW_CURSOR = ESC + '?25h';
-const HIDE_CURSOR = ESC + '?25l';
-const SAVE_CURSOR = ESC + 's';
-const RESTORE_CURSOR = ESC + 'u';
+const RESET = `${ESC}0m`;
+const DIM = `${ESC}2m`;
+const BOLD = `${ESC}1m`;
+const FG_GREEN = `${ESC}32m`;
+const FG_YELLOW = `${ESC}33m`;
+const FG_CYAN = `${ESC}36m`;
+const FG_MAGENTA = `${ESC}35m`;
+const FG_RED = `${ESC}31m`;
+const FG_GRAY = `${ESC}90m`;
+const SAVE = `${ESC}s`;
+const RESTORE = `${ESC}u`;
+const SHOW_CURSOR = `${ESC}?25h`;
+const HIDE_CURSOR = `${ESC}?25l`;
 
 interface TuiState {
   status: string;
   tool: string | null;
   subagents: ActiveSubagent[];
   showSubagents: boolean;
-  inputBuffer: string;
 }
 
 export async function runTui(framework: AgentFramework): Promise<void> {
@@ -54,312 +52,300 @@ export async function runTui(framework: AgentFramework): Promise<void> {
   if (!stdout.isTTY) throw new Error('TUI requires a TTY');
 
   let rows = stdout.rows ?? 24;
-  let cols = stdout.columns ?? 80;
+  const scrollBot = () => rows - 2;
+  const statusLine = () => rows - 1;
+  const inputLine = () => rows;
 
   const state: TuiState = {
     status: 'idle',
     tool: null,
     subagents: [],
     showSubagents: false,
-    inputBuffer: '',
   };
 
-  // Track whether we're mid-stream (tokens flowing) to know whether to newline
   let streaming = false;
 
-  // -- Layout calculation --
-  const statusRow = () => rows - 1;
-  const inputRow = () => rows;
-  const scrollBottom = () => rows - 2;
+  // ── Screen setup ──────────────────────────────────────────────────────
 
-  // -- Screen setup --
-  function setupScreen() {
-    stdout.write(alt(true));        // alternate screen
-    stdout.write(clear());
-    stdout.write(scrollRegion(1, scrollBottom()));
-    drawStatusBar();
-    drawInputLine();
+  function initScreen() {
+    stdout.write(alt(true));
+    stdout.write(clearScreen());
+    stdout.write(setScrollRegion(1, scrollBot()));
+    // Park cursor at bottom of scroll region
+    stdout.write(moveTo(scrollBot(), 1));
+    redrawFooter();
   }
 
-  function teardownScreen() {
-    stdout.write(scrollRegion(1, rows)); // reset scroll region
-    stdout.write(alt(false));            // back to main screen
+  function destroyScreen() {
+    stdout.write(setScrollRegion(1, rows));
+    stdout.write(alt(false));
   }
 
-  // -- Writing to scroll region --
-  // Positions cursor in the scroll region and writes. Text naturally scrolls up.
-  function writeToScroll(text: string) {
-    stdout.write(SAVE_CURSOR + HIDE_CURSOR);
-    stdout.write(moveTo(scrollBottom(), 1));  // bottom of scroll region
-    stdout.write(text);
-    stdout.write(RESTORE_CURSOR + SHOW_CURSOR);
-  }
+  // ── Footer (status + input) ───────────────────────────────────────────
+  // Drawn outside the scroll region so it never scrolls.
 
-  function scrollWrite(text: string, style?: string) {
-    const prefix = style ?? '';
-    const suffix = style ? RESET : '';
-    // Ensure previous line is terminated
-    writeToScroll('\n' + prefix + text + suffix);
-  }
+  function redrawFooter() {
+    stdout.write(SAVE + HIDE_CURSOR);
 
-  function scrollWriteRaw(text: string) {
-    // Write raw text into scroll region (for streaming tokens)
-    writeToScroll(text);
-  }
-
-  // -- Status bar --
-  function drawStatusBar() {
-    stdout.write(SAVE_CURSOR + HIDE_CURSOR);
-    stdout.write(moveTo(statusRow(), 1) + eraseLine());
-
-    const statusColor = state.status === 'idle' ? FG_GREEN
-      : state.status === 'error' ? FG_RED
-      : FG_YELLOW;
-
-    let bar = `${FG_GRAY}[${RESET}${statusColor}${state.status}${RESET}`;
+    // Status bar
+    stdout.write(moveTo(statusLine(), 1) + eraseLine());
+    const sColor = state.status === 'idle' ? FG_GREEN
+      : state.status === 'error' ? FG_RED : FG_YELLOW;
+    let bar = `${FG_GRAY}[${RESET}${sColor}${state.status}${RESET}`;
     if (state.tool) bar += `${FG_YELLOW} | ${state.tool}${RESET}`;
-
     const running = state.subagents.filter(s => s.status === 'running').length;
     if (running > 0) {
-      bar += `${FG_MAGENTA} | ${running} subagent${running > 1 ? 's' : ''}${RESET}`;
-      if (!state.showSubagents) bar += `${FG_GRAY}${DIM} Tab: details${RESET}`;
+      bar += `${FG_MAGENTA} | ${running} sub${RESET}`;
+      if (state.showSubagents) {
+        const details = state.subagents
+          .filter(s => s.status === 'running')
+          .map(s => {
+            const t = Math.floor((Date.now() - s.startedAt) / 1000);
+            const msg = s.statusMessage ? ` ${s.statusMessage}` : '';
+            return `${FG_CYAN}${s.name}${FG_GRAY}(${t}s${msg})${RESET}`;
+          }).join(' ');
+        bar += ' ' + details;
+      } else {
+        bar += `${DIM}${FG_GRAY} Tab:details${RESET}`;
+      }
     }
-
     bar += `${FG_GRAY}]${RESET}`;
+    stdout.write(bar);
 
-    // Subagent details (inline, after the bar)
-    if (state.showSubagents && state.subagents.length > 0) {
-      const details = state.subagents
-        .filter(s => s.status === 'running')
-        .map(s => {
-          const elapsed = Math.floor((Date.now() - s.startedAt) / 1000);
-          const msg = s.statusMessage ? `: ${s.statusMessage}` : '';
-          return `${FG_CYAN}${s.name}${RESET}${FG_GRAY}(${elapsed}s${msg})${RESET}`;
-        })
-        .join(' ');
-      if (details) bar += ' ' + details;
+    // Input line
+    stdout.write(moveTo(inputLine(), 1) + eraseLine());
+    stdout.write(`${BOLD}${FG_CYAN}> ${RESET}`);
+
+    stdout.write(RESTORE + SHOW_CURSOR);
+  }
+
+  // ── Scroll region writing ─────────────────────────────────────────────
+  // These all assume cursor is parked inside the scroll region.
+
+  /** Write a complete line into the scroll region with a preceding newline. */
+  function printLine(text: string, style?: string) {
+    stdout.write(SAVE + HIDE_CURSOR);
+    // Move to bottom of scroll region — newline will scroll up
+    stdout.write(moveTo(scrollBot(), 1));
+    stdout.write('\n');
+    if (style) stdout.write(style);
+    stdout.write(text);
+    if (style) stdout.write(RESET);
+    stdout.write(RESTORE + SHOW_CURSOR);
+  }
+
+  // Track the scroll-region cursor column so we can resume streaming mid-line.
+  // The terminal maintains its own scroll cursor; we track it to know where to moveTo.
+  let scrollRow = 1;
+  let scrollCol = 1;
+
+  /** Start streaming: insert a newline in the scroll region. */
+  function beginStream() {
+    stdout.write(SAVE + HIDE_CURSOR);
+    stdout.write(moveTo(scrollBot(), 1) + '\n');
+    scrollRow = scrollBot();
+    scrollCol = 1;
+    stdout.write(RESTORE + SHOW_CURSOR);
+    streaming = true;
+  }
+
+  /** Write a token fragment into the scroll region, then return cursor to input line. */
+  function streamToken(text: string) {
+    stdout.write(SAVE + HIDE_CURSOR);
+    stdout.write(moveTo(scrollRow, scrollCol));
+    stdout.write(text);
+
+    // Track cursor position — count characters, handle newlines and wraps
+    const cols = stdout.columns ?? 80;
+    for (const ch of text) {
+      if (ch === '\n') {
+        scrollCol = 1;
+        // If at bottom of scroll region, content scrolled up (row stays)
+        // If not at bottom, move down
+        if (scrollRow < scrollBot()) scrollRow++;
+      } else {
+        scrollCol++;
+        if (scrollCol > cols) {
+          scrollCol = 1;
+          if (scrollRow < scrollBot()) scrollRow++;
+        }
+      }
     }
 
-    stdout.write(bar);
-    stdout.write(RESTORE_CURSOR + SHOW_CURSOR);
+    stdout.write(RESTORE + SHOW_CURSOR);
   }
 
-  // -- Input line --
-  function drawInputLine() {
-    stdout.write(SAVE_CURSOR + HIDE_CURSOR);
-    stdout.write(moveTo(inputRow(), 1) + eraseLine());
-    stdout.write(`${BOLD}${FG_CYAN}> ${RESET}`);
-    stdout.write(RESTORE_CURSOR + SHOW_CURSOR);
+  /** End streaming. */
+  function endStream() {
+    streaming = false;
   }
 
-  // -- Trace listener --
+  // ── Trace listener ────────────────────────────────────────────────────
+
   function onTrace(event: Record<string, unknown>) {
+    const agent = event.agentName as string | undefined;
+
     switch (event.type) {
       case 'inference:started': {
-        const agent = event.agentName as string;
-        // Only show newline for main agent, subagent starts are quieter
         if (agent === 'researcher') {
           state.status = 'thinking';
-          streaming = true;
-          scrollWrite('', undefined); // blank line before response
-        } else {
-          // Subagent started — update status
-          const sa = state.subagents.find(s => s.name === agent || `spawn-${s.name}` === agent || `fork-${s.name}` === agent);
-          if (sa) sa.statusMessage = 'thinking';
+          beginStream();
+          redrawFooter();
         }
-        drawStatusBar();
         break;
       }
 
       case 'inference:tokens': {
         const content = event.content as string;
-        const agent = event.agentName as string;
-        if (content && agent === 'researcher') {
-          scrollWriteRaw(content);
+        if (content && agent === 'researcher' && streaming) {
+          streamToken(content);
         }
-        // Subagent tokens are silent in the main scroll — they report results
         break;
       }
 
       case 'inference:completed': {
-        const agent = event.agentName as string;
         if (agent === 'researcher') {
           state.status = 'idle';
           state.tool = null;
-          if (streaming) {
-            streaming = false;
-            scrollWriteRaw('\n');
-          }
+          if (streaming) endStream();
+          redrawFooter();
         }
-        drawStatusBar();
         break;
       }
 
       case 'inference:failed': {
-        const err = event.error as string;
-        const agent = event.agentName as string;
         if (agent === 'researcher') {
           state.status = 'error';
-          streaming = false;
-          scrollWrite(`Error: ${err}`, FG_RED);
+          if (streaming) endStream();
+          printLine(`Error: ${event.error}`, FG_RED);
+          redrawFooter();
         } else {
-          scrollWrite(`[${agent}] Error: ${err}`, FG_RED + DIM);
+          printLine(`[${agent}] Error: ${event.error}`, FG_RED + DIM);
         }
-        drawStatusBar();
         break;
       }
 
       case 'inference:tool_calls_yielded': {
         const calls = event.calls as Array<{ name: string }>;
-        const agent = event.agentName as string;
         const names = calls.map(c => c.name).join(', ');
 
         if (agent === 'researcher') {
           state.status = 'tools';
           state.tool = names;
-          if (streaming) {
-            streaming = false;
-            scrollWriteRaw('\n');
-          }
-          scrollWrite(`[tools] ${names}`, FG_YELLOW + DIM);
+          if (streaming) endStream();
+          printLine(`[tools] ${names}`, FG_YELLOW + DIM);
         } else {
-          // Subagent tool call — show dimmed
-          const shortAgent = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '');
-          scrollWrite(`  [${shortAgent}] ${names}`, FG_GRAY);
-          const sa = state.subagents.find(s =>
-            agent.includes(s.name)
-          );
+          // Subagent tool call
+          const short = (agent ?? '').replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '');
+          printLine(`  [${short}] ${names}`, FG_GRAY);
+          const sa = state.subagents.find(s => (agent ?? '').includes(s.name));
           if (sa) {
             sa.toolCallsCount += calls.length;
             sa.statusMessage = names.split(':').pop();
           }
         }
-        drawStatusBar();
+        redrawFooter();
         break;
       }
 
       case 'inference:stream_resumed': {
-        const agent = event.agentName as string;
         if (agent === 'researcher') {
           state.status = 'thinking';
           state.tool = null;
-          streaming = true;
+          beginStream();
+          redrawFooter();
         }
-        drawStatusBar();
         break;
       }
 
       case 'tool:started': {
-        const tool = event.tool as string;
-        const agent = event.agentName as string;
         if (agent === 'researcher') {
-          state.tool = tool;
-          drawStatusBar();
+          state.tool = event.tool as string;
+          redrawFooter();
         }
         break;
       }
     }
   }
 
-  // -- Subagent polling --
-  const subagentModule = framework.getAllModules().find(m => m.name === 'subagent') as SubagentModule | undefined;
-  const pollInterval = setInterval(() => {
-    if (subagentModule) {
-      state.subagents = [...subagentModule.activeSubagents.values()];
-      drawStatusBar();
+  // ── Subagent polling ──────────────────────────────────────────────────
+
+  const subMod = framework.getAllModules().find(m => m.name === 'subagent') as SubagentModule | undefined;
+  const pollTimer = setInterval(() => {
+    if (subMod) {
+      state.subagents = [...subMod.activeSubagents.values()];
+      redrawFooter();
     }
   }, 500);
 
-  // -- Resize handler --
+  // ── Resize ────────────────────────────────────────────────────────────
+
   function onResize() {
     rows = stdout.rows ?? 24;
-    cols = stdout.columns ?? 80;
-    stdout.write(scrollRegion(1, scrollBottom()));
-    drawStatusBar();
-    drawInputLine();
+    stdout.write(setScrollRegion(1, scrollBot()));
+    redrawFooter();
   }
   stdout.on('resize', onResize);
 
-  // -- Readline setup --
-  // We use readline in raw-ish mode but positioned on the input row
+  // ── Input ─────────────────────────────────────────────────────────────
+
   stdin.setRawMode(true);
-  const rl = createInterface({
-    input: stdin,
-    output: stdout,
-    prompt: '',
-    terminal: true,
-  });
+  const rl = createInterface({ input: stdin, output: stdout, prompt: '', terminal: true });
 
-  // Position readline's cursor on the input row
-  function positionInput() {
-    stdout.write(moveTo(inputRow(), 3)); // after "> "
-  }
-
-  // -- Screen init --
-  setupScreen();
-  scrollWrite('Zulip Knowledge App. Type /help for commands.', FG_GRAY);
-  positionInput();
-
-  // -- Trace registration --
-  framework.onTrace(onTrace as (e: unknown) => void);
-
-  // -- Input handling --
-  // Tab key for subagent panel toggle — need to intercept before readline
+  // Tab interceptor
   stdin.on('data', (data: Buffer) => {
-    if (data[0] === 0x09) { // Tab
+    if (data[0] === 0x09) {
       state.showSubagents = !state.showSubagents;
-      drawStatusBar();
+      redrawFooter();
     }
   });
 
+  // ── Init ──────────────────────────────────────────────────────────────
+
+  initScreen();
+  printLine('Zulip Knowledge App. Type /help for commands.', FG_GRAY);
+  // Position cursor on input line for readline
+  stdout.write(moveTo(inputLine(), 3));
+
+  framework.onTrace(onTrace as (e: unknown) => void);
+
   rl.on('line', (line: string) => {
     const trimmed = line.trim();
-    drawInputLine();
-    positionInput();
+    // Redraw input line (readline messes it up)
+    redrawFooter();
+    stdout.write(moveTo(inputLine(), 3));
 
     if (!trimmed) return;
 
     if (trimmed.startsWith('/')) {
       const result = handleCommand(trimmed, framework);
-      if (result.quit) {
-        rl.close();
-        return;
-      }
+      if (result.quit) { rl.close(); return; }
       if (trimmed === '/clear') {
-        stdout.write(SAVE_CURSOR);
-        stdout.write(scrollRegion(1, scrollBottom()));
-        // Clear the scroll region
-        for (let i = 1; i <= scrollBottom(); i++) {
+        // Clear scroll region
+        for (let i = 1; i <= scrollBot(); i++) {
           stdout.write(moveTo(i, 1) + eraseLine());
         }
-        stdout.write(RESTORE_CURSOR);
+        stdout.write(moveTo(inputLine(), 3));
       } else {
-        for (const l of result.lines) {
-          scrollWrite(l.text, FG_GRAY);
-        }
+        for (const l of result.lines) printLine(l.text, FG_GRAY);
       }
     } else {
-      scrollWrite(`You: ${trimmed}`, FG_GREEN);
+      printLine(`You: ${trimmed}`, FG_GREEN);
       framework.pushEvent({
-        type: 'external-message',
-        source: 'tui',
-        content: trimmed,
-        metadata: {},
-        triggerInference: true,
+        type: 'external-message', source: 'tui',
+        content: trimmed, metadata: {}, triggerInference: true,
       });
     }
-    positionInput();
+    stdout.write(moveTo(inputLine(), 3));
   });
 
-  // -- Wait for exit --
-  await new Promise<void>((resolve) => {
-    rl.on('close', resolve);
-  });
+  // ── Wait for exit ─────────────────────────────────────────────────────
 
-  // -- Cleanup --
-  clearInterval(pollInterval);
+  await new Promise<void>(resolve => rl.on('close', resolve));
+
+  clearInterval(pollTimer);
   stdout.removeListener('resize', onResize);
   framework.offTrace(onTrace as (e: unknown) => void);
-  teardownScreen();
+  destroyScreen();
   await framework.stop();
 }
