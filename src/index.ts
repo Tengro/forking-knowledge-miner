@@ -199,7 +199,7 @@ async function main() {
     await runPiped(framework);
   } else {
     const { runTui } = await import('./tui.js');
-    await runTui(framework);
+    await runTui(framework, membrane);
   }
 }
 

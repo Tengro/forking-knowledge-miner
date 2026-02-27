@@ -382,7 +382,7 @@ export class SubagentModule implements Module {
   }
 
   private async runFork(input: ForkInput): Promise<SubagentResult> {
-    const agentName = `fork-${input.name}-${Date.now()}`;
+    const agentName = input.name;
     const entry: ActiveSubagent = {
       name: input.name, type: 'fork', task: input.task,
       status: 'running', startedAt: Date.now(), toolCallsCount: 0, findingsCount: 0,
@@ -408,12 +408,14 @@ export class SubagentModule implements Module {
     });
 
     try {
-      // Copy parent's messages into the fork's context
+      // Copy parent's messages into the fork's context, remapping the parent's
+      // assistant participant name to the fork's name so Membrane maps roles correctly.
       if (parentAgent) {
         const parentCM = parentAgent.getContextManager();
         const { messages } = parentCM.queryMessages({});
         for (const msg of messages) {
-          contextManager.addMessage(msg.participant, msg.content, msg.metadata);
+          const participant = msg.participant === parentAgent.name ? agentName : msg.participant;
+          contextManager.addMessage(participant, msg.content, msg.metadata);
         }
       }
 

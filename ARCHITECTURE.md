@@ -14,8 +14,8 @@ A TUI-driven application that points an LLM agent at Zulip conversations to extr
 
 ```
                          ┌──────────────┐
-                         │   ANSI TUI   │  readline input, scroll region,
-                         │   (tui.ts)   │  status bar, streaming tokens
+                         │   OpenTUI    │  ScrollBox, TextRenderable,
+                         │   (tui.ts)   │  InputRenderable, status bar
                          └──────┬───────┘
                                 │ pushEvent('external-message')
                          ┌──────┴───────┐
@@ -75,13 +75,28 @@ zulip-app/
 
 Built on [OpenTUI](https://github.com/anomalyco/opentui) (`@opentui/core`) — the same terminal UI library that powers OpenCode. Requires the Bun runtime.
 
-**Layout**: `ScrollBoxRenderable` (conversation, flexGrow, stickyScroll) + `BoxRenderable` (status bar, height=1) + `InputRenderable` (user input). OpenTUI handles all terminal rendering, cursor management, and input isolation.
+**Layout**:
+```
+┌─────────────────────────────────────────────────────┐
+│  ScrollBoxRenderable (flexGrow, stickyScroll)       │
+│  └─ TextRenderable per message/stream chunk         │
+├──────────────────────────────────────┬──────────────┤
+│  [✓ idle | tool | N sub]            │ 1.2kin 0.5kout│
+├──────────────────────────────────────┴──────────────┤
+│  InputRenderable                                    │
+└─────────────────────────────────────────────────────┘
+```
 
-**Status bar**: `[status | tool_name | N sub]` — shows agent state, current tool, active subagent count. Tab toggles inline subagent detail.
+- **Conversation area**: `ScrollBoxRenderable` with `stickyScroll: true` — auto-scrolls as content is added. Each message or tool notification is a `TextRenderable` child node.
+- **Status bar**: Two `TextRenderable` nodes in a `BoxRenderable` with `justifyContent: 'space-between'`. Left side shows agent state, current tool, and subagent count. Right side shows cumulative token usage across the session (all agents).
+- **Input**: `InputRenderable` with `ENTER` event for submitting messages and commands.
+- **Keyboard**: Tab toggles subagent details in the status bar. Ctrl-C exits.
 
-**Streaming**: Tokens arrive via `inference:tokens` trace events and are appended to a `TextRenderable.content` string. OpenTUI re-renders automatically.
+**Streaming**: Tokens arrive via `inference:tokens` trace events. A plain string buffer tracks accumulated text and assigns the full string to `TextRenderable.content` each time (the `.content` property is a `StyledText` object, not a string — `+=` would break).
 
-**Dual mode**: If stdout is not a TTY (piped/CI), falls back to a plain readline loop with `waitForInference` promise gating (no OpenTUI dependency on this path).
+**Token tracking**: Every `inference:completed` trace event (researcher + all subagents) adds to a session-wide counter tracking input tokens, output tokens, cache reads, and cache writes. Displayed compactly: `1.2kin 0.5kout 3.4kcache`.
+
+**Dual mode**: If stdout is not a TTY (piped/CI), falls back to a plain readline loop with `waitForInference` promise gating. No OpenTUI dependency on this path.
 
 ### Subagent Module (`subagent-module.ts`)
 
@@ -185,7 +200,6 @@ const framework = await AgentFramework.create({
     name: 'researcher',
     model: 'claude-opus-4-20250514',
     systemPrompt: SYSTEM_PROMPT,
-    maxTokens: 8192,
     strategy: new PassthroughStrategy(),
   }],
   modules: [tuiModule, subagentModule, lessonsModule, retrievalModule],
@@ -234,7 +248,7 @@ bun --watch src/index.ts
 | `@connectome/context-manager` | `../context-manager` |
 | `chronicle` | `../chronicle` (Rust + N-API bindings) |
 | `membrane` | `../membrane` |
-| `@opentui/core` | npm (native Zig terminal UI) |
+| `@opentui/core` | npm (native Zig terminal UI, powers OpenCode) |
 | `zulip-mcp` | `../zulip-mcp` (cloned from `antra-tess/zulip_mcp`) |
 
 ## Status
@@ -244,6 +258,7 @@ bun --watch src/index.ts
 | Scaffold + bootstrap | Done |
 | Zulip MCP integration | Done |
 | OpenTUI TUI (streaming, status bar, input) | Done |
+| Token usage tracking (session-wide) | Done |
 | Piped/CI mode | Done |
 | Subagent spawn/fork/launch/wait | Done |
 | Lessons CRUD + persistence | Done |
@@ -255,14 +270,14 @@ bun --watch src/index.ts
 | KnowledgeStrategy (context compression) | Not started |
 | Tests | Not started |
 
-## Commit History
+## TUI Evolution
 
-```
-595c10c Fix streaming token rendering + allow typing during inference
-f4ff6e7 Replace Ink/React TUI with custom ANSI terminal
-2a06353 Subagents now run through the framework event loop
-3aea685 Fix TUI rendering interleave, add Tab-togglable subagent panel
-295bc21 Fix agent not responding: add TuiModule for message routing
-6927b6d Add --no-tui readline mode for piped/CI usage
-44c42ea Initial scaffold: TUI knowledge extraction app for Zulip
-```
+1. **Ink/React** — first attempt, clunky rendering, interleaved output
+2. **Custom ANSI** — raw escape sequences, cursor tracking; fixed interleave but letters disappeared during typing
+3. **OpenTUI** — production-quality terminal rendering (Zig core), handles cursor/input/scroll natively
+
+## Gotchas
+
+- **`TextRenderable.content` is a `StyledText` object**, not a string. Using `+=` silently breaks (stringifies as `[object Object]`). Always track text in a plain string buffer and assign the full string via `=`.
+- **Bun auto-loads `.env`** — no `dotenv` package needed.
+- **`child_process.spawn`** works in Bun (needed for MCPL server connections to zulip-mcp).

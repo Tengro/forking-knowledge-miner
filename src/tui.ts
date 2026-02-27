@@ -10,6 +10,9 @@
  *   ├─────────────────────────────┤
  *   │  InputRenderable            │  ← user input
  *   └─────────────────────────────┘
+ *
+ * Tab toggles between conversation and agent fleet tree view.
+ * Fleet view uses a single TextRenderable (no child churn).
  */
 
 import {
@@ -25,6 +28,7 @@ import {
   fg,
 } from '@opentui/core';
 import type { AgentFramework } from '@connectome/agent-framework';
+import type { Membrane, NormalizedRequest } from 'membrane';
 import type { SubagentModule, ActiveSubagent } from './modules/subagent-module.js';
 import { handleCommand } from './commands.js';
 
@@ -32,11 +36,19 @@ import { handleCommand } from './commands.js';
 // State
 // ---------------------------------------------------------------------------
 
+interface TokenUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
 interface TuiState {
   status: string;
   tool: string | null;
   subagents: ActiveSubagent[];
-  showSubagents: boolean;
+  viewMode: 'chat' | 'fleet';
+  tokens: TokenUsage;
 }
 
 // ---------------------------------------------------------------------------
@@ -56,14 +68,18 @@ const WHITE = '#cccccc';
 // Main
 // ---------------------------------------------------------------------------
 
-export async function runTui(framework: AgentFramework): Promise<void> {
+export async function runTui(framework: AgentFramework, membrane: Membrane): Promise<void> {
   const renderer = await createCliRenderer({ exitOnCtrlC: false });
+
+  // Set terminal title
+  process.stdout.write('\x1b]0;Zulip Knowledge Miner\x07');
 
   const state: TuiState = {
     status: 'idle',
     tool: null,
     subagents: [],
-    showSubagents: false,
+    viewMode: 'chat',
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   };
 
   let streaming = false;
@@ -85,16 +101,41 @@ export async function runTui(framework: AgentFramework): Promise<void> {
     stickyScroll: true,
   });
 
-  const statusBar = new TextRenderable(renderer, {
-    id: 'status',
-    content: formatStatusBar(state),
+  // Fleet view: a Box containing a single TextRenderable whose content is rebuilt.
+  // Using a Box wrapper so we can toggle .visible without layout issues.
+  const fleetText = new TextRenderable(renderer, {
+    id: 'fleet-text',
+    content: '',
     fg: GRAY,
+  });
+  const fleetBox = new BoxRenderable(renderer, {
+    id: 'fleet',
+    flexGrow: 1,
+    flexDirection: 'column',
+    paddingLeft: 1,
+    paddingTop: 1,
+  });
+  fleetBox.add(fleetText);
+
+  const statusLeft = new TextRenderable(renderer, {
+    id: 'status-left',
+    content: formatStatusLeft(state),
+    fg: GRAY,
+  });
+
+  const statusRight = new TextRenderable(renderer, {
+    id: 'status-right',
+    content: formatTokens(state.tokens),
+    fg: DIM_GRAY,
   });
 
   const statusBox = new BoxRenderable(renderer, {
     id: 'status-box',
     height: 1,
     paddingLeft: 1,
+    paddingRight: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
   });
 
   const input = new InputRenderable(renderer, {
@@ -108,15 +149,73 @@ export async function runTui(framework: AgentFramework): Promise<void> {
     paddingLeft: 1,
   });
 
-  // Assembly
-  statusBox.add(statusBar);
+  // Assembly — both views always present; fleet starts hidden
+  statusBox.add(statusLeft);
+  statusBox.add(statusRight);
   inputBox.add(input);
   rootBox.add(scrollBox);
+  rootBox.add(fleetBox);
+  fleetBox.visible = false;
   rootBox.add(statusBox);
   rootBox.add(inputBox);
   renderer.root.add(rootBox);
 
   input.focus();
+
+  // ── Agent stream transcripts & synesthete summaries ────────────────
+
+  /** Accumulated transcript per agent (text output + tool calls). */
+  const agentTranscripts = new Map<string, string>();
+
+  /** Synesthete summary per agent, keyed by agent name. */
+  const summaryCache = new Map<string, string>();
+  /** Transcript length at time of last summary generation. */
+  const summarySnapshotLen = new Map<string, number>();
+  const summaryPending = new Set<string>();
+
+  /** Minimum transcript growth before re-summarizing. */
+  const SUMMARY_DELTA = 2000;
+  /** Max transcript chars to send to Haiku. */
+  const SUMMARY_WINDOW = 10_000;
+
+  function appendTranscript(agent: string, text: string) {
+    const prev = agentTranscripts.get(agent) ?? '';
+    agentTranscripts.set(agent, prev + text);
+  }
+
+  async function generateSummary(agentName: string) {
+    if (summaryPending.has(agentName)) return;
+    const transcript = agentTranscripts.get(agentName);
+    if (!transcript || transcript.length < 50) return;
+
+    // Only re-summarize if transcript has grown enough
+    const lastLen = summarySnapshotLen.get(agentName) ?? 0;
+    if (transcript.length - lastLen < SUMMARY_DELTA && summaryCache.has(agentName)) return;
+
+    summaryPending.add(agentName);
+    try {
+      const window = transcript.slice(-SUMMARY_WINDOW);
+      const request: NormalizedRequest = {
+        messages: [{
+          participant: 'user',
+          content: [{ type: 'text', text: `Here is the recent activity stream of an AI agent:\n\n${window}\n\nDescribe what this agent is currently doing in a single concise sentence (max 80 chars). Be specific about the content, not the mechanics.` }],
+        }],
+        system: 'You are a synesthete observer. You perceive an agent\'s stream of work and distill it into a vivid, concise status line. Be specific and evocative. One sentence only.',
+        config: { model: 'claude-haiku-4-5-20251001', maxTokens: 80, temperature: 0.3 },
+      };
+      const response = await membrane.complete(request);
+      const text = response.content
+        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        .map(b => b.text).join('').trim();
+      summaryCache.set(agentName, text);
+      summarySnapshotLen.set(agentName, transcript.length);
+      if (state.viewMode === 'fleet') updateFleetView();
+    } catch {
+      // Summary generation is best-effort
+    } finally {
+      summaryPending.delete(agentName);
+    }
+  }
 
   // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -132,7 +231,8 @@ export async function runTui(framework: AgentFramework): Promise<void> {
   }
 
   function updateStatus() {
-    statusBar.content = formatStatusBar(state);
+    statusLeft.content = formatStatusLeft(state);
+    statusRight.content = formatTokens(state.tokens);
   }
 
   function beginStream() {
@@ -159,6 +259,87 @@ export async function runTui(framework: AgentFramework): Promise<void> {
     currentStreamBuffer = '';
   }
 
+  // ── Fleet tree view ────────────────────────────────────────────────
+
+  function updateFleetView() {
+    const lines: string[] = [];
+
+    lines.push('─── Agent Fleet ───────────────────────────');
+    lines.push('');
+
+    // Researcher (root of tree)
+    const resStatus = state.status === 'idle' ? '✓ idle'
+      : state.status === 'error' ? '✗ error'
+      : `… ${state.status}`;
+    lines.push(`  researcher                          [${resStatus}]`);
+    if (state.tool) {
+      lines.push(`  │  tool: ${state.tool}`);
+    }
+    const resSummary = summaryCache.get('researcher');
+    if (resSummary) {
+      lines.push(`  │  ┈ ${resSummary}`);
+    }
+    generateSummary('researcher');
+
+    const running = state.subagents.filter(s => s.status === 'running');
+    const completed = state.subagents.filter(s => s.status !== 'running');
+    const all = [...running, ...completed];
+
+    if (all.length === 0) {
+      lines.push('');
+      lines.push('  (no subagents)');
+    }
+
+    all.forEach((s, i) => {
+      const isLast = i === all.length - 1;
+      const branch = isLast ? '└─' : '├─';
+      const cont = isLast ? '   ' : '│  ';
+
+      const elapsed = Math.floor((Date.now() - s.startedAt) / 1000);
+      let tag: string;
+      if (s.status === 'running') {
+        tag = `running ${elapsed}s`;
+      } else if (s.status === 'completed') {
+        tag = `done ${elapsed}s`;
+      } else {
+        tag = 'failed';
+      }
+
+      lines.push('  │');
+      lines.push(`  ${branch} ${s.name}  ${s.type}                [${tag}]`);
+      lines.push(`  ${cont}  task: ${s.task}`);
+
+      if (s.statusMessage) {
+        lines.push(`  ${cont}  tool: ${s.statusMessage} (${s.toolCallsCount} calls)`);
+      }
+
+      // Synesthete summary — match full agent name from transcripts
+      const fullName = [...agentTranscripts.keys()].find(k => k.includes(s.name));
+      if (fullName) {
+        const summary = summaryCache.get(fullName);
+        if (summary) {
+          lines.push(`  ${cont}  ┈ ${summary}`);
+        } else if (summaryPending.has(fullName)) {
+          lines.push(`  ${cont}  ┈ …`);
+        }
+        generateSummary(fullName);
+      }
+    });
+
+    lines.push('');
+    lines.push('                                  Tab: back to chat');
+
+    fleetText.content = lines.join('\n');
+  }
+
+  function switchView(mode: 'chat' | 'fleet') {
+    state.viewMode = mode;
+    scrollBox.visible = mode === 'chat';
+    fleetBox.visible = mode === 'fleet';
+    if (mode === 'fleet') updateFleetView();
+    input.focus();
+  }
+
   // ── Trace listener ──────────────────────────────────────────────────
 
   function onTrace(event: Record<string, unknown>) {
@@ -176,19 +357,31 @@ export async function runTui(framework: AgentFramework): Promise<void> {
 
       case 'inference:tokens': {
         const content = event.content as string;
-        if (content && agent === 'researcher' && streaming) {
-          streamToken(content);
+        if (content) {
+          if (agent === 'researcher' && streaming) {
+            streamToken(content);
+          }
+          if (agent) appendTranscript(agent, content);
         }
         break;
       }
 
       case 'inference:completed': {
+        // Track tokens for all agents (researcher + subagents)
+        const usage = event.tokenUsage as { input?: number; output?: number; cacheRead?: number; cacheCreation?: number } | undefined;
+        if (usage) {
+          state.tokens.input += usage.input ?? 0;
+          state.tokens.output += usage.output ?? 0;
+          state.tokens.cacheRead += usage.cacheRead ?? 0;
+          state.tokens.cacheWrite += usage.cacheCreation ?? 0;
+        }
+
         if (agent === 'researcher') {
           state.status = 'idle';
           state.tool = null;
           if (streaming) endStream();
-          updateStatus();
         }
+        updateStatus();
         break;
       }
 
@@ -205,8 +398,16 @@ export async function runTui(framework: AgentFramework): Promise<void> {
       }
 
       case 'inference:tool_calls_yielded': {
-        const calls = event.calls as Array<{ name: string }>;
+        const calls = event.calls as Array<{ name: string; input?: unknown }>;
         const names = calls.map(c => c.name).join(', ');
+
+        if (agent) {
+          const toolSnippet = calls.map(c => {
+            const inp = c.input ? JSON.stringify(c.input) : '';
+            return `[tool: ${c.name}${inp ? ' ' + inp.slice(0, 200) : ''}]`;
+          }).join('\n');
+          appendTranscript(agent, '\n' + toolSnippet + '\n');
+        }
 
         if (agent === 'researcher') {
           state.status = 'tools';
@@ -253,6 +454,7 @@ export async function runTui(framework: AgentFramework): Promise<void> {
     if (subMod) {
       state.subagents = [...subMod.activeSubagents.values()];
       updateStatus();
+      if (state.viewMode === 'fleet') updateFleetView();
     }
   }, 500);
 
@@ -260,7 +462,7 @@ export async function runTui(framework: AgentFramework): Promise<void> {
 
   renderer.keyInput.on('keypress', (key: { name?: string; ctrl?: boolean }) => {
     if (key.name === 'tab') {
-      state.showSubagents = !state.showSubagents;
+      switchView(state.viewMode === 'chat' ? 'fleet' : 'chat');
       updateStatus();
     }
     if (key.ctrl && key.name === 'c') {
@@ -287,8 +489,9 @@ export async function runTui(framework: AgentFramework): Promise<void> {
       }
       if (text === '/clear') {
         // Remove all children from scroll box
-        for (const child of scrollBox.getChildren()) {
-          scrollBox.remove(child);
+        const children = [...scrollBox.getChildren()];
+        for (const child of children) {
+          scrollBox.remove(child.id);
         }
       } else {
         for (const l of result.lines) {
@@ -315,6 +518,8 @@ export async function runTui(framework: AgentFramework): Promise<void> {
     clearInterval(pollTimer);
     framework.offTrace(onTrace as (e: unknown) => void);
     renderer.destroy();
+    // Restore terminal title
+    process.stdout.write('\x1b]0;\x07');
     framework.stop().then(() => {
       resolveExit?.();
     });
@@ -331,26 +536,34 @@ export async function runTui(framework: AgentFramework): Promise<void> {
 // Status bar formatter
 // ---------------------------------------------------------------------------
 
-function formatStatusBar(state: TuiState): string {
+function formatStatusLeft(state: TuiState): string {
   const sColor = state.status === 'idle' ? '✓' : state.status === 'error' ? '✗' : '…';
   let bar = `[${sColor} ${state.status}`;
   if (state.tool) bar += ` | ${state.tool}`;
   const running = state.subagents.filter(s => s.status === 'running').length;
   if (running > 0) {
     bar += ` | ${running} sub`;
-    if (state.showSubagents) {
-      const details = state.subagents
-        .filter(s => s.status === 'running')
-        .map(s => {
-          const t = Math.floor((Date.now() - s.startedAt) / 1000);
-          const msg = s.statusMessage ? ` ${s.statusMessage}` : '';
-          return `${s.name}(${t}s${msg})`;
-        }).join(' ');
-      bar += ' ' + details;
-    } else {
-      bar += ' Tab:details';
-    }
+  }
+  if (state.viewMode === 'fleet') {
+    bar += ' | fleet view';
+  } else if (running > 0) {
+    bar += ' Tab:fleet';
   }
   bar += ']';
   return bar;
+}
+
+function formatTokens(tokens: TokenUsage): string {
+  const total = tokens.input + tokens.output;
+  if (total === 0) return '';
+
+  const fmt = (n: number) => {
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
+    return String(n);
+  };
+
+  let s = `${fmt(tokens.input)}in ${fmt(tokens.output)}out`;
+  if (tokens.cacheRead > 0) s += ` ${fmt(tokens.cacheRead)}cache`;
+  return s;
 }
