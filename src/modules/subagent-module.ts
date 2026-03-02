@@ -188,6 +188,9 @@ export class SubagentModule implements Module {
   /** Observable registry of active/recent subagents for TUI display. */
   readonly activeSubagents = new Map<string, ActiveSubagent>();
 
+  // Stashed results from subagent:return tool calls, keyed by framework agent name
+  private returnedResults = new Map<string, string>();
+
   // Live state for peek observability
   private liveSubagents = new Map<string, LiveSubagentState>();          // keyed by displayName
   private frameworkNameIndex = new Map<string, string>();                 // frameworkAgentName → displayName
@@ -386,6 +389,17 @@ export class SubagentModule implements Module {
           },
         },
       },
+      {
+        name: 'return',
+        description: 'Return results from a fork or spawn back to the parent agent. Call this when you have completed your task. Your result text will be delivered to the parent as the tool result of the fork/spawn call. This ends your execution.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            result: { type: 'string', description: 'Your findings, summary, or results to return to the parent' },
+          },
+          required: ['result'],
+        },
+      },
     ];
   }
 
@@ -403,6 +417,17 @@ export class SubagentModule implements Module {
         return this.handleConcurrency(call.input as { maxConcurrent?: number });
       case 'peek':
         return this.handlePeek(call.input as { name?: string });
+      case 'return': {
+        // Stash the result keyed by the tool call ID. The completion path
+        // in runSpawn/runFork will pick it up via the callIdIndex → displayName.
+        const result = (call.input as { result: string }).result;
+        // Find which subagent is calling this via the callIdIndex
+        const callerName = this.callIdIndex.get(call.id);
+        if (callerName) {
+          this.returnedResults.set(callerName, result);
+        }
+        return { success: true, data: 'Result received.', endTurn: true };
+      }
       default:
         return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
     }
@@ -850,10 +875,19 @@ export class SubagentModule implements Module {
             );
           }
 
-          const { speech, toolCallsCount } = await this.withTimeout(
+          let { speech, toolCallsCount } = await this.withTimeout(
             framework.runEphemeralToCompletion(agent, contextManager),
             input.name,
           );
+
+          // Prefer explicit return over speech capture
+          const returned = this.returnedResults.get(input.name);
+          if (returned) {
+            speech = returned;
+            this.returnedResults.delete(input.name);
+          } else if (!speech.trim()) {
+            speech = this.extractLastAssistantText(contextManager);
+          }
 
           entry.status = 'completed';
           entry.toolCallsCount = toolCallsCount;
@@ -941,13 +975,22 @@ export class SubagentModule implements Module {
             }
           }
 
-          // Frame the fork's identity so it doesn't repeat the parent's fork actions
-          contextManager.addMessage('user', [{ type: 'text', text:
-            `[You are now running as a forked subagent "${input.name}". ` +
-            `The context above is inherited from your parent agent. ` +
-            `Complete the task below and return your findings. ` +
-            `Do not re-do work the parent already dispatched.]\n\n${input.task}`
-          }]);
+          // Fork identity: the fork is the same self that decided to fork.
+          // Show it as a tool call it "made" with a result confirming it's inside.
+          const forkCallId = `fork-${input.name}-${Date.now()}`;
+          contextManager.addMessage(agentName, [{
+            type: 'tool_use',
+            id: forkCallId,
+            name: 'subagent:fork',
+            input: { name: input.name, task: input.task },
+          }] as ContentBlock[]);
+          contextManager.addMessage('user', [{
+            type: 'tool_result',
+            toolUseId: forkCallId,
+            content: `Fork successful — you are now running inside the fork "${input.name}". ` +
+              `Complete your task, then call subagent:return with your findings to deliver ` +
+              `them back to the parent agent.`,
+          }] as ContentBlock[]);
 
           // Pre-validate prompt size
           const { messages } = await contextManager.compile();
@@ -960,10 +1003,19 @@ export class SubagentModule implements Module {
             );
           }
 
-          const { speech, toolCallsCount } = await this.withTimeout(
+          let { speech, toolCallsCount } = await this.withTimeout(
             framework.runEphemeralToCompletion(agent, contextManager),
             input.name,
           );
+
+          // Prefer explicit return over speech capture
+          const returned = this.returnedResults.get(input.name);
+          if (returned) {
+            speech = returned;
+            this.returnedResults.delete(input.name);
+          } else if (!speech.trim()) {
+            speech = this.extractLastAssistantText(contextManager);
+          }
 
           entry.status = 'completed';
           entry.toolCallsCount = toolCallsCount;
@@ -994,6 +1046,28 @@ export class SubagentModule implements Module {
     } finally {
       this.releaseSlot();
     }
+  }
+
+  /**
+   * Extract the last assistant text from a context manager's messages.
+   * Fallback when the streaming speech capture is empty (e.g., agent's
+   * last action was a tool call, or speech was reset on stream_resumed).
+   */
+  private extractLastAssistantText(contextManager: ContextManager): string {
+    try {
+      const messages = contextManager.getAllMessages();
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg.participant === 'user' || msg.participant === 'User') continue;
+        const texts = msg.content
+          .filter((b: ContentBlock) => b.type === 'text')
+          .map((b: ContentBlock) => (b as { type: 'text'; text: string }).text);
+        if (texts.length > 0) return texts.join('\n');
+      }
+    } catch {
+      // best-effort
+    }
+    return '(no text output)';
   }
 
   /**
