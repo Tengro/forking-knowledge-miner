@@ -3,3 +3,4 @@ dist/
 data/
 .env
 .zuliprc
+mcpl-servers.json

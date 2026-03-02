@@ -48,8 +48,9 @@ interface TuiState {
   status: string;
   tool: string | null;
   subagents: ActiveSubagent[];
-  viewMode: 'chat' | 'fleet';
+  viewMode: 'chat' | 'fleet' | 'peek';
   tokens: TokenUsage;
+  peekTarget: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     subagents: [],
     viewMode: 'chat',
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    peekTarget: null,
   };
 
   let streaming = false;
@@ -347,8 +349,8 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
         : sa.status === 'completed' ? `done ${elapsed}s` : 'failed';
     }
 
-    // Context size
-    const ctxTokens = agentContextTokens.get(node.fullName);
+    // Context size (try fullName, then short name)
+    const ctxTokens = agentContextTokens.get(node.fullName) ?? agentContextTokens.get(node.name);
     const ctxStr = ctxTokens ? ` ${fmtK(ctxTokens)}ctx` : '';
 
     // Compression stats (researcher only — we can access the strategy)
@@ -418,7 +420,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     visibleNodeIds = [];
 
     const lines: string[] = [];
-    lines.push('─── Agent Fleet ─────────────── ↑↓:nav ⏎:fold ───');
+    lines.push('─── Agent Fleet ────────── ↑↓:nav ⏎:fold p:peek ───');
     lines.push('');
 
     renderNode(tree, 0, lines);
@@ -443,6 +445,128 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     } else {
       input.focus();
     }
+  }
+
+  // ── Peek view ────────────────────────────────────────────────────────
+
+  let peekStreamBuffer = '';
+  let peekToolCalls: Array<{ name: string; input?: unknown }> = [];
+  let peekUnsubscribe: (() => void) | null = null;
+
+  function cleanupPeek() {
+    if (peekUnsubscribe) {
+      peekUnsubscribe();
+      peekUnsubscribe = null;
+    }
+    peekStreamBuffer = '';
+    peekToolCalls = [];
+    state.peekTarget = null;
+  }
+
+  function enterPeek(name: string) {
+    // Only peek at running subagents
+    const sa = state.subagents.find(s => s.name === name);
+    if (!sa || sa.status !== 'running') return;
+
+    state.viewMode = 'peek';
+    state.peekTarget = name;
+    peekStreamBuffer = '';
+    peekToolCalls = [];
+
+    if (subMod) {
+      // Get initial snapshot (async, best-effort)
+      subMod.peek(name).then(snapshots => {
+        if (snapshots.length > 0 && state.viewMode === 'peek' && state.peekTarget === name) {
+          if (!peekStreamBuffer) peekStreamBuffer = snapshots[0]!.currentStream;
+          if (peekToolCalls.length === 0) peekToolCalls = snapshots[0]!.pendingToolCalls;
+          updatePeekView();
+        }
+      }).catch(() => {});
+
+      // Live subscription
+      peekUnsubscribe = subMod.onPeekStream(name, (event) => {
+        switch (event.type) {
+          case 'inference:started':
+            peekStreamBuffer = '';
+            peekToolCalls = [];
+            break;
+          case 'tokens':
+            peekStreamBuffer += event.content;
+            break;
+          case 'tool_calls':
+            peekToolCalls = event.calls;
+            peekStreamBuffer = '';
+            break;
+          case 'tool:started':
+            // Show the tool that just started in the pending list
+            peekToolCalls = [{ name: event.tool, input: event.input }];
+            break;
+          case 'tool:completed':
+          case 'tool:failed':
+            peekToolCalls = peekToolCalls.filter(tc => tc.name !== event.tool);
+            break;
+          case 'stream_resumed':
+            peekStreamBuffer = '';
+            peekToolCalls = [];
+            break;
+          case 'inference:completed':
+            break;
+          case 'done':
+            peekStreamBuffer = `(completed) ${event.summary}`;
+            peekToolCalls = [];
+            break;
+        }
+        if (state.viewMode === 'peek') updatePeekView();
+      });
+    }
+
+    updatePeekView();
+  }
+
+  function updatePeekView() {
+    const name = state.peekTarget;
+    if (!name) return;
+
+    const lines: string[] = [];
+    lines.push(`─── Peek: ${name} ──────────────── Esc:back ───`);
+    lines.push('');
+
+    const sa = state.subagents.find(s => s.name === name);
+    if (sa) {
+      const elapsed = Math.floor((Date.now() - sa.startedAt) / 1000);
+      const min = Math.floor(elapsed / 60);
+      const sec = elapsed % 60;
+      const timeStr = min > 0 ? `${min}m${sec}s` : `${sec}s`;
+      lines.push(`  ${sa.status}  ${timeStr}  ${sa.toolCallsCount} tool calls`);
+
+      const task = sa.task.length > 70 ? sa.task.slice(0, 67) + '...' : sa.task;
+      lines.push(`  task: ${task}`);
+    }
+
+    if (peekToolCalls.length > 0) {
+      lines.push('');
+      for (const tc of peekToolCalls) {
+        const inp = tc.input ? ' ' + JSON.stringify(tc.input).slice(0, 80) : '';
+        lines.push(`  ⟳ ${tc.name}${inp}`);
+      }
+    }
+
+    lines.push('');
+
+    if (peekStreamBuffer) {
+      const streamLines = peekStreamBuffer.split('\n');
+      const tail = streamLines.slice(-35);
+      if (streamLines.length > 35) {
+        lines.push(`  ┈ (${streamLines.length - 35} lines above)`);
+      }
+      for (const line of tail) {
+        lines.push(`  ${line}`);
+      }
+    } else {
+      lines.push('  (waiting for output)');
+    }
+
+    fleetText.content = lines.join('\n');
   }
 
   // ── Trace listener ──────────────────────────────────────────────────
@@ -471,6 +595,18 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
         break;
       }
 
+      case 'inference:usage': {
+        // Per-round usage updates during yielding streams
+        const roundUsage = event.tokenUsage as { input?: number; output?: number } | undefined;
+        if (agent && roundUsage?.input) {
+          agentContextTokens.set(agent, roundUsage.input);
+          const short = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '').replace(/-retry\d+$/, '');
+          if (short !== agent) agentContextTokens.set(short, roundUsage.input);
+          if (state.viewMode === 'fleet') updateFleetView();
+        }
+        break;
+      }
+
       case 'inference:completed': {
         const usage = event.tokenUsage as { input?: number; output?: number; cacheRead?: number; cacheCreation?: number } | undefined;
         if (usage) {
@@ -478,9 +614,11 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
           state.tokens.output += usage.output ?? 0;
           state.tokens.cacheRead += usage.cacheRead ?? 0;
           state.tokens.cacheWrite += usage.cacheCreation ?? 0;
-          // Track context size per agent
+          // Track context size per agent (store by both full and short name)
           if (agent && usage.input) {
             agentContextTokens.set(agent, usage.input);
+            const short = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '').replace(/-retry\d+$/, '');
+            if (short !== agent) agentContextTokens.set(short, usage.input);
           }
         }
 
@@ -573,6 +711,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
       state.subagents = [...subMod.activeSubagents.values()];
       updateStatus();
       if (state.viewMode === 'fleet') updateFleetView();
+      else if (state.viewMode === 'peek') updatePeekView();
     }
   }, 500);
 
@@ -580,12 +719,23 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   renderer.keyInput.on('keypress', (key: { name?: string; ctrl?: boolean }) => {
     if (key.name === 'tab') {
+      cleanupPeek();
       switchView(state.viewMode === 'chat' ? 'fleet' : 'chat');
       updateStatus();
       return;
     }
     if (key.ctrl && key.name === 'c') {
       cleanup();
+      return;
+    }
+
+    // Peek view: Escape or p goes back to fleet
+    if (state.viewMode === 'peek') {
+      if (key.name === 'escape' || key.name === 'p') {
+        cleanupPeek();
+        switchView('fleet');
+        updateStatus();
+      }
       return;
     }
 
@@ -609,6 +759,11 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
         if (nodeId) {
           expandedNodes.delete(nodeId);
           updateFleetView();
+        }
+      } else if (key.name === 'p') {
+        const nodeId = visibleNodeIds[fleetCursor];
+        if (nodeId && nodeId !== 'researcher') {
+          enterPeek(nodeId);
         }
       }
     }
@@ -657,6 +812,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
   // ── Cleanup ────────────────────────────────────────────────────────
 
   function cleanup() {
+    cleanupPeek();
     clearInterval(pollTimer);
     framework.offTrace(onTrace as (e: unknown) => void);
     renderer.destroy();
@@ -685,8 +841,8 @@ function formatStatusLeft(state: TuiState): string {
   if (running > 0) {
     bar += ` | ${running} sub`;
   }
-  if (state.viewMode === 'fleet') {
-    bar += ' | fleet view';
+  if (state.viewMode === 'fleet' || state.viewMode === 'peek') {
+    bar += state.viewMode === 'peek' ? ` | peek: ${state.peekTarget}` : ' | fleet view';
   } else if (running > 0) {
     bar += ' Tab:fleet';
   }

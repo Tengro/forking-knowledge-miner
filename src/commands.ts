@@ -12,11 +12,13 @@
  *   /lessons       — Show current lesson library
  *   /status        — Show agent/module status
  *   /clear         — Clear conversation display
+ *   /mcp list|add|remove|env — Manage MCPL server config
  *   /help          — List commands
  */
 
 import type { AgentFramework } from '@connectome/agent-framework';
 import type { ContextManager } from '@connectome/context-manager';
+import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
 
 export type Line = { text: string; style?: 'user' | 'agent' | 'tool' | 'system' };
 
@@ -71,6 +73,10 @@ export function handleCommand(command: string, framework: AgentFramework): Comma
           { text: '  /branches              List Chronicle branches', style: 'system' },
           { text: '  /checkout <name>       Switch to branch', style: 'system' },
           { text: '  /history               Show state transitions', style: 'system' },
+          { text: '  /mcp list              List MCPL servers', style: 'system' },
+          { text: '  /mcp add <id> <cmd>    Add/overwrite server', style: 'system' },
+          { text: '  /mcp remove <id>       Remove a server', style: 'system' },
+          { text: '  /mcp env <id> K=V ...  Set env vars on server', style: 'system' },
         ],
       };
 
@@ -103,6 +109,9 @@ export function handleCommand(command: string, framework: AgentFramework): Comma
 
     case 'history':
       return handleHistory(framework);
+
+    case 'mcp':
+      return handleMcp(args);
 
     default:
       return {
@@ -333,4 +342,110 @@ function handleHistory(framework: AgentFramework): CommandResult {
   }
 
   return { lines };
+}
+
+// ---------------------------------------------------------------------------
+// /mcp subcommands
+// ---------------------------------------------------------------------------
+
+function handleMcp(args: string[]): CommandResult {
+  const sub = args[0];
+  switch (sub) {
+    case 'list':
+    case undefined:
+      return handleMcpList();
+    case 'add':
+      return handleMcpAdd(args.slice(1));
+    case 'remove':
+      return handleMcpRemove(args[1]);
+    case 'env':
+      return handleMcpEnv(args[1], args.slice(2));
+    default:
+      return { lines: [{ text: `Unknown /mcp subcommand: ${sub}. Try /mcp list.`, style: 'system' }] };
+  }
+}
+
+function handleMcpList(): CommandResult {
+  const servers = readMcplServersFile(DEFAULT_CONFIG_PATH);
+  const entries = Object.entries(servers);
+
+  if (entries.length === 0) {
+    return { lines: [{ text: 'No MCPL servers configured. Use /mcp add <id> <command> [args...].', style: 'system' }] };
+  }
+
+  const lines: Line[] = [{ text: `--- MCPL Servers (${entries.length}) ---`, style: 'system' }];
+  for (const [id, entry] of entries) {
+    const cmdLine = [entry.command, ...(entry.args ?? [])].join(' ');
+    lines.push({ text: `  ${id}: ${cmdLine}`, style: 'system' });
+    if (entry.env && Object.keys(entry.env).length > 0) {
+      const envStr = Object.entries(entry.env).map(([k, v]) => `${k}=${v}`).join(' ');
+      lines.push({ text: `    env: ${envStr}`, style: 'system' });
+    }
+    if (entry.toolPrefix) {
+      lines.push({ text: `    toolPrefix: ${entry.toolPrefix}`, style: 'system' });
+    }
+  }
+  return { lines };
+}
+
+function handleMcpAdd(args: string[]): CommandResult {
+  if (args.length < 2) {
+    return { lines: [{ text: 'Usage: /mcp add <id> <command> [args...]', style: 'system' }] };
+  }
+
+  const [id, command, ...cmdArgs] = args;
+  const servers = readMcplServersFile(DEFAULT_CONFIG_PATH);
+  const isOverwrite = id! in servers;
+  servers[id!] = { command: command!, ...(cmdArgs.length > 0 ? { args: cmdArgs } : {}) };
+  saveMcplServers(DEFAULT_CONFIG_PATH, servers);
+
+  return {
+    lines: [
+      { text: `${isOverwrite ? 'Updated' : 'Added'} server "${id}". Restart to apply.`, style: 'system' },
+    ],
+  };
+}
+
+function handleMcpRemove(id?: string): CommandResult {
+  if (!id) {
+    return { lines: [{ text: 'Usage: /mcp remove <id>', style: 'system' }] };
+  }
+
+  const servers = readMcplServersFile(DEFAULT_CONFIG_PATH);
+  if (!(id in servers)) {
+    return { lines: [{ text: `Server "${id}" not found.`, style: 'system' }] };
+  }
+
+  delete servers[id];
+  saveMcplServers(DEFAULT_CONFIG_PATH, servers);
+  return { lines: [{ text: `Removed server "${id}". Restart to apply.`, style: 'system' }] };
+}
+
+function handleMcpEnv(id: string | undefined, pairs: string[]): CommandResult {
+  if (!id || pairs.length === 0) {
+    return { lines: [{ text: 'Usage: /mcp env <id> KEY=VALUE [KEY=VALUE ...]', style: 'system' }] };
+  }
+
+  const servers = readMcplServersFile(DEFAULT_CONFIG_PATH);
+  if (!(id in servers)) {
+    return { lines: [{ text: `Server "${id}" not found.`, style: 'system' }] };
+  }
+
+  const entry = servers[id]!;
+  if (!entry.env) entry.env = {};
+
+  const set: string[] = [];
+  for (const pair of pairs) {
+    const eqIdx = pair.indexOf('=');
+    if (eqIdx < 1) {
+      return { lines: [{ text: `Invalid env pair: "${pair}". Expected KEY=VALUE.`, style: 'system' }] };
+    }
+    const key = pair.slice(0, eqIdx);
+    const value = pair.slice(eqIdx + 1);
+    entry.env[key] = value;
+    set.push(key);
+  }
+
+  saveMcplServers(DEFAULT_CONFIG_PATH, servers);
+  return { lines: [{ text: `Set ${set.join(', ')} on "${id}". Restart to apply.`, style: 'system' }] };
 }

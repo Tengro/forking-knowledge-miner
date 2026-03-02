@@ -828,6 +828,7 @@ export class SubagentModule implements Module {
             recentWindowTokens: 80_000,
             compressionModel: model,
             autoTickOnNewMessage: true,
+            maxMessageTokens: 10_000,
           }),
           allowedTools: this.filterToolNames(input.tools),
         });
@@ -921,6 +922,7 @@ export class SubagentModule implements Module {
             recentWindowTokens: 80_000,
             compressionModel: model,
             autoTickOnNewMessage: true,
+            maxMessageTokens: 10_000,
           }),
           allowedTools: this.filterToolNames(),
         });
@@ -939,7 +941,13 @@ export class SubagentModule implements Module {
             }
           }
 
-          contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
+          // Frame the fork's identity so it doesn't repeat the parent's fork actions
+          contextManager.addMessage('user', [{ type: 'text', text:
+            `[You are now running as a forked subagent "${input.name}". ` +
+            `The context above is inherited from your parent agent. ` +
+            `Complete the task below and return your findings. ` +
+            `Do not re-do work the parent already dispatched.]\n\n${input.task}`
+          }]);
 
           // Pre-validate prompt size
           const { messages } = await contextManager.compile();

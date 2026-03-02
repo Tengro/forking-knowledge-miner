@@ -19,11 +19,13 @@ import { Membrane, AnthropicAdapter, NativeFormatter } from 'membrane';
 import { AgentFramework, AutobiographicalStrategy, FilesModule } from '@connectome/agent-framework';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { existsSync } from 'node:fs';
 import { SYSTEM_PROMPT } from './prompts/system.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
 import { TuiModule } from './modules/tui-module.js';
+import { loadMcplServers, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -33,9 +35,6 @@ const config = {
   apiKey: process.env.ANTHROPIC_API_KEY,
   model: process.env.MODEL || 'claude-opus-4-6',
   storePath: process.env.STORE_PATH || './data/store',
-  zulipMcpCmd: process.env.ZULIP_MCP_CMD || 'node',
-  zulipMcpArgs: process.env.ZULIP_MCP_ARGS?.split(' ') || [resolve(__dirname, '../../zulip-mcp/build/index.js')],
-  zuliprc: process.env.ZULIP_RC_PATH || resolve(process.cwd(), '.zuliprc'),
 };
 
 if (!config.apiKey) {
@@ -43,14 +42,31 @@ if (!config.apiKey) {
   process.exit(1);
 }
 
-async function createFramework(membrane: Membrane) {
-  const zulipEnv: Record<string, string> = {
+/**
+ * Seed mcpl-servers.json on first run using legacy env vars.
+ */
+function seedMcplConfig(): void {
+  if (existsSync(DEFAULT_CONFIG_PATH)) return;
+
+  const cmd = process.env.ZULIP_MCP_CMD || 'node';
+  const args = process.env.ZULIP_MCP_ARGS?.split(' ')
+    || [resolve(__dirname, '../../zulip-mcp/build/index.js')];
+  const zuliprc = process.env.ZULIP_RC_PATH || resolve(process.cwd(), '.zuliprc');
+
+  const env: Record<string, string> = {
     ENABLE_ZULIP: 'true',
     ENABLE_DISCORD: 'false',
   };
-  if (config.zuliprc) {
-    zulipEnv.ZULIP_RC_PATH = config.zuliprc;
-  }
+  if (zuliprc) env.ZULIP_RC_PATH = zuliprc;
+
+  saveMcplServers(DEFAULT_CONFIG_PATH, {
+    zulip: { command: cmd, args, env },
+  });
+}
+
+async function createFramework(membrane: Membrane) {
+  seedMcplConfig();
+  const mcplServers = loadMcplServers(DEFAULT_CONFIG_PATH);
 
   const subagentModule = new SubagentModule({
     parentAgentName: 'researcher',
@@ -73,18 +89,12 @@ async function createFramework(membrane: Membrane) {
           recentWindowTokens: 30000,
           compressionModel: config.model,
           autoTickOnNewMessage: true,
+          maxMessageTokens: 10000,
         }),
       },
     ],
     modules: [new TuiModule(), subagentModule, lessonsModule, retrievalModule, filesModule],
-    mcplServers: [
-      {
-        id: 'zulip',
-        command: config.zulipMcpCmd,
-        args: config.zulipMcpArgs,
-        env: zulipEnv,
-      },
-    ],
+    mcplServers,
   });
 
   subagentModule.setFramework(framework);
