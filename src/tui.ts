@@ -71,6 +71,12 @@ interface FleetNode {
   children: FleetNode[];
 }
 
+/** A single line in the fleet view with its color. */
+interface FleetLine {
+  text: string;
+  color: string;
+}
+
 // ---------------------------------------------------------------------------
 // Colours (hex strings for OpenTUI)
 // ---------------------------------------------------------------------------
@@ -136,11 +142,6 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     stickyStart: 'bottom',
   });
 
-  const fleetText = new TextRenderable(renderer, {
-    id: 'fleet-text',
-    content: '',
-    fg: GRAY,
-  });
   const fleetBox = new BoxRenderable(renderer, {
     id: 'fleet',
     flexGrow: 1,
@@ -148,7 +149,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     paddingLeft: 1,
     paddingTop: 1,
   });
-  fleetBox.add(fleetText);
+  let fleetLineCounter = 0;
 
   const statusLeft = new TextRenderable(renderer, {
     id: 'status-left',
@@ -343,13 +344,42 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
       root.children.push(byName.get(sa.name)!);
     }
 
+    // Sort children: running on top, then by startedAt ascending (stable reading order)
+    const sortChildren = (children: FleetNode[]) => {
+      children.sort((a, b) => {
+        const aRunning = a.agent?.status === 'running' ? 0 : 1;
+        const bRunning = b.agent?.status === 'running' ? 0 : 1;
+        if (aRunning !== bRunning) return aRunning - bRunning;
+        return (a.agent?.startedAt ?? 0) - (b.agent?.startedAt ?? 0);
+      });
+      for (const child of children) {
+        if (child.children.length > 0) sortChildren(child.children);
+      }
+    };
+    sortChildren(root.children);
+
     return root;
   }
 
-  function renderNode(node: FleetNode, depth: number, lines: string[]): void {
+  function renderNode(node: FleetNode, depth: number, lines: FleetLine[]): void {
     const indent = '  '.repeat(depth);
     const isExpanded = expandedNodes.has(node.name);
     const hasChildren = node.children.length > 0;
+
+    // Determine node color based on status
+    let nodeColor: string;
+    if (node.isResearcher) {
+      nodeColor = state.status === 'idle' ? GRAY : WHITE;
+    } else {
+      const sa = node.agent!;
+      nodeColor = sa.status === 'running' ? CYAN
+        : sa.status === 'failed' ? RED : DIM_GRAY;
+    }
+
+    // Dimmer variant for detail/child lines
+    const detailColor = node.isResearcher
+      ? (state.status === 'idle' ? DIM_GRAY : GRAY)
+      : (node.agent?.status === 'running' ? GRAY : DIM_GRAY);
 
     // Status tag
     let statusTag: string;
@@ -388,11 +418,17 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     // Fold marker
     const marker = hasChildren ? (isExpanded ? '▼' : '►') : '─';
 
+    // Peek marker for running non-researcher agents
+    const peekMarker = (!node.isResearcher && node.agent?.status === 'running') ? ' [p]' : '';
+
     // Header line (this is a navigable node)
     const isCursor = visibleNodeIds.length === fleetCursor;
     const cursor = isCursor ? '→' : ' ';
     visibleNodeIds.push(node.name);
-    lines.push(`${cursor} ${indent}${marker} ${node.name}  [${statusTag}]${ctxStr}${compStr}`);
+    lines.push({
+      text: `${cursor} ${indent}${marker} ${node.name}  [${statusTag}]${ctxStr}${compStr}${peekMarker}`,
+      color: nodeColor,
+    });
 
     if (!isExpanded) return;
 
@@ -400,15 +436,15 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     const detail = indent + '    ';
 
     if (node.isResearcher && state.tool) {
-      lines.push(`  ${detail}tool: ${state.tool}`);
+      lines.push({ text: `  ${detail}tool: ${state.tool}`, color: detailColor });
     }
     if (!node.isResearcher && node.agent) {
       const sa = node.agent;
       // Truncate task to 60 chars
       const task = sa.task.length > 60 ? sa.task.slice(0, 57) + '...' : sa.task;
-      lines.push(`  ${detail}task: ${task}`);
+      lines.push({ text: `  ${detail}task: ${task}`, color: detailColor });
       if (sa.statusMessage) {
-        lines.push(`  ${detail}tool: ${sa.statusMessage} (${sa.toolCallsCount} calls)`);
+        lines.push({ text: `  ${detail}tool: ${sa.statusMessage} (${sa.toolCallsCount} calls)`, color: detailColor });
       }
     }
 
@@ -418,9 +454,9 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     if (fullName) {
       const summary = summaryCache.get(fullName);
       if (summary) {
-        lines.push(`  ${detail}┈ ${summary}`);
+        lines.push({ text: `  ${detail}┈ ${summary}`, color: DIM_GRAY });
       } else if (summaryPending.has(fullName)) {
-        lines.push(`  ${detail}┈ …`);
+        lines.push({ text: `  ${detail}┈ …`, color: DIM_GRAY });
       }
       generateSummary(fullName);
     }
@@ -435,9 +471,9 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     const tree = buildFleetTree();
     visibleNodeIds = [];
 
-    const lines: string[] = [];
-    lines.push('─── Agent Fleet ────────── ↑↓:nav ⏎:fold p:peek ───');
-    lines.push('');
+    const lines: FleetLine[] = [];
+    lines.push({ text: '─── Agent Fleet ────────── ↑↓:nav ⏎:fold p:peek ───', color: GRAY });
+    lines.push({ text: '', color: GRAY });
 
     renderNode(tree, 0, lines);
 
@@ -445,10 +481,30 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     if (fleetCursor >= visibleNodeIds.length) fleetCursor = visibleNodeIds.length - 1;
     if (fleetCursor < 0) fleetCursor = 0;
 
-    lines.push('');
-    lines.push('                                    Tab: chat');
+    // Status bar hint: if cursor is on a running non-researcher agent, show peek hint
+    const cursorNodeId = visibleNodeIds[fleetCursor];
+    if (cursorNodeId && cursorNodeId !== 'researcher') {
+      const sa = state.subagents.find(s => s.name === cursorNodeId);
+      if (sa?.status === 'running') {
+        lines.push({ text: '', color: GRAY });
+        lines.push({ text: '  ⏎:fold  p:peek', color: CYAN });
+      }
+    }
 
-    fleetText.content = lines.join('\n');
+    lines.push({ text: '', color: GRAY });
+    lines.push({ text: '                                    Tab: chat', color: DIM_GRAY });
+
+    // Rebuild fleetBox children: clear old, add new per-line renderables
+    for (const child of [...fleetBox.getChildren()]) {
+      fleetBox.remove(child.id);
+    }
+    for (const line of lines) {
+      fleetBox.add(new TextRenderable(renderer, {
+        id: `fleet-ln-${++fleetLineCounter}`,
+        content: line.text,
+        fg: line.color,
+      }));
+    }
   }
 
   function switchView(mode: 'chat' | 'fleet') {
@@ -465,17 +521,22 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   // ── Peek view ────────────────────────────────────────────────────────
 
-  let peekStreamBuffer = '';
-  let peekToolCalls: Array<{ name: string; input?: unknown }> = [];
+  /** Accumulated event log per agent (keyed by display name). */
+  const peekLogs = new Map<string, FleetLine[]>();
+  /** Current in-progress tool per agent (for sticky display). */
+  const peekCurrentTool = new Map<string, string | null>();
   let peekUnsubscribe: (() => void) | null = null;
+
+  function appendPeekLog(name: string, text: string, color: string) {
+    if (!peekLogs.has(name)) peekLogs.set(name, []);
+    peekLogs.get(name)!.push({ text, color });
+  }
 
   function cleanupPeek() {
     if (peekUnsubscribe) {
       peekUnsubscribe();
       peekUnsubscribe = null;
     }
-    peekStreamBuffer = '';
-    peekToolCalls = [];
     state.peekTarget = null;
   }
 
@@ -486,54 +547,34 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
     state.viewMode = 'peek';
     state.peekTarget = name;
-    peekStreamBuffer = '';
-    peekToolCalls = [];
+
+    // Ensure log exists (may already have entries from global subscriber)
+    if (!peekLogs.has(name)) peekLogs.set(name, []);
 
     if (subMod) {
-      // Get initial snapshot (async, best-effort)
+      // Get initial snapshot (async, best-effort) — seed the log if empty
       subMod.peek(name).then(snapshots => {
         if (snapshots.length > 0 && state.viewMode === 'peek' && state.peekTarget === name) {
-          if (!peekStreamBuffer) peekStreamBuffer = snapshots[0]!.currentStream;
-          if (peekToolCalls.length === 0) peekToolCalls = snapshots[0]!.pendingToolCalls;
+          const snap = snapshots[0]!;
+          const log = peekLogs.get(name);
+          if (log && log.length === 0) {
+            if (snap.currentStream) {
+              // Show last few lines of existing stream as initial context
+              const streamLines = snap.currentStream.split('\n').slice(-10);
+              for (const l of streamLines) {
+                if (l.trim()) appendPeekLog(name, l, WHITE);
+              }
+            }
+            if (snap.pendingToolCalls.length > 0) {
+              for (const tc of snap.pendingToolCalls) {
+                appendPeekLog(name, `⟳ ${tc.name}`, YELLOW);
+                peekCurrentTool.set(name, tc.name);
+              }
+            }
+          }
           updatePeekView();
         }
       }).catch(() => {});
-
-      // Live subscription
-      peekUnsubscribe = subMod.onPeekStream(name, (event) => {
-        switch (event.type) {
-          case 'inference:started':
-            peekStreamBuffer = '';
-            peekToolCalls = [];
-            break;
-          case 'tokens':
-            peekStreamBuffer += event.content;
-            break;
-          case 'tool_calls':
-            peekToolCalls = event.calls;
-            peekStreamBuffer = '';
-            break;
-          case 'tool:started':
-            // Show the tool that just started in the pending list
-            peekToolCalls = [{ name: event.tool, input: event.input }];
-            break;
-          case 'tool:completed':
-          case 'tool:failed':
-            peekToolCalls = peekToolCalls.filter(tc => tc.name !== event.tool);
-            break;
-          case 'stream_resumed':
-            peekStreamBuffer = '';
-            peekToolCalls = [];
-            break;
-          case 'inference:completed':
-            break;
-          case 'done':
-            peekStreamBuffer = `(completed) ${event.summary}`;
-            peekToolCalls = [];
-            break;
-        }
-        if (state.viewMode === 'peek') updatePeekView();
-      });
     }
 
     updatePeekView();
@@ -543,9 +584,9 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
     const name = state.peekTarget;
     if (!name) return;
 
-    const lines: string[] = [];
-    lines.push(`─── Peek: ${name} ──────────────── Esc:back ───`);
-    lines.push('');
+    const lines: FleetLine[] = [];
+    lines.push({ text: `─── Peek: ${name} ──────────────── Esc:back ───`, color: GRAY });
+    lines.push({ text: '', color: GRAY });
 
     const sa = state.subagents.find(s => s.name === name);
     if (sa) {
@@ -553,36 +594,47 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
       const min = Math.floor(elapsed / 60);
       const sec = elapsed % 60;
       const timeStr = min > 0 ? `${min}m${sec}s` : `${sec}s`;
-      lines.push(`  ${sa.status}  ${timeStr}  ${sa.toolCallsCount} tool calls`);
+      const statusColor = sa.status === 'running' ? CYAN : sa.status === 'failed' ? RED : DIM_GRAY;
+      lines.push({ text: `  ${sa.status}  ${timeStr}  ${sa.toolCallsCount} tool calls`, color: statusColor });
 
       const task = sa.task.length > 70 ? sa.task.slice(0, 67) + '...' : sa.task;
-      lines.push(`  task: ${task}`);
+      lines.push({ text: `  task: ${task}`, color: GRAY });
     }
 
-    if (peekToolCalls.length > 0) {
-      lines.push('');
-      for (const tc of peekToolCalls) {
-        const inp = tc.input ? ' ' + JSON.stringify(tc.input).slice(0, 80) : '';
-        lines.push(`  ⟳ ${tc.name}${inp}`);
-      }
+    // Sticky: current pending tool (if any)
+    const log = peekLogs.get(name);
+    if (peekCurrentTool.get(name)) {
+      lines.push({ text: '', color: GRAY });
+      lines.push({ text: `  ⟳ ${peekCurrentTool.get(name)}`, color: YELLOW });
     }
 
-    lines.push('');
+    lines.push({ text: '', color: GRAY });
 
-    if (peekStreamBuffer) {
-      const streamLines = peekStreamBuffer.split('\n');
-      const tail = streamLines.slice(-35);
-      if (streamLines.length > 35) {
-        lines.push(`  ┈ (${streamLines.length - 35} lines above)`);
+    // Accumulated event log — show last N lines
+    if (log && log.length > 0) {
+      const maxLines = Math.max(10, (process.stdout.rows ?? 40) - 8);
+      const tail = log.slice(-maxLines);
+      if (log.length > maxLines) {
+        lines.push({ text: `  ┈ (${log.length - maxLines} lines above)`, color: DIM_GRAY });
       }
-      for (const line of tail) {
-        lines.push(`  ${line}`);
+      for (const entry of tail) {
+        lines.push({ text: `  ${entry.text}`, color: entry.color });
       }
     } else {
-      lines.push('  (waiting for output)');
+      lines.push({ text: '  (waiting for output)', color: DIM_GRAY });
     }
 
-    fleetText.content = lines.join('\n');
+    // Rebuild fleetBox children
+    for (const child of [...fleetBox.getChildren()]) {
+      fleetBox.remove(child.id);
+    }
+    for (const line of lines) {
+      fleetBox.add(new TextRenderable(renderer, {
+        id: `fleet-ln-${++fleetLineCounter}`,
+        content: line.text,
+        fg: line.color,
+      }));
+    }
   }
 
   // ── Trace listener ──────────────────────────────────────────────────
@@ -738,29 +790,112 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   const subMod = framework.getAllModules().find(m => m.name === 'subagent') as SubagentModule | undefined;
 
-  // Subscribe to each subagent's done event for verbose chat display.
-  // We subscribe per-agent as they appear (via polling) so we get the name.
-  const subagentDoneUnsubs: Array<() => void> = [];
+  // Subscribe to each subagent's stream for peek logs + done events.
+  const subagentStreamUnsubs: Array<() => void> = [];
   const subscribedSubagents = new Set<string>();
 
-  function subscribeSubagentDone(name: string) {
+  /** Tracks the last token line being built for each agent (to merge consecutive token events). */
+  const peekTokenLine = new Map<string, string>();
+
+  function subscribeSubagentStream(name: string) {
     if (subscribedSubagents.has(name) || !subMod) return;
     subscribedSubagents.add(name);
+
+    if (!peekLogs.has(name)) peekLogs.set(name, []);
+
     const unsub = subMod.onPeekStream(name, (event) => {
-      if (event.type === 'done' && verboseChat) {
-        const summary = event.summary;
-        const truncated = summary.length > 200 ? summary.slice(0, 197) + '...' : summary;
-        addLine(`  ◀ [${name}] ${truncated}`, CYAN);
+      switch (event.type) {
+        case 'inference:started':
+          appendPeekLog(name, '── inference round ──', DIM_GRAY);
+          peekCurrentTool.set(name, null);
+          peekTokenLine.delete(name);
+          break;
+
+        case 'tokens': {
+          // Merge consecutive token events into the last line
+          const prev = peekTokenLine.get(name) ?? '';
+          const merged = prev + event.content;
+          // Split by newlines — only the last segment is "in progress"
+          const parts = merged.split('\n');
+          if (parts.length > 1) {
+            // Flush completed lines
+            for (let i = 0; i < parts.length - 1; i++) {
+              if (parts[i]!.trim()) appendPeekLog(name, parts[i]!, WHITE);
+            }
+          }
+          peekTokenLine.set(name, parts[parts.length - 1]!);
+          break;
+        }
+
+        case 'tool_calls': {
+          // Flush any pending token line
+          const pending = peekTokenLine.get(name);
+          if (pending?.trim()) appendPeekLog(name, pending, WHITE);
+          peekTokenLine.delete(name);
+          const toolNames = event.calls.map(c => c.name).join(', ');
+          appendPeekLog(name, `→ ${toolNames}`, YELLOW);
+          break;
+        }
+
+        case 'tool:started':
+          peekCurrentTool.set(name, event.tool);
+          appendPeekLog(name, `  ⟳ ${event.tool}`, GRAY);
+          break;
+
+        case 'tool:completed':
+          if (peekCurrentTool.get(name) === event.tool) peekCurrentTool.set(name, null);
+          appendPeekLog(name, `  ✓ ${event.tool} (${event.durationMs}ms)`, DIM_GRAY);
+          break;
+
+        case 'tool:failed':
+          if (peekCurrentTool.get(name) === event.tool) peekCurrentTool.set(name, null);
+          appendPeekLog(name, `  ✗ ${event.tool}: ${event.error}`, RED);
+          break;
+
+        case 'stream_resumed':
+          appendPeekLog(name, '── stream resumed ──', DIM_GRAY);
+          peekCurrentTool.set(name, null);
+          peekTokenLine.delete(name);
+          break;
+
+        case 'inference:completed':
+          break;
+
+        case 'done': {
+          // Flush any pending token line
+          const pendingTok = peekTokenLine.get(name);
+          if (pendingTok?.trim()) appendPeekLog(name, pendingTok, WHITE);
+          peekTokenLine.delete(name);
+          peekCurrentTool.set(name, null);
+
+          const summary = event.summary;
+          const truncated = summary.length > 100 ? summary.slice(0, 97) + '...' : summary;
+          appendPeekLog(name, `── done: ${truncated} ──`, DIM_GRAY);
+
+          // Update context tokens from done event
+          if (event.lastInputTokens) {
+            agentContextTokens.set(name, event.lastInputTokens);
+          }
+
+          // Verbose chat display
+          if (verboseChat) {
+            const chatTruncated = summary.length > 200 ? summary.slice(0, 197) + '...' : summary;
+            addLine(`  ◀ [${name}] ${chatTruncated}`, CYAN);
+          }
+          break;
+        }
       }
+
+      if (state.viewMode === 'peek' && state.peekTarget === name) updatePeekView();
     });
-    subagentDoneUnsubs.push(unsub);
+    subagentStreamUnsubs.push(unsub);
   }
   const pollTimer = setInterval(() => {
     if (subMod) {
       state.subagents = [...subMod.activeSubagents.values()];
-      // Subscribe to done events for any new subagents
+      // Subscribe to stream events for any new subagents
       for (const sa of state.subagents) {
-        subscribeSubagentDone(sa.name);
+        subscribeSubagentStream(sa.name);
       }
       updateStatus();
       if (state.viewMode === 'fleet') updateFleetView();
@@ -874,7 +1009,7 @@ export async function runTui(framework: AgentFramework, membrane: Membrane): Pro
 
   function cleanup() {
     cleanupPeek();
-    for (const unsub of subagentDoneUnsubs) unsub();
+    for (const unsub of subagentStreamUnsubs) unsub();
     clearInterval(pollTimer);
     framework.offTrace(onTrace as (e: unknown) => void);
     renderer.destroy();

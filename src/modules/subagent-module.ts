@@ -134,7 +134,7 @@ export type SubagentStreamEvent =
   | { type: 'inference:completed' }
   | { type: 'inference:failed'; error: string }
   | { type: 'stream_resumed' }
-  | { type: 'done'; summary: string };
+  | { type: 'done'; summary: string; lastInputTokens?: number };
 
 export type SubagentStreamCallback = (event: SubagentStreamEvent) => void;
 
@@ -197,6 +197,7 @@ export class SubagentModule implements Module {
   private frameworkNameIndex = new Map<string, string>();                 // frameworkAgentName → displayName
   private callIdIndex = new Map<string, string>();                        // toolCallId → displayName
   private streamSubscribers = new Map<string, Set<SubagentStreamCallback>>();  // displayName → callbacks
+  private lastInputTokens = new Map<string, number>();  // displayName → last known input token count
 
   constructor(config: SubagentModuleConfig = {}) {
     this.config = config;
@@ -223,6 +224,13 @@ export class SubagentModule implements Module {
         if (!displayName) return;
         const live = this.liveSubagents.get(displayName);
         if (!live) return;
+
+        // inference:usage is emitted at runtime but not in the TraceEvent union — handle it first
+        if ((event as { type: string }).type === 'inference:usage') {
+          const roundUsage = (event as { tokenUsage?: { input?: number } }).tokenUsage;
+          if (roundUsage?.input) this.lastInputTokens.set(displayName, roundUsage.input);
+          return;
+        }
 
         switch (event.type) {
           case 'inference:started':
@@ -254,9 +262,12 @@ export class SubagentModule implements Module {
             live.pendingToolCalls = [];
             this.emit(displayName, { type: 'stream_resumed' });
             break;
-          case 'inference:completed':
+          case 'inference:completed': {
+            const usage = (event as { tokenUsage?: { input?: number } }).tokenUsage;
+            if (usage?.input) this.lastInputTokens.set(displayName, usage.input);
             this.emit(displayName, { type: 'inference:completed' });
             break;
+          }
           case 'inference:failed': {
             const error = (event as { error?: string }).error ?? 'Unknown error';
             this.emit(displayName, { type: 'inference:failed', error });
@@ -894,7 +905,7 @@ export class SubagentModule implements Module {
           entry.completedAt = Date.now();
           entry.toolCallsCount = toolCallsCount;
           this.onSubagentSuccess();
-          this.emit(input.name, { type: 'done', summary: speech });
+          this.emit(input.name, { type: 'done', summary: speech, lastInputTokens: this.lastInputTokens.get(input.name) });
           return { summary: speech, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
@@ -1024,7 +1035,7 @@ export class SubagentModule implements Module {
           entry.completedAt = Date.now();
           entry.toolCallsCount = toolCallsCount;
           this.onSubagentSuccess();
-          this.emit(input.name, { type: 'done', summary: speech });
+          this.emit(input.name, { type: 'done', summary: speech, lastInputTokens: this.lastInputTokens.get(input.name) });
           return { summary: speech, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
