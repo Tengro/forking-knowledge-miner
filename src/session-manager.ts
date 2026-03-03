@@ -78,8 +78,10 @@ export class SessionManager {
       lastAccessedAt: now,
     };
 
-    // Ensure the store directory exists
-    mkdirSync(this.getStorePath(id), { recursive: true });
+    // Ensure the sessions parent directory exists.
+    // Don't create the store directory itself — JsStore.openOrCreate needs it
+    // absent to know it should create (not open) the store.
+    mkdirSync(this.sessionsDir, { recursive: true });
 
     index.sessions[id] = session;
     index.activeSessionId = id;

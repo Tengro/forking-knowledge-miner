@@ -454,12 +454,37 @@ export class SubagentModule implements Module {
   // Concurrency Control (adaptive, rate-limit-aware)
   // =========================================================================
 
-  private async acquireSlot(): Promise<void> {
+  /**
+   * Acquire a concurrency slot. Returns how long the caller waited (0 = immediate).
+   * Throws if the slot is not acquired within `slotTimeoutMs`.
+   */
+  private async acquireSlot(slotTimeoutMs = 120_000): Promise<{ waitedMs: number }> {
     if (this.activeConcurrent < this.effectiveConcurrent) {
       this.activeConcurrent++;
-      return;
+      return { waitedMs: 0 };
     }
-    return new Promise<void>(resolve => this.waitQueue.push(resolve));
+
+    const startWait = Date.now();
+    return new Promise<{ waitedMs: number }>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        // Remove ourselves from the wait queue
+        const idx = this.waitQueue.indexOf(onSlot);
+        if (idx >= 0) this.waitQueue.splice(idx, 1);
+        reject(new Error(
+          `Timed out waiting for a concurrency slot after ${slotTimeoutMs}ms ` +
+          `(${this.activeConcurrent}/${this.effectiveConcurrent} slots in use, ` +
+          `${this.waitQueue.length} still queued). ` +
+          `Limit parallel forks/spawns to ${this.effectiveConcurrent}.`
+        ));
+      }, slotTimeoutMs);
+
+      const onSlot = () => {
+        clearTimeout(timer);
+        resolve({ waitedMs: Date.now() - startWait });
+      };
+
+      this.waitQueue.push(onSlot);
+    });
   }
 
   private releaseSlot(): void {
@@ -468,6 +493,15 @@ export class SubagentModule implements Module {
       this.activeConcurrent++;
       this.waitQueue.shift()!();
     }
+  }
+
+  /** Format a concurrency notice for tool results (empty string if no wait). */
+  private concurrencyNotice(waitedMs: number): string {
+    if (waitedMs <= 0) return '';
+    const secs = (waitedMs / 1000).toFixed(1);
+    return `[Concurrency notice: this agent waited ${secs}s for a slot ` +
+      `(${this.effectiveConcurrent} concurrent limit). ` +
+      `To avoid delays, limit parallel forks/spawns to ${this.effectiveConcurrent}.]\n\n`;
   }
 
   /** Call on successful subagent completion — gradually recovers concurrency. */
@@ -867,7 +901,7 @@ export class SubagentModule implements Module {
   // =========================================================================
 
   private async runSpawn(input: SpawnInput): Promise<SubagentResult> {
-    await this.acquireSlot();
+    const { waitedMs } = await this.acquireSlot();
 
     const entry: ActiveSubagent = {
       name: input.name, type: 'spawn', task: input.task,
@@ -943,8 +977,10 @@ export class SubagentModule implements Module {
           entry.completedAt = Date.now();
           entry.toolCallsCount = toolCallsCount;
           this.onSubagentSuccess();
-          this.emit(input.name, { type: 'done', summary: speech, lastInputTokens: this.lastInputTokens.get(input.name) });
-          return { summary: speech, findings: [], issues: [], toolCallsCount };
+          const notice = this.concurrencyNotice(waitedMs);
+          const finalSummary = notice + speech;
+          this.emit(input.name, { type: 'done', summary: finalSummary, lastInputTokens: this.lastInputTokens.get(input.name) });
+          return { summary: finalSummary, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
           this.cancellationHandles.delete(input.name);
@@ -955,7 +991,8 @@ export class SubagentModule implements Module {
             entry.status = 'completed';
             entry.completedAt = Date.now();
             entry.statusMessage = 'stopped by user';
-            const summary = '[Stopped by user] ' + (partial || '(no output yet)');
+            const notice = this.concurrencyNotice(waitedMs);
+            const summary = notice + '[Stopped by user] ' + (partial || '(no output yet)');
             this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
             return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
           }
@@ -986,7 +1023,7 @@ export class SubagentModule implements Module {
   }
 
   private async runFork(input: ForkInput): Promise<SubagentResult> {
-    await this.acquireSlot();
+    const { waitedMs } = await this.acquireSlot();
 
     const entry: ActiveSubagent = {
       name: input.name, type: 'fork', task: input.task,
@@ -1096,8 +1133,10 @@ export class SubagentModule implements Module {
           entry.completedAt = Date.now();
           entry.toolCallsCount = toolCallsCount;
           this.onSubagentSuccess();
-          this.emit(input.name, { type: 'done', summary: speech, lastInputTokens: this.lastInputTokens.get(input.name) });
-          return { summary: speech, findings: [], issues: [], toolCallsCount };
+          const notice = this.concurrencyNotice(waitedMs);
+          const finalSummary = notice + speech;
+          this.emit(input.name, { type: 'done', summary: finalSummary, lastInputTokens: this.lastInputTokens.get(input.name) });
+          return { summary: finalSummary, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
           this.cancellationHandles.delete(input.name);
@@ -1108,7 +1147,8 @@ export class SubagentModule implements Module {
             entry.status = 'completed';
             entry.completedAt = Date.now();
             entry.statusMessage = 'stopped by user';
-            const summary = '[Stopped by user] ' + (partial || '(no output yet)');
+            const notice = this.concurrencyNotice(waitedMs);
+            const summary = notice + '[Stopped by user] ' + (partial || '(no output yet)');
             this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
             return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
           }
