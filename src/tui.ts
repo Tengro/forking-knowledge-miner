@@ -693,7 +693,17 @@ export async function runTui(app: AppContext): Promise<void> {
             spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
             updateStatus();
           }
-          if (agent) appendTranscript(agent, content);
+          if (agent) {
+            appendTranscript(agent, content);
+            // Project context growth: output tokens will be in context next round
+            const prev = agentContextTokens.get(agent);
+            if (prev) {
+              const delta = Math.ceil(content.length / 4);
+              agentContextTokens.set(agent, prev + delta);
+              const short = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '').replace(/-retry\d+$/, '');
+              if (short !== agent) agentContextTokens.set(short, prev + delta);
+            }
+          }
         }
         break;
       }
@@ -801,9 +811,31 @@ export async function runTui(app: AppContext): Promise<void> {
       }
 
       case 'tool:started': {
+        const tool = event.tool as string;
         if (agent === 'researcher') {
-          state.tool = event.tool as string;
+          state.tool = tool;
           updateStatus();
+        }
+        // Show file operations in chat
+        const toolInput = event.input as Record<string, unknown> | undefined;
+        if (toolInput && (agent === 'researcher' || verboseChat)) {
+          const short = agent === 'researcher' ? '' : `[${(agent ?? '').replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '')}] `;
+          if (tool === 'files:write' && toolInput.filePath) {
+            const fp = String(toolInput.filePath);
+            addLine(`  ${short}write ${fp}`, DIM_GRAY);
+          } else if (tool === 'files:materialize' && toolInput.targetDir) {
+            const dir = String(toolInput.targetDir);
+            const files = toolInput.files as string[] | undefined;
+            const fileList = files ? files.join(', ') : 'all';
+            // OSC 8 hyperlink for the target directory
+            const link = `\x1b]8;;file://${dir}\x07${dir}\x1b]8;;\x07`;
+            addLine(`  ${short}materialize → ${link} (${fileList})`, DIM_GRAY);
+          } else if (tool === 'lessons:create' && toolInput.content) {
+            const content = String(toolInput.content);
+            const tags = (toolInput.tags as string[] | undefined)?.join(', ') ?? '';
+            const preview = content.length > 80 ? content.slice(0, 77) + '...' : content;
+            addLine(`  ${short}+ lesson${tags ? ` [${tags}]` : ''}: ${preview}`, GREEN);
+          }
         }
         break;
       }
@@ -937,6 +969,11 @@ export async function runTui(app: AppContext): Promise<void> {
     subagentStreamUnsubs.push(unsub);
   }
   const pollTimer = setInterval(() => {
+    // Animate spinner when researcher is active (not just on token events)
+    if (state.status !== 'idle' && state.status !== 'error') {
+      spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
+    }
+
     if (subMod) {
       state.subagents = [...subMod.activeSubagents.values()];
       // Subscribe to stream events for any new subagents
@@ -1129,9 +1166,12 @@ function formatStatusLeft(
 ): string {
   const sColor = state.status === 'idle' ? '✓' : state.status === 'error' ? '✗' : '…';
   let bar = `[${sColor} ${state.status}`;
-  if (state.status === 'thinking' && spinnerChar !== undefined && outputTokens !== undefined) {
-    const tokStr = outputTokens >= 1000 ? (outputTokens / 1000).toFixed(1) + 'k' : String(outputTokens);
-    bar += ` ${spinnerChar} ${tokStr} tok`;
+  if (spinnerChar !== undefined && state.status !== 'idle' && state.status !== 'error') {
+    bar += ` ${spinnerChar}`;
+    if (state.status === 'thinking' && outputTokens !== undefined && outputTokens > 0) {
+      const tokStr = outputTokens >= 1000 ? (outputTokens / 1000).toFixed(1) + 'k' : String(outputTokens);
+      bar += ` ${tokStr} tok`;
+    }
   }
   if (state.tool) bar += ` | ${state.tool}`;
   const running = state.subagents.filter(s => s.status === 'running').length;
