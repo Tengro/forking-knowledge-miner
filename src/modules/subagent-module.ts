@@ -160,8 +160,8 @@ export interface SubagentPeekSnapshot {
   status: 'running' | 'completed' | 'failed';
   startedAt: number;
   elapsedMs: number;
-  systemPrompt: string;
-  messages: Array<{ participant: string; content: ContentBlock[] }>;
+  messageCount: number;
+  lastMessageSnippet: string;
   currentStream: string;
   pendingToolCalls: Array<{ name: string; input?: unknown }>;
   toolCallsCount: number;
@@ -471,7 +471,7 @@ export class SubagentModule implements Module {
       },
       {
         name: 'peek',
-        description: 'Peek at a running subagent\'s live state: full compiled context (system prompt, messages, tool results), current streaming output, and pending tool calls. Omit name to peek at all running subagents.',
+        description: 'Peek at a running subagent\'s live state: status, elapsed time, message count, last message snippet, current streaming output, and pending tool calls. Omit name to peek at all running subagents.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -851,10 +851,21 @@ export class SubagentModule implements Module {
       if (e.name === displayName) { entry = e; break; }
     }
 
-    let messages: Array<{ participant: string; content: ContentBlock[] }> = [];
+    let messageCount = 0;
+    let lastMessageSnippet = '';
     try {
       const compiled = await live.contextManager.compile();
-      messages = compiled.messages;
+      messageCount = compiled.messages.length;
+      // Extract a short snippet from the last message for observability
+      // without dumping the entire context into the caller's window.
+      if (compiled.messages.length > 0) {
+        const last = compiled.messages[compiled.messages.length - 1];
+        const textBlocks = last.content
+          .filter((b: ContentBlock) => b.type === 'text')
+          .map((b: ContentBlock) => (b as { type: 'text'; text: string }).text);
+        const fullText = textBlocks.join(' ');
+        lastMessageSnippet = fullText.length > 500 ? fullText.slice(-500) : fullText;
+      }
     } catch {
       // Context manager may be mid-modification; return what we have
     }
@@ -875,8 +886,8 @@ export class SubagentModule implements Module {
       status: entry?.status ?? 'running',
       startedAt: entry?.startedAt ?? 0,
       elapsedMs,
-      systemPrompt: live.systemPrompt,
-      messages,
+      messageCount,
+      lastMessageSnippet,
       currentStream: live.currentStream,
       pendingToolCalls: live.pendingToolCalls,
       toolCallsCount: entry?.toolCallsCount ?? 0,
@@ -1040,6 +1051,15 @@ export class SubagentModule implements Module {
     }
 
     // Wait for all
+    if (this.launchedTasks.size === 0) {
+      return {
+        success: true,
+        data: {
+          pending: 0,
+          message: 'No launched tasks to wait for. Use subagent:launch to start a non-blocking task first, then subagent:wait to collect results.',
+        },
+      };
+    }
     const results: Record<string, SubagentResult> = {};
     for (const [id, task] of this.launchedTasks) {
       results[id] = await task.promise;

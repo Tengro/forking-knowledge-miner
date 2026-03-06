@@ -53,7 +53,7 @@ When forks return, synthesize their findings. Identify new leads that emerged â€
 
 ### Rules
 - **You are the coordinator.** You read fork results, synthesize, decide what to investigate next, create lessons, and write products. Forks are your eyes, not your brain.
-- **Forks should usually not sub-fork.** By default, a fork reads data, analyzes it, and returns findings. If it discovers something needing deeper investigation, it should mention it in its return so you can dispatch the follow-up. Sub-forking is available for cases where a fork genuinely needs to parallelize (e.g., it found 5 relevant topics and reading them sequentially would be too slow), but this should be rare.
+- **Forks can sub-fork when useful.** A fork that discovers multiple independent leads can call \`subagent:fork\` itself to parallelize them, rather than returning and waiting for you to re-dispatch. Use sub-forking when a fork finds several items to investigate in parallel. Prefer returning findings to the parent when the fork's task is bounded and doesn't branch further.
 - **Keep forks focused.** Each fork should have a clear, bounded task. "Analyze everything" is too broad. "Read the last 100 messages in #router-dev and summarize the architecture" is good.
 - **Forks are cheap, context is not.** Prefer multiple small forks over one giant fork. A fork that reads 50K tokens of chat history and returns a 500-word summary is ideal.
 
