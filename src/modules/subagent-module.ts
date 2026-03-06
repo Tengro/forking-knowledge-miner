@@ -98,6 +98,22 @@ interface LaunchedTask {
   completed: boolean;
 }
 
+/**
+ * Non-retryable termination of a subagent. All abnormal-but-expected exits
+ * (user cancel, zombie reclaim, depth limit, etc.) use this so the catch
+ * path can distinguish "killed" from "transient network error".
+ */
+export class SubagentTerminated extends Error {
+  constructor(
+    public readonly reason: 'cancelled' | 'zombie' | 'killed',
+    public readonly partialOutput: string,
+    message?: string,
+  ) {
+    super(message ?? `Subagent terminated: ${reason}`);
+    this.name = 'SubagentTerminated';
+  }
+}
+
 /** Persisted subagent state (stored in Chronicle module state). */
 interface PersistedSubagent {
   name: string;
@@ -618,9 +634,12 @@ export class SubagentModule implements Module {
         // Cancel via cancellation handle (unblocks the Promise.race in runSpawn/runFork)
         const handle = this.cancellationHandles.get(displayName);
         if (handle) {
-          handle.reject(new Error(
+          const partial = live.currentStream ?? '';
+          handle.reject(new SubagentTerminated(
+            'zombie',
+            partial,
             `Zombie detected: "${displayName}" ran for ${(elapsed / 1000).toFixed(0)}s ` +
-            `without starting inference. Slot reclaimed.`
+            `without starting inference. Slot reclaimed.`,
           ));
           this.cancellationHandles.delete(displayName);
         }
@@ -744,6 +763,7 @@ export class SubagentModule implements Module {
 
     // Abort the active inference stream (cancels the HTTP request)
     const live = this.liveSubagents.get(displayName);
+    const partial = live?.currentStream ?? '';
     if (live) {
       try {
         const agent = this.getFramework().getAgent(live.frameworkAgentName);
@@ -752,7 +772,7 @@ export class SubagentModule implements Module {
     }
 
     // Unblock the Promise.race in runSpawn/runFork
-    handle.reject(new Error('Cancelled by user'));
+    handle.reject(new SubagentTerminated('cancelled', partial, `Subagent "${displayName}" cancelled by user`));
     return true;
   }
 
@@ -1181,14 +1201,14 @@ export class SubagentModule implements Module {
           lastError = err instanceof Error ? err : new Error(String(err));
           this.cancellationHandles.delete(input.name);
 
-          // User-initiated cancellation — return partial output, not a failure
-          if (lastError.message === 'Cancelled by user') {
-            const partial = this.liveSubagents.get(input.name)?.currentStream ?? '';
+          // Non-retryable termination (user cancel, zombie reclaim, etc.)
+          if (lastError instanceof SubagentTerminated) {
             entry.status = 'completed';
             entry.completedAt = Date.now();
-            entry.statusMessage = 'stopped by user';
+            entry.statusMessage = lastError.reason;
             const notice = this.concurrencyNotice(waitedMs);
-            const summary = notice + '[Stopped by user] ' + (partial || '(no output yet)');
+            const label = lastError.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${lastError.reason}`;
+            const summary = notice + `[${label}] ` + (lastError.partialOutput || '(no output yet)');
             this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
             return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
           }
@@ -1362,14 +1382,14 @@ export class SubagentModule implements Module {
           lastError = err instanceof Error ? err : new Error(String(err));
           this.cancellationHandles.delete(input.name);
 
-          // User-initiated cancellation — return partial output, not a failure
-          if (lastError.message === 'Cancelled by user') {
-            const partial = this.liveSubagents.get(input.name)?.currentStream ?? '';
+          // Non-retryable termination (user cancel, zombie reclaim, etc.)
+          if (lastError instanceof SubagentTerminated) {
             entry.status = 'completed';
             entry.completedAt = Date.now();
-            entry.statusMessage = 'stopped by user';
+            entry.statusMessage = lastError.reason;
             const notice = this.concurrencyNotice(waitedMs);
-            const summary = notice + '[Stopped by user] ' + (partial || '(no output yet)');
+            const label = lastError.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${lastError.reason}`;
+            const summary = notice + `[${label}] ` + (lastError.partialOutput || '(no output yet)');
             this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
             return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
           }
