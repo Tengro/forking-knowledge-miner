@@ -173,9 +173,9 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
         return mount;
       });
     } else {
-      // Default: read-only local mount + read-write products mount
+      // Default: read-only input mount + read-write products mount
       mounts = [
-        { name: 'local', path: resolve('.'), mode: 'read-only', watch: 'never' },
+        { name: 'input', path: resolve('./input'), mode: 'read-only', watch: 'never' },
         { name: 'products', path: resolve('./output'), mode: 'read-write', watch: 'never' },
       ];
     }
