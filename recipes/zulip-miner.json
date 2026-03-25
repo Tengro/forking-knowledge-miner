@@ -29,7 +29,16 @@
     "subagents": true,
     "lessons": true,
     "retrieval": true,
-    "wake": true,
+    "wake": {
+      "policies": [
+        {
+          "name": "subagent-completions",
+          "match": { "scope": ["inference-request"] },
+          "behavior": "always"
+        }
+      ],
+      "default": "skip"
+    },
     "workspace": {
       "mounts": [
         { "name": "local", "path": ".", "mode": "read-only" },

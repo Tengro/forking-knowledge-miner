@@ -533,7 +533,13 @@ export class SubagentModule implements Module {
     }
   }
 
-  async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    // When an async subagent completes, deliverAsyncResult() pushes an
+    // inference-request event.  Convert it into a proper requestInference
+    // response so the framework (and EventGate) can route it normally.
+    if (event.type === 'inference-request' && 'source' in event && event.source === 'subagent') {
+      return { requestInference: [(event as { agentName: string }).agentName] };
+    }
     return {};
   }
 
