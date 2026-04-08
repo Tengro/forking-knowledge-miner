@@ -245,7 +245,7 @@ Or just quit — lessons are auto-exported on exit. This creates `./output/lesso
 bun src/index.ts recipes/knowledge-reviewer.json
 ```
 
-The Reviewer shares the same data directory as the Miner — it can access all lessons extracted by previous mining sessions. It also reads the Miner's output documents and produces:
+The Reviewer reads the exported lessons and documents from `./output/` (mounted as read-only `input/`). It produces:
 - **Critic findings** per document — internal contradictions, unsupported claims, missing markers
 - **SME checklist** — a focused list of items for domain experts to verify
 
