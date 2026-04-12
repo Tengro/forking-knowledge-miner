@@ -33,7 +33,7 @@ import {
   clearSavedRecipe,
   parseRecipeArg,
 } from './recipe.js';
-import { createBranchState, resetBranchState, type BranchState } from './commands.js';
+import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
 
 export type { AppContext };
 
@@ -128,7 +128,8 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
   // Lessons
   let lessonsModule: LessonsModule | null = null;
   if (modules.lessons !== false) {
-    lessonsModule = new LessonsModule();
+    const globalLessonsPath = resolve(join(storePath, '..', '..', 'lessons.json'));
+    lessonsModule = new LessonsModule({ globalPath: globalLessonsPath });
     moduleInstances.push(lessonsModule);
   }
 
@@ -439,6 +440,7 @@ async function main() {
     userMessageCount: 0,
 
     async switchSession(id: string) {
+      handleExport(this);
       await this.framework.stop();
       sessionManager.setActiveSession(id);
       const newStorePath = sessionManager.getStorePath(id);

@@ -4,3 +4,6 @@ data/
 .env
 .zuliprc
 mcpl-servers.json
+my-recipe.json
+output/
+review-output/
