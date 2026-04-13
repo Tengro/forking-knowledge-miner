@@ -32,7 +32,15 @@ import type { AgentFramework } from '@animalabs/agent-framework';
 import type { AutobiographicalStrategy } from '@animalabs/context-manager';
 import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
 import type { SubagentModule, ActiveSubagent } from './modules/subagent-module.js';
+import type { SessionUsage } from '@connectome/agent-framework';
 import { handleCommand, resetBranchState } from './commands.js';
+
+/** Format a token count compactly: 1.2M / 3.5k / 42. */
+export function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
+  return String(n);
+}
 
 interface AppContext {
   framework: AgentFramework;
@@ -413,11 +421,7 @@ export async function runTui(app: AppContext): Promise<void> {
     updateStatus();
   }
 
-  const fmtK = (n: number) => {
-    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-    if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
-    return String(n);
-  };
+  const fmtK = fmtTokens;
 
   // ── Fleet tree view ────────────────────────────────────────────────
 
@@ -823,18 +827,12 @@ export async function runTui(app: AppContext): Promise<void> {
       }
 
       case 'inference:completed': {
-        const usage = event.tokenUsage as { input?: number; output?: number; cacheRead?: number; cacheCreation?: number } | undefined;
-        if (usage) {
-          state.tokens.input += usage.input ?? 0;
-          state.tokens.output += usage.output ?? 0;
-          state.tokens.cacheRead += usage.cacheRead ?? 0;
-          state.tokens.cacheWrite += usage.cacheCreation ?? 0;
-          // Track context size per agent (store by both full and short name)
-          if (agent && usage.input) {
-            agentContextTokens.set(agent, usage.input);
-            const short = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '').replace(/-retry\d+$/, '');
-            if (short !== agent) agentContextTokens.set(short, usage.input);
-          }
+        const usage = event.tokenUsage as { input?: number; output?: number } | undefined;
+        // Track context size per agent (store by both full and short name)
+        if (usage && agent && usage.input) {
+          agentContextTokens.set(agent, usage.input);
+          const short = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '').replace(/-retry\d+$/, '');
+          if (short !== agent) agentContextTokens.set(short, usage.input);
         }
 
         if (agent === rootAgentName) {
@@ -851,6 +849,16 @@ export async function runTui(app: AppContext): Promise<void> {
           }
           if (streaming) endStream();
         }
+        updateStatus();
+        break;
+      }
+
+      case 'usage:updated': {
+        const { totals } = event as { totals: SessionUsage };
+        state.tokens.input = totals.inputTokens;
+        state.tokens.output = totals.outputTokens;
+        state.tokens.cacheRead = totals.cacheReadTokens;
+        state.tokens.cacheWrite = totals.cacheCreationTokens;
         updateStatus();
         break;
       }
@@ -1420,13 +1428,8 @@ function formatTokens(tokens: TokenUsage, verbose: boolean): string {
 
   const total = tokens.input + tokens.output;
   if (total > 0) {
-    const fmt = (n: number) => {
-      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-      if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
-      return String(n);
-    };
-    let s = `${fmt(tokens.input)}in ${fmt(tokens.output)}out`;
-    if (tokens.cacheRead > 0) s += ` ${fmt(tokens.cacheRead)}cache`;
+    let s = `${fmtTokens(tokens.input)}in ${fmtTokens(tokens.output)}out`;
+    if (tokens.cacheRead > 0) s += ` ${fmtTokens(tokens.cacheRead)}cache`;
     parts.push(s);
   }
 

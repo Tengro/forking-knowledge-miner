@@ -438,7 +438,7 @@ export class SubagentModule implements Module {
               description: 'Tool names the subagent can use (default: all). Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. For async tasks, the subagent is cancelled after this duration. For sync tasks, auto-detaches to background after this duration (result delivered as message). Example: 600000 = 10 minutes.' },
+            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
           },
           required: ['name', 'systemPrompt', 'task'],
         },
@@ -454,7 +454,7 @@ export class SubagentModule implements Module {
             systemPrompt: { type: 'string', description: 'Override system prompt (optional, defaults to parent)' },
             model: { type: 'string', description: 'Model override (optional)' },
             sync: { type: 'boolean', description: 'If true, block until fork completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. For async tasks, the subagent is cancelled after this duration. For sync tasks, auto-detaches to background after this duration (result delivered as message). Example: 600000 = 10 minutes.' },
+            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
           },
           required: ['name', 'task'],
         },
@@ -990,13 +990,14 @@ export class SubagentModule implements Module {
   // Execution Timeout
   // =========================================================================
 
-  private withTimeout<T>(promise: Promise<T>, name: string): Promise<T> {
+  private withTimeout<T>(promise: Promise<T>, name: string, timeoutMs?: number): Promise<T> {
+    if (timeoutMs === undefined) return promise;
     return Promise.race([
       promise,
       new Promise<never>((_, reject) =>
         setTimeout(
-          () => reject(new Error(`Subagent ${name} timed out after ${this.maxExecutionMs}ms`)),
-          this.maxExecutionMs,
+          () => reject(new Error(`Subagent ${name} timed out after ${timeoutMs}ms`)),
+          timeoutMs,
         )
       ),
     ]);
@@ -1044,27 +1045,20 @@ export class SubagentModule implements Module {
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
 
-    // Apply per-task timeout override if provided
-    const savedMaxExecution = this.maxExecutionMs;
-    if (input.timeoutMs !== undefined) {
-      this.maxExecutionMs = input.timeoutMs;
-    }
-
-    // Sync mode: block until completion, but detachable mid-flight
+    // Sync mode: block until completion, but detachable mid-flight.
+    // Default timeout applies (600s) — auto-detaches to background.
     if (input.sync) {
-      const promise = this.runSpawn(input, callerAgentName, callerDepth);
-
-      // Create a detachable wrapper: resolves either when the subagent completes
-      // or when detach() is called (user Ctrl+B or auto-timeout)
+      const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
+      const promise = this.runSpawn(input, callerAgentName, callerDepth, timeoutMs);
       const result = await this.runDetachable(input.name, 'spawn', promise, parentAgentName, input.timeoutMs);
-      this.maxExecutionMs = savedMaxExecution;
       return result;
     }
 
-    // Async mode (default): fire-and-forget, deliver result as message
-    const promise = this.runSpawn(input, callerAgentName, callerDepth);
+    // Async mode (default): fire-and-forget, deliver result as message.
+    // No default timeout — async agents run until they finish unless
+    // the caller explicitly sets timeoutMs.
+    const promise = this.runSpawn(input, callerAgentName, callerDepth, input.timeoutMs);
     this.asyncHandles.set(input.name, { name: input.name, type: 'spawn', promise, parentAgentName });
-    this.maxExecutionMs = savedMaxExecution;
 
     promise
       .then(result => this.deliverAsyncResult(input.name, result, parentAgentName))
@@ -1085,25 +1079,20 @@ export class SubagentModule implements Module {
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
 
-    // Apply per-task timeout override if provided
-    const savedMaxExecution = this.maxExecutionMs;
-    if (input.timeoutMs !== undefined) {
-      this.maxExecutionMs = input.timeoutMs;
-    }
-
-    // Sync mode: block until completion, but detachable mid-flight
+    // Sync mode: block until completion, but detachable mid-flight.
+    // Default timeout applies (600s) — auto-detaches to background.
     if (input.sync) {
-      const promise = this.runFork(input, callerAgentName, callerDepth);
-
+      const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
+      const promise = this.runFork(input, callerAgentName, callerDepth, timeoutMs);
       const result = await this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs);
-      this.maxExecutionMs = savedMaxExecution;
       return result;
     }
 
-    // Async mode (default): fire-and-forget, deliver result as message
-    const promise = this.runFork(input, callerAgentName, callerDepth);
+    // Async mode (default): fire-and-forget, deliver result as message.
+    // No default timeout — async agents run until they finish unless
+    // the caller explicitly sets timeoutMs.
+    const promise = this.runFork(input, callerAgentName, callerDepth, input.timeoutMs);
     this.asyncHandles.set(input.name, { name: input.name, type: 'fork', promise, parentAgentName });
-    this.maxExecutionMs = savedMaxExecution;
 
     promise
       .then(result => this.deliverAsyncResult(input.name, result, parentAgentName))
@@ -1290,7 +1279,7 @@ export class SubagentModule implements Module {
   // Subagent Execution
   // =========================================================================
 
-  private async runSpawn(input: SpawnInput, _callerAgentName?: string, callerDepth = 0): Promise<SubagentResult> {
+  private async runSpawn(input: SpawnInput, _callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number): Promise<SubagentResult> {
     const { waitedMs } = await this.acquireSlot();
     const childDepth = callerDepth + 1;
 
@@ -1355,6 +1344,7 @@ export class SubagentModule implements Module {
             this.withTimeout(
               framework.runEphemeralToCompletion(agent, contextManager),
               input.name,
+              executionTimeoutMs,
             ),
             cancelPromise,
           ]);
@@ -1421,7 +1411,7 @@ export class SubagentModule implements Module {
     }
   }
 
-  private async runFork(input: ForkInput, callerAgentName?: string, callerDepth = 0): Promise<SubagentResult> {
+  private async runFork(input: ForkInput, callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number): Promise<SubagentResult> {
     const { waitedMs } = await this.acquireSlot();
     const childDepth = callerDepth + 1;
 
@@ -1537,6 +1527,7 @@ export class SubagentModule implements Module {
             this.withTimeout(
               framework.runEphemeralToCompletion(agent, contextManager),
               input.name,
+              executionTimeoutMs,
             ),
             cancelPromise,
           ]);

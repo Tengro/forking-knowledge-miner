@@ -18,6 +18,7 @@
  *   /recipe        — Show current recipe info
  *   /newtopic      — Reset head window (auto-summarize or with user context)
  *   /export        — Export lessons to ./output/ (JSON + markdown)
+ *   /usage         — Show session token usage and costs
  *   /help          — List commands
  */
 
@@ -27,6 +28,7 @@ import type { AgentFramework } from '@animalabs/agent-framework';
 import type { ContextManager } from '@animalabs/context-manager';
 import type { Recipe } from './recipe.js';
 import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
+import { fmtTokens } from './tui.js';
 
 /** Imported lazily to avoid circular deps — index.ts re-exports the type. */
 interface AppContext {
@@ -137,6 +139,7 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
           { text: '  /session delete <name> Delete a session', style: 'system' },
           { text: '  /recipe                Show current recipe info', style: 'system' },
           { text: '  /newtopic [context]    Reset head window (auto-summarize if empty)', style: 'system' },
+          { text: '  /usage                 Show session token usage and costs', style: 'system' },
         ],
       };
 
@@ -187,6 +190,9 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
 
     case 'newtopic':
       return handleNewTopic(app, args);
+
+    case 'usage':
+      return handleUsage(app);
 
     default:
       return {
@@ -357,6 +363,43 @@ function handleRecipe(app: AppContext): CommandResult {
 
   const mcpCount = r.mcpServers ? Object.keys(r.mcpServers).length : 0;
   lines.push({ text: `  MCP servers (recipe): ${mcpCount}`, style: 'system' });
+
+  return { lines };
+}
+
+// ---------------------------------------------------------------------------
+// /usage — session token usage and cost breakdown
+// ---------------------------------------------------------------------------
+
+function handleUsage(app: AppContext): CommandResult {
+  const snapshot = app.framework.getSessionUsage();
+  const lines: Line[] = [];
+  const fmt = fmtTokens;
+
+  const fmtCost = (cost?: { total: number; currency: string }) => {
+    if (!cost) return '';
+    return `  $${cost.total.toFixed(4)}`;
+  };
+
+  const { totals } = snapshot;
+  lines.push({ text: '--- Session Usage ---', style: 'system' });
+  lines.push({
+    text: `  Total: ${fmt(totals.inputTokens)} in  ${fmt(totals.outputTokens)} out  ${fmt(totals.cacheReadTokens)} cache read  ${fmt(totals.cacheCreationTokens)} cache write${fmtCost(totals.estimatedCost)}`,
+    style: 'system',
+  });
+  lines.push({ text: `  Inferences: ${snapshot.inferenceCount}`, style: 'system' });
+
+  if (snapshot.byAgent.length > 0) {
+    lines.push({ text: '', style: 'system' });
+    lines.push({ text: '--- Per Agent ---', style: 'system' });
+    for (const agent of snapshot.byAgent) {
+      const u = agent.usage;
+      lines.push({
+        text: `  ${agent.agentName}  ${fmt(u.inputTokens)} in  ${fmt(u.outputTokens)} out  ${fmt(u.cacheReadTokens)} cache read  ${fmt(u.cacheCreationTokens)} cache write${fmtCost(u.estimatedCost)}  (${agent.inferenceCount} inf)`,
+        style: 'system',
+      });
+    }
+  }
 
   return { lines };
 }
