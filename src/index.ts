@@ -16,6 +16,7 @@
 import { Membrane, AnthropicAdapter, NativeFormatter } from '@animalabs/membrane';
 import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, type Module, type MountConfig } from '@animalabs/agent-framework';
 import { resolve, join } from 'node:path';
+import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
@@ -215,15 +216,18 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
   // -- Build strategy --
   const strategyConfig = recipe.agent.strategy;
   const strategyType = strategyConfig?.type ?? 'autobiographical';
+  const autobiographicalOpts = {
+    headWindowTokens: strategyConfig?.headWindowTokens ?? 4000,
+    recentWindowTokens: strategyConfig?.recentWindowTokens ?? 30000,
+    compressionModel: strategyConfig?.compressionModel ?? model,
+    autoTickOnNewMessage: true,
+    maxMessageTokens: strategyConfig?.maxMessageTokens ?? 10000,
+  };
   const strategy = strategyType === 'passthrough'
     ? new PassthroughStrategy()
-    : new AutobiographicalStrategy({
-        headWindowTokens: strategyConfig?.headWindowTokens ?? 4000,
-        recentWindowTokens: strategyConfig?.recentWindowTokens ?? 30000,
-        compressionModel: strategyConfig?.compressionModel ?? model,
-        autoTickOnNewMessage: true,
-        maxMessageTokens: strategyConfig?.maxMessageTokens ?? 10000,
-      });
+    : strategyType === 'frontdesk'
+      ? new FrontdeskStrategy(autobiographicalOpts)
+      : new AutobiographicalStrategy(autobiographicalOpts);
 
   // -- Create framework --
   const framework = await AgentFramework.create({
