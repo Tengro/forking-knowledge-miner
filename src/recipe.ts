@@ -19,7 +19,7 @@ import { resolve } from 'node:path';
 // ---------------------------------------------------------------------------
 
 export interface RecipeStrategy {
-  type: 'autobiographical' | 'passthrough';
+  type: 'autobiographical' | 'passthrough' | 'frontdesk';
   headWindowTokens?: number;
   recentWindowTokens?: number;
   compressionModel?: string;
@@ -173,8 +173,15 @@ export function validateRecipe(raw: unknown): Recipe {
   // Validate strategy type if present
   if (agent.strategy) {
     const strategy = agent.strategy as Record<string, unknown>;
-    if (strategy.type && strategy.type !== 'autobiographical' && strategy.type !== 'passthrough') {
-      throw new Error(`Invalid strategy type "${strategy.type}". Must be "autobiographical" or "passthrough".`);
+    if (
+      strategy.type &&
+      strategy.type !== 'autobiographical' &&
+      strategy.type !== 'passthrough' &&
+      strategy.type !== 'frontdesk'
+    ) {
+      throw new Error(
+        `Invalid strategy type "${strategy.type}". Must be "autobiographical", "passthrough", or "frontdesk".`,
+      );
     }
   }
 
