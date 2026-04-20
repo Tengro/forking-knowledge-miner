@@ -58,6 +58,15 @@
             "pathGlob": "knowledge-requests/*.md"
           },
           "behavior": "always"
+        },
+        {
+          "name": "reviewed-responses",
+          "match": {
+            "scope": ["workspace:created"],
+            "mount": "library-reviewed",
+            "pathGlob": "library-reviewed/*.md"
+          },
+          "behavior": "always"
         }
       ],
       "default": "skip"
@@ -66,7 +75,13 @@
       "configMount": true,
       "mounts": [
         { "name": "library-mined",      "path": "./output",             "mode": "read-only" },
-        { "name": "library-reviewed",   "path": "./review-output",      "mode": "read-only" },
+        {
+          "name": "library-reviewed",
+          "path": "./review-output",
+          "mode": "read-only",
+          "watch": "always",
+          "wakeOnChange": ["created"]
+        },
         {
           "name": "knowledge-requests",
           "path": "./knowledge-requests",
