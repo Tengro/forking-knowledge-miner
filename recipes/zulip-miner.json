@@ -21,7 +21,8 @@
       "env": {
         "ENABLE_ZULIP": "true",
         "ENABLE_DISCORD": "false"
-      }
+      },
+      "channelSubscription": "manual"
     }
   },
 

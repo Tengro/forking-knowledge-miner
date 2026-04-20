@@ -22,6 +22,7 @@ export interface ServerFileEntry {
   reconnectIntervalMs?: number;
   enabledFeatureSets?: string[];
   disabledFeatureSets?: string[];
+  channelSubscription?: 'auto' | 'manual' | string[];
 }
 
 export interface McplServersFile {
@@ -65,6 +66,7 @@ export function loadMcplServers(configPath: string): LoadedServerConfig[] {
       reconnectIntervalMs: entry.reconnectIntervalMs,
       enabledFeatureSets: entry.enabledFeatureSets,
       disabledFeatureSets: entry.disabledFeatureSets,
+      channelSubscription: entry.channelSubscription,
     });
   }
 

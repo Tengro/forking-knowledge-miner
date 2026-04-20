@@ -210,7 +210,18 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
     .filter(([, entry]) => entry.command) // must have a command
     .map(([id, entry]) => ({ id, ...entry, command: entry.command! }));
 
-  const allServers = [...recipeServerList, ...fileServers];
+  // Overlay recipe-level `channelSubscription` onto file servers. Credentials
+  // live in mcpl-servers.json (gitignored), but subscription policy is
+  // recipe-level intent and must not be silently dropped on id collision.
+  const mergedFileServers = fileServers.map(s => {
+    const recipeEntry = recipeServers[s.id];
+    if (recipeEntry?.channelSubscription !== undefined && s.channelSubscription === undefined) {
+      return { ...s, channelSubscription: recipeEntry.channelSubscription };
+    }
+    return s;
+  });
+
+  const allServers = [...recipeServerList, ...mergedFileServers];
 
   // No server augmentation needed — gate is wired via FrameworkConfig.gate
 

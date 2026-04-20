@@ -22,7 +22,8 @@
         "ENABLE_ZULIP": "true",
         "ENABLE_DISCORD": "false",
         "ZULIP_RC_PATH": "./.zuliprc"
-      }
+      },
+      "channelSubscription": "manual"
     },
     "syncntn": {
       "command": "../syncntn/services/mcp/start_mcp_local.sh",

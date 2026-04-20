@@ -49,6 +49,12 @@ export interface RecipeMcpServer {
   disabledFeatureSets?: string[];
   reconnect?: boolean;
   reconnectIntervalMs?: number;
+  /**
+   * Channel auto-open policy. 'auto' (default) opens everything the server
+   * registers; 'manual' opens nothing (agent calls channel_open as needed);
+   * a string[] is an allow-list of channel ids.
+   */
+  channelSubscription?: 'auto' | 'manual' | string[];
 }
 
 /**
