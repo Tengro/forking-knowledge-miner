@@ -133,15 +133,52 @@ EOF
 
 Replace `sk-ant-...` with your real key. Bun auto-loads `.env` — no extra step needed.
 
-## Step 6: Review the triumvirate recipe
+## Step 6: Configure the miner's data sources
 
-Open `recipes/triumvirate.json` and skim it. You generally don't need to edit anything unless you want to:
+The miner child uses `recipes/knowledge-miner.json`, which comes pre-wired to talk to **Zulip, Notion, and GitLab**. You decide which of these you actually want enabled.
 
-- Rename the clerk's channel away from `tracker-miner-f` — edit `recipes/clerk.json`, change `ZULIP_SUBSCRIBE` and the `tracker-channel` wake policy's `channel` field.
-- Swap the model — change `"model": "claude-opus-4-6"` to `claude-sonnet-4-6` (faster, cheaper) or another Claude model. The same override can be applied to each child's recipe file.
-- Adjust who auto-starts — set `"autoStart": false` on any child if you want to leave them inactive until the conductor explicitly spawns them.
+Open `recipes/knowledge-miner.json` and look at the `mcpServers` block. Three source entries are there as templates:
 
-For a first run, leave the file as-is.
+### Zulip (required — already done)
+
+You set this up in Steps 2–4. The entry under `mcpServers.zulip` already points at `../zulip-mcp/build/index.js` and reads `./.zuliprc`. No change needed.
+
+### GitLab (optional)
+
+If you want the miner to read your team's GitLab issues, merge requests, and code:
+
+1. In your GitLab instance, go to **User Settings > Access Tokens** and create a Personal Access Token with scopes `read_api` and `read_repository`. Add `api` if you want the miner to write issues or comments.
+2. In `recipes/knowledge-miner.json`, find the `gitlab` and `gitlab-clone` blocks. Replace the placeholders:
+   - `GITLAB_PERSONAL_ACCESS_TOKEN` — your token
+   - `GITLAB_API_URL` — your GitLab's `/api/v4` endpoint (e.g. `https://gitlab.example.com/api/v4` or `https://gitlab.com/api/v4`)
+
+No separate install needed — the recipe uses `npx @zereight/mcp-gitlab` on demand. Note that `gitlab-clone` additionally runs `tsx ../gitlab-clone-mcp/src/index.ts`; if you want that one too, clone `gitlab-clone-mcp` into a sibling directory of connectome-host (same `..` relationship as zulip-mcp).
+
+**If you don't use GitLab**, delete the `gitlab` and `gitlab-clone` blocks from `mcpServers` entirely. Leaving placeholder tokens in place will produce authentication errors at miner startup and noisy log churn.
+
+### Notion (optional)
+
+If you want the miner to read your Notion workspace:
+
+1. Install a Notion MCP server. The recipe's template is named `syncntn` after the adapter it was developed against — any MCP server that exposes Notion search and page-read tools works, as long as its exposed tool names match what the system prompt references (`syncntn--search_pages`, `syncntn--get_page_markdown`, etc.). If your server uses different tool names, either rename the key in the recipe and update the miner's system prompt, or install/build `syncntn` itself.
+2. Start your Notion MCP server wherever the recipe's `command` path expects it.
+3. In `recipes/knowledge-miner.json`, replace the placeholders under `mcpServers.syncntn`:
+   - `STORAGE_URL` — your MCP server's endpoint
+   - `WORKSPACE_ID` — your Notion workspace ID
+
+**If you don't use Notion**, delete the `syncntn` block from `mcpServers`. The miner adapts to whatever sources remain — the system prompt is written to tolerate any combination.
+
+See [SETUP.md → Step 2: Set up your data sources](./SETUP.md#step-2-set-up-your-data-sources) for additional background, including read-only GitLab modes and the Notion MCP server selection caveats.
+
+### Optional: tweak other defaults
+
+You can also edit `recipes/triumvirate.json` itself if you want to:
+
+- **Rename the clerk's channel** away from `tracker-miner-f` — edit `recipes/clerk.json`, change `ZULIP_SUBSCRIBE` and the `tracker-channel` wake policy's `channel` field.
+- **Swap the model** — change `"model": "claude-opus-4-6"` to `claude-sonnet-4-6` (faster, cheaper) or another Claude model. The same override can be applied to each child's recipe file.
+- **Adjust autoStart** — set `"autoStart": false` on any child if you want to leave them inactive until you (or the conductor) explicitly launch them.
+
+For a minimal first run with Zulip-only knowledge extraction, just delete the GitLab + Notion blocks from `recipes/knowledge-miner.json` and leave everything else as-is.
 
 ## Step 7: First launch
 
@@ -225,12 +262,11 @@ This is the "leave the bots working overnight, come back tomorrow" workflow.
 
 ### Miner
 
-- You point it at a Zulip channel or topic (or it picks from what it can see).
-- It forks sub-agents to read in parallel, extracts decisions / patterns / people / processes.
-- It writes Draft documents into `library-mined/` and creates structured "lessons" in its Chronicle store.
-- Everything it writes is tagged with confidence markers — `[SRC: ...]`, `[INF]`, `[GEN]`, `❓`. These propagate all the way to the final library.
-
-Out of the box the triumvirate wires the miner to `recipes/zulip-miner.json`, which is **Zulip-only**. If your knowledge lives in Notion or GitLab too, you can point the miner at the multi-source `recipes/knowledge-miner.json` (or augment `zulip-miner.json` with additional MCP servers). See [Connecting additional data sources (Notion, GitLab)](#connecting-additional-data-sources-notion-gitlab) below.
+- Uses `recipes/knowledge-miner.json`. Reads whatever data sources you configured in Step 6 (Zulip always; optionally Notion and/or GitLab).
+- Wakes automatically when the clerk files a new ticket in `knowledge-requests/` — the miner's wake policy watches that directory.
+- Forks sub-agents to read across sources in parallel, extracts decisions / patterns / people / processes.
+- Writes Draft documents into `library-mined/` and creates structured "lessons" in its Chronicle store.
+- Tags every non-trivial claim with confidence markers — `[SRC: ...]`, `[INF]`, `[GEN]`, `❓`. These propagate all the way to the final library.
 
 ### Reviewer
 
@@ -335,7 +371,7 @@ If the conductor itself becomes unresponsive, `Ctrl+C` and relaunch. Children st
 | Child status stays "starting" forever | It timed out reaching ready. Check `data/<name>/headless.log` and `startup.log`. Most often: missing / invalid Zulip creds, or missing `../zulip-mcp/build/index.js`. |
 | A child is crashed with "API error 401" | Zulip credentials are wrong or expired. Regenerate the bot's API key, update `.zuliprc`, `/fleet restart <child>`. |
 | Clerk says "I don't see any messages in tracker-miner-f" | Check that the bot is actually subscribed to `#tracker-miner-f` in Zulip. Subscription happens on clerk startup via `ZULIP_SUBSCRIBE` — if the stream doesn't exist, it silently fails. |
-| Miner or clerk spawns keep crashing right away | Usually a missing `.zuliprc` or a path-resolution problem. Run the child recipe standalone to isolate: `bun src/index.ts recipes/zulip-miner.json` in the same directory. |
+| Miner or clerk launches keep crashing right away | Usually a missing `.zuliprc`, a placeholder GitLab/Notion credential left un-filled, or an MCP server (Notion) that isn't running. Run the child recipe standalone to isolate: `bun src/index.ts recipes/knowledge-miner.json` (or `recipes/clerk.json`) in the same directory — the errors come back clearly in the interactive TUI. Either fill the credentials or delete the offending `mcpServers` block. |
 | Process view shows fewer children than expected | Check the conductor's own `data/tui-error.log` for errors during child spawn. One child failing shouldn't prevent the others from starting. |
 | Children reappear after I thought I quit | If you chose `d` (detach) instead of `Y` (kill) last time, they're still running. `/fleet list` on startup will show them as adopted. Use `Y` to actually stop. |
 | The bill is higher than expected | All four agents run concurrently and all except the reviewer (Sonnet) default to Opus. Switch the conductor or miner to Sonnet by editing the relevant recipe's `"model"` field. |
@@ -344,70 +380,9 @@ For issues specific to one agent in isolation (miner, reviewer), see [SETUP.md](
 
 ## Customization
 
-### Connecting additional data sources (Notion, GitLab)
+### Adding or removing data sources later
 
-By default, the triumvirate's miner reads Zulip and nothing else. To widen it, you have two paths. In either case, the [Step 2 of the standalone SETUP.md guide](./SETUP.md#step-2-set-up-your-data-sources) walks through each source's credential-gathering step by step; cross-reference it for the hairy bits (GitLab token scopes, Notion MCP server choice, etc.).
-
-#### Path A: swap in the multi-source miner recipe (simplest)
-
-`recipes/knowledge-miner.json` is a ready-made recipe that talks to Zulip + Notion + GitLab. Edit `recipes/triumvirate.json` and change the miner's recipe pointer:
-
-```jsonc
-{
-  "name": "miner",
-  "recipe": "recipes/knowledge-miner.json",   // was: "recipes/zulip-miner.json"
-  "dataDir": "./data/miner",
-  "autoStart": true,
-  ...
-}
-```
-
-Then follow SETUP.md Step 2 to fill in the credentials in `recipes/knowledge-miner.json`:
-
-- **Zulip** — already set up from this guide.
-- **GitLab** — create a Personal Access Token with `read_api` and `read_repository` scopes (add `api` if you want the miner to write issues/comments). Paste into `GITLAB_PERSONAL_ACCESS_TOKEN` and set `GITLAB_API_URL` to your instance's `/api/v4` endpoint. No separate install — the recipe uses `npx @zereight/mcp-gitlab` on demand.
-- **Notion** — install a Notion MCP server (the recipe's template uses `syncntn`; any compatible server works as long as its exposed tool names match what the system prompt references). Fill in `STORAGE_URL` and `WORKSPACE_ID`. If you don't have a Notion MCP server and don't want to set one up, **remove the `syncntn` block** from the recipe — the agent adapts to whatever sources remain.
-
-After editing, restart the conductor. The miner child will relaunch with the new recipe and the additional tool surfaces available.
-
-#### Path B: augment `zulip-miner.json` in place (surgical)
-
-If you want to keep the triumvirate pointed at `zulip-miner.json` but also want it reading from GitLab (or Notion), copy the relevant `mcpServers` entries from `recipes/knowledge-miner.json` into `recipes/zulip-miner.json`:
-
-```jsonc
-"mcpServers": {
-  "zulip": { /* existing entry, keep as-is */ },
-  "gitlab": {
-    "command": "npx",
-    "args": ["-y", "@zereight/mcp-gitlab"],
-    "env": {
-      "GITLAB_PERSONAL_ACCESS_TOKEN": "YOUR_TOKEN_HERE",
-      "GITLAB_API_URL": "https://gitlab.example.com/api/v4"
-    }
-  },
-  "syncntn": {
-    "command": "../syncntn/services/mcp/start_mcp_local.sh",
-    "env": {
-      "STORAGE_URL": "http://localhost:8000",
-      "WORKSPACE_ID": "YOUR_NOTION_WORKSPACE_ID"
-    }
-  }
-}
-```
-
-You'll also want to update the miner's system prompt in `zulip-miner.json` to mention the new sources, otherwise the agent may not know to use them even though the tools are available. Consult `knowledge-miner.json`'s prompt for a template that already covers all three sources.
-
-#### Prerequisites for the widened setup
-
-Depending on which sources you enable, you may need:
-
-| Source | What you need | Where documented |
-|---|---|---|
-| GitLab | Personal Access Token; your GitLab API base URL | [SETUP.md → GitLab](./SETUP.md#gitlab) |
-| Notion | A running Notion MCP server reachable by the child process; workspace ID; any MCP-server-specific env | [SETUP.md → Notion](./SETUP.md#notion-optional-via-an-mcp-server) |
-| Additional Zulip streams | Bot subscription to the new streams; possibly stream-admin approval | Done in Zulip directly |
-
-GitLab and Notion credentials are per-source secrets — treat them like you'd treat the `.zuliprc`. Don't commit them.
+Data sources for the miner (Zulip, Notion, GitLab) are configured in `recipes/knowledge-miner.json` under `mcpServers`. To add one you hadn't set up before or remove one you no longer want, edit that block following the instructions in [Step 6](#step-6-configure-the-miners-data-sources) and `/fleet restart miner` — the miner respawns with the new MCP server set.
 
 ### Running only part of the trio
 
