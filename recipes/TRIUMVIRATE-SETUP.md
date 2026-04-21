@@ -47,19 +47,24 @@ You should see a TUI with a generic assistant. Type `/quit` to exit. If this did
 
 ## Step 2: Install the Zulip MCP server
 
-Two of the three specialists (miner, clerk) talk to Zulip. They do that through a small adapter called `zulip-mcp`, which has to be cloned and built once:
+Two of the three specialists (miner, clerk) talk to Zulip. They do that through a small adapter called `zulip-mcp`.
+
+**Important:** the version of `zulip-mcp` adapted to match the triumvirate's recipes and the headless host's MCPL protocol expectations currently lives on a PR branch: [antra-tess/zulip_mcp#3 "Mcpl addendum"](https://github.com/antra-tess/zulip_mcp/pull/3). The PR's code sits on `Anarchid/zulip_mcp` branch `mcpl-addendum`. Clone that directly — the `anima-research/zulip_mcp` main branch is behind and will not work with the triumvirate as of this writing.
 
 ```bash
 # From inside the connectome-host directory:
 cd ..
-git clone https://github.com/anima-research/zulip_mcp.git zulip-mcp
+git clone https://github.com/Anarchid/zulip_mcp.git zulip-mcp
 cd zulip-mcp
+git checkout mcpl-addendum
 npm install
 npm run build
 cd ../connectome-host
 ```
 
 This leaves a built binary at `../zulip-mcp/build/index.js`, relative to connectome-host. The triumvirate recipe expects it exactly there — don't rename or move it.
+
+Once [antra-tess/zulip_mcp#3](https://github.com/antra-tess/zulip_mcp/pull/3) merges upstream, you'll be able to clone the regular upstream repository and skip the `git checkout` step. Until then, stay on `mcpl-addendum`.
 
 ## Step 3: Create a Zulip bot and get credentials
 
@@ -225,6 +230,8 @@ This is the "leave the bots working overnight, come back tomorrow" workflow.
 - It writes Draft documents into `library-mined/` and creates structured "lessons" in its Chronicle store.
 - Everything it writes is tagged with confidence markers — `[SRC: ...]`, `[INF]`, `[GEN]`, `❓`. These propagate all the way to the final library.
 
+Out of the box the triumvirate wires the miner to `recipes/zulip-miner.json`, which is **Zulip-only**. If your knowledge lives in Notion or GitLab too, you can point the miner at the multi-source `recipes/knowledge-miner.json` (or augment `zulip-miner.json` with additional MCP servers). See [Connecting additional data sources (Notion, GitLab)](#connecting-additional-data-sources-notion-gitlab) below.
+
 ### Reviewer
 
 - Watches `library-mined/` for new/changed documents.
@@ -336,6 +343,71 @@ If the conductor itself becomes unresponsive, `Ctrl+C` and relaunch. Children st
 For issues specific to one agent in isolation (miner, reviewer), see [SETUP.md](./SETUP.md).
 
 ## Customization
+
+### Connecting additional data sources (Notion, GitLab)
+
+By default, the triumvirate's miner reads Zulip and nothing else. To widen it, you have two paths. In either case, the [Step 2 of the standalone SETUP.md guide](./SETUP.md#step-2-set-up-your-data-sources) walks through each source's credential-gathering step by step; cross-reference it for the hairy bits (GitLab token scopes, Notion MCP server choice, etc.).
+
+#### Path A: swap in the multi-source miner recipe (simplest)
+
+`recipes/knowledge-miner.json` is a ready-made recipe that talks to Zulip + Notion + GitLab. Edit `recipes/triumvirate.json` and change the miner's recipe pointer:
+
+```jsonc
+{
+  "name": "miner",
+  "recipe": "recipes/knowledge-miner.json",   // was: "recipes/zulip-miner.json"
+  "dataDir": "./data/miner",
+  "autoStart": true,
+  ...
+}
+```
+
+Then follow SETUP.md Step 2 to fill in the credentials in `recipes/knowledge-miner.json`:
+
+- **Zulip** — already set up from this guide.
+- **GitLab** — create a Personal Access Token with `read_api` and `read_repository` scopes (add `api` if you want the miner to write issues/comments). Paste into `GITLAB_PERSONAL_ACCESS_TOKEN` and set `GITLAB_API_URL` to your instance's `/api/v4` endpoint. No separate install — the recipe uses `npx @zereight/mcp-gitlab` on demand.
+- **Notion** — install a Notion MCP server (the recipe's template uses `syncntn`; any compatible server works as long as its exposed tool names match what the system prompt references). Fill in `STORAGE_URL` and `WORKSPACE_ID`. If you don't have a Notion MCP server and don't want to set one up, **remove the `syncntn` block** from the recipe — the agent adapts to whatever sources remain.
+
+After editing, restart the conductor. The miner child will relaunch with the new recipe and the additional tool surfaces available.
+
+#### Path B: augment `zulip-miner.json` in place (surgical)
+
+If you want to keep the triumvirate pointed at `zulip-miner.json` but also want it reading from GitLab (or Notion), copy the relevant `mcpServers` entries from `recipes/knowledge-miner.json` into `recipes/zulip-miner.json`:
+
+```jsonc
+"mcpServers": {
+  "zulip": { /* existing entry, keep as-is */ },
+  "gitlab": {
+    "command": "npx",
+    "args": ["-y", "@zereight/mcp-gitlab"],
+    "env": {
+      "GITLAB_PERSONAL_ACCESS_TOKEN": "YOUR_TOKEN_HERE",
+      "GITLAB_API_URL": "https://gitlab.example.com/api/v4"
+    }
+  },
+  "syncntn": {
+    "command": "../syncntn/services/mcp/start_mcp_local.sh",
+    "env": {
+      "STORAGE_URL": "http://localhost:8000",
+      "WORKSPACE_ID": "YOUR_NOTION_WORKSPACE_ID"
+    }
+  }
+}
+```
+
+You'll also want to update the miner's system prompt in `zulip-miner.json` to mention the new sources, otherwise the agent may not know to use them even though the tools are available. Consult `knowledge-miner.json`'s prompt for a template that already covers all three sources.
+
+#### Prerequisites for the widened setup
+
+Depending on which sources you enable, you may need:
+
+| Source | What you need | Where documented |
+|---|---|---|
+| GitLab | Personal Access Token; your GitLab API base URL | [SETUP.md → GitLab](./SETUP.md#gitlab) |
+| Notion | A running Notion MCP server reachable by the child process; workspace ID; any MCP-server-specific env | [SETUP.md → Notion](./SETUP.md#notion-optional-via-an-mcp-server) |
+| Additional Zulip streams | Bot subscription to the new streams; possibly stream-admin approval | Done in Zulip directly |
+
+GitLab and Notion credentials are per-source secrets — treat them like you'd treat the `.zuliprc`. Don't commit them.
 
 ### Running only part of the trio
 
