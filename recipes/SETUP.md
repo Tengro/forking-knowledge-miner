@@ -69,18 +69,17 @@ Works with both gitlab.com and self-hosted GitLab instances.
 
 No separate installation needed — the recipe uses `npx` to run `@zereight/mcp-gitlab` on demand.
 
-### Notion (via syncntn)
+### Notion (optional, via an MCP server)
 
-Notion access uses [syncntn](https://github.com/anima-research/syncntn), which syncs Notion pages into a local search index.
+If you want the agent to read your Notion workspace, point the recipe at any MCP server that exposes Notion search and page-read tools. The recipe's template entry is named `syncntn` after the particular Notion MCP adapter it was developed against, but the key is just a label — any Notion MCP server works, as long as its exposed tool names match what the system prompt references (`syncntn--search_pages`, `syncntn--get_page_markdown`, and friends). If your server uses different tool names, either rename the MCP key and update the prompt, or skip Notion entirely by removing the block.
 
-1. Set up syncntn following its README
-2. Start the syncntn storage service (typically `http://localhost:8000`)
-3. Note your workspace ID from the syncntn dashboard
+Typical setup:
 
-```bash
-git clone https://github.com/anima-research/syncntn.git ../syncntn
-# Follow syncntn setup instructions
-```
+1. Install and start your Notion MCP server somewhere the recipe can launch it.
+2. Note any configuration it needs (API credentials, workspace ID, storage URL).
+3. Fill those values into the recipe's `syncntn` env block in Step 3 below.
+
+Don't have a Notion MCP server? Remove the `syncntn` entry from the recipe — the agent will adapt and work with whatever sources remain.
 
 ## Step 3: Configure the recipe
 
@@ -275,6 +274,6 @@ The Knowledge Miner tags document claims with `[SRC]`, `[INF]`, `[GEN]`, or `❓
 | `ANTHROPIC_API_KEY not set` | `export ANTHROPIC_API_KEY=sk-ant-...` |
 | Zulip tools not appearing | Check `.zuliprc` path and that zulip_mcp is built |
 | GitLab 401 errors | Verify your token has the right scopes and hasn't expired |
-| syncntn connection refused | Make sure the syncntn storage service is running on the configured port |
+| Notion tools not appearing or connection refused | Make sure your Notion MCP server is running and reachable at the command/URL the recipe expects |
 | Agent seems stuck | Press `Esc` to interrupt, then ask it to try a different approach |
 | Sub-agents not returning | Press `Tab` to check fleet view — they may still be working |
