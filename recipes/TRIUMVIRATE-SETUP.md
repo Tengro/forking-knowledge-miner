@@ -171,9 +171,9 @@ GITLAB_TOKEN=glpat-...
 GITLAB_API_URL=https://gitlab.example.com/api/v4
 ```
 
-No separate install — the recipe runs `npx @zereight/mcp-gitlab` on demand. The recipe also has a `gitlab-clone` MCP entry that needs `gitlab-clone-mcp` cloned as a sibling of connectome-host (`../gitlab-clone-mcp/`) — skip that one if you don't have it by deleting the `gitlab-clone` block.
+No separate install — the recipe runs `npx @zereight/mcp-gitlab` on demand.
 
-To disable: remove the `gitlab` and `gitlab-clone` blocks from `recipes/knowledge-miner.json`. If you leave them in but don't set the env vars, the child will fail to start with a message like `Recipe "recipes/knowledge-miner.json" references environment variable ${GITLAB_TOKEN} which is not set.` — that's the system telling you to either fill in the env var or delete the block.
+To disable: remove the `gitlab` block from `recipes/knowledge-miner.json`. If you leave it in but don't set the env vars, the child will fail to start with a message like `Recipe "recipes/knowledge-miner.json" references environment variable ${GITLAB_TOKEN} which is not set.` — that's the system telling you to either fill in the env var or delete the block.
 
 ### Notion (optional)
 

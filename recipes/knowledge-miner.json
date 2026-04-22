@@ -39,17 +39,6 @@
         "GITLAB_PERSONAL_ACCESS_TOKEN": "${GITLAB_TOKEN}",
         "GITLAB_API_URL": "${GITLAB_API_URL}"
       }
-    },
-    "gitlab-clone": {
-      "command": "npx",
-      "args": [
-        "tsx",
-        "../gitlab-clone-mcp/src/index.ts"
-      ],
-      "env": {
-        "GITLAB_PERSONAL_ACCESS_TOKEN": "${GITLAB_TOKEN}",
-        "GITLAB_API_URL": "${GITLAB_API_URL}"
-      }
     }
   },
 
