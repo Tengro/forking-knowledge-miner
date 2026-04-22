@@ -230,29 +230,38 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
     moduleInstances.push(workspaceModule);
   }
 
-  // -- Build MCP server list (recipe + file, file wins on conflict) --
+  // -- Build MCP server list --
+  //
+  // Recipes are opt-in: a file entry from mcpl-servers.json is loaded only
+  // when the recipe references its id under `mcpServers`. Credentials and
+  // the spawn command come from the file; the recipe entry can override
+  // policy fields (channelSubscription, toolPrefix, feature-set toggles,
+  // reconnect). Recipes can also define new servers the file doesn't have
+  // by supplying `command` or `url` themselves.
+  //
+  // The previous behavior loaded every file server for every recipe, which
+  // silently flooded focused recipes (conductor, reviewer) with traffic
+  // from channels the agent never asked to listen to.
   const recipeServers = recipe.mcpServers ?? {};
   const fileServers = loadMcplServers(DEFAULT_CONFIG_PATH);
-  const fileServerIds = new Set(fileServers.map(s => s.id));
+  const fileServersById = new Map(fileServers.map(s => [s.id, s]));
 
-  // Convert recipe servers to McplServerConfig shape
-  const recipeServerList = Object.entries(recipeServers)
-    .filter(([id]) => !fileServerIds.has(id)) // file wins on conflict
-    .filter(([, entry]) => entry.command) // must have a command
-    .map(([id, entry]) => ({ id, ...entry, command: entry.command! }));
-
-  // Overlay recipe-level `channelSubscription` onto file servers. Credentials
-  // live in mcpl-servers.json (gitignored), but subscription policy is
-  // recipe-level intent and must not be silently dropped on id collision.
-  const mergedFileServers = fileServers.map(s => {
-    const recipeEntry = recipeServers[s.id];
-    if (recipeEntry?.channelSubscription !== undefined && s.channelSubscription === undefined) {
-      return { ...s, channelSubscription: recipeEntry.channelSubscription };
+  const allServers: Array<{ id: string; command: string; [k: string]: unknown }> = [];
+  for (const [id, recipeEntry] of Object.entries(recipeServers)) {
+    const fileEntry = fileServersById.get(id);
+    if (fileEntry) {
+      const merged: Record<string, unknown> = { ...fileEntry };
+      if (recipeEntry.channelSubscription !== undefined) merged.channelSubscription = recipeEntry.channelSubscription;
+      if (recipeEntry.toolPrefix !== undefined) merged.toolPrefix = recipeEntry.toolPrefix;
+      if (recipeEntry.enabledFeatureSets !== undefined) merged.enabledFeatureSets = recipeEntry.enabledFeatureSets;
+      if (recipeEntry.disabledFeatureSets !== undefined) merged.disabledFeatureSets = recipeEntry.disabledFeatureSets;
+      if (recipeEntry.reconnect !== undefined) merged.reconnect = recipeEntry.reconnect;
+      if (recipeEntry.reconnectIntervalMs !== undefined) merged.reconnectIntervalMs = recipeEntry.reconnectIntervalMs;
+      allServers.push(merged as { id: string; command: string; [k: string]: unknown });
+    } else if (recipeEntry.command || recipeEntry.url) {
+      allServers.push({ id, ...recipeEntry, command: recipeEntry.command! } as { id: string; command: string; [k: string]: unknown });
     }
-    return s;
-  });
-
-  const allServers = [...recipeServerList, ...mergedFileServers];
+  }
 
   // No server augmentation needed — gate is wired via FrameworkConfig.gate
 
