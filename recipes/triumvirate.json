@@ -29,7 +29,11 @@
           "recipe": "recipes/knowledge-miner.json",
           "dataDir": "./data/miner",
           "autoStart": true,
-          "subscription": ["lifecycle", "inference:completed", "inference:speech", "tool:completed", "tool:failed", "inference:failed"]
+          "subscription": ["lifecycle", "inference:completed", "inference:speech", "tool:completed", "tool:failed", "inference:failed"],
+          "onIdle": {
+            "command": "/newtopic",
+            "debounceMs": 120000
+          }
         },
         {
           "name": "reviewer",

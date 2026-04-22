@@ -142,6 +142,14 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     emit(traceEvent as unknown as Record<string, unknown>);
   });
 
+  // Filled in by the idle-tracking block below.  Called whenever an event
+  // has semantically reset the conversation head (currently: /newtopic).
+  // After a reset, the poll must wait for a fresh `inference:started`
+  // before emitting `lifecycle:idle` again — otherwise a post-compression
+  // idle would instantly trigger whatever auto-command is watching for
+  // idle (e.g. an onIdle hook that fires /newtopic) in an infinite loop.
+  let resetIdleTracking: () => void = (): void => { /* wired below */ };
+
   // -- Command dispatch --
   async function dispatchCommand(cmd: IncomingCommand): Promise<void> {
     switch (cmd.type) {
@@ -181,6 +189,14 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
         if (result.switchToSessionId) {
           await app.switchSession(result.switchToSessionId);
           emit({ type: 'command-output', text: 'Session switched.', style: 'system' });
+        }
+        // `/newtopic` compresses the head window; the head is now logically
+        // fresh.  Clear the idle-tracker so a subsequent lifecycle:idle
+        // won't fire until after the next real inference.  Relevant even
+        // outside onIdle-hook scenarios: any operator running /newtopic
+        // interactively gets the same well-defined post-reset state.
+        if (/^\/newtopic(?:\s|$)/.test(cmd.command)) {
+          resetIdleTracking();
         }
         if (result.quit) {
           await gracefulShutdown('command:/quit');
@@ -316,6 +332,17 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     // and on inference:tool_calls_yielded (that round was a tool-use turn,
     // not the final speech).  Emitted on inference:completed if non-empty.
     let currentSpeech = '';
+
+    // Wire the module-level hook that the command dispatcher calls after
+    // /newtopic — clear every flag that the poll treats as "there's been
+    // meaningful activity worth compressing."
+    resetIdleTracking = (): void => {
+      hadAtLeastOneInference = false;
+      idleSince = 0;
+      idleEmitted = false;
+      currentSpeech = '';
+      log('idle-tracking reset (post-/newtopic)');
+    };
 
     app.framework.onTrace((event) => {
       const t = (event as { type?: string }).type;

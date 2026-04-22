@@ -134,7 +134,7 @@ export interface RecipeFleetChild {
   /**
    * Event subscription at handshake (supports glob like `tool:*`).
    * Relevant synthetic events the parent may care about:
-   *   - `lifecycle` (includes `ready` / `idle` / `exiting`) — required for fleet--await.
+   *   - `lifecycle` (includes `ready` / `idle` / `exiting`) — required for fleet--await AND for the `onIdle` hook below.
    *   - `inference:speech` — per-final-inference speech text, required for fleet--relay.
    *   - `inference:completed` / `inference:failed` / `tool:completed` / `tool:failed` — useful for status tracking.
    */
@@ -143,6 +143,26 @@ export interface RecipeFleetChild {
   autoStart?: boolean;
   /** Respawn on crash (Phase 5 honours this; schema accepts it now). */
   autoRestart?: boolean;
+  /**
+   * When the child's `lifecycle:idle` event persists for `debounceMs` with
+   * no other activity, auto-dispatch `command` via fleet--command.  Activity
+   * during the wait cancels the pending dispatch; the hook re-arms on each
+   * subsequent idle, so it fires once per sustained-idle period.
+   *
+   * Typical use: `{ "command": "/newtopic", "debounceMs": 120000 }` on a
+   * ticket-driven miner, so inter-ticket idle auto-compresses the prior
+   * task's context.  The child's headless runtime resets its idle-tracking
+   * after `/newtopic`, so the hook won't re-fire on the post-compression
+   * idle — a new `inference:started` is required first.
+   *
+   * Requires `subscription` to include `lifecycle` (or be omitted/`"*"`).
+   */
+  onIdle?: {
+    /** Slash command (should start with "/"). */
+    command: string;
+    /** Sustained-idle threshold in ms.  Default 120000 (2 min). */
+    debounceMs?: number;
+  };
 }
 
 export interface Recipe {
@@ -381,6 +401,19 @@ export function validateRecipe(raw: unknown): Recipe {
           }
           if (c.autoStart !== undefined && typeof c.autoStart !== 'boolean') {
             throw new Error(`fleet.children[${i}].autoStart must be a boolean`);
+          }
+          if (c.onIdle !== undefined) {
+            if (typeof c.onIdle !== 'object' || c.onIdle === null) {
+              throw new Error(`fleet.children[${i}].onIdle must be an object`);
+            }
+            const oi = c.onIdle as Record<string, unknown>;
+            if (typeof oi.command !== 'string' || !oi.command) {
+              throw new Error(`fleet.children[${i}].onIdle.command must be a non-empty string`);
+            }
+            if (oi.debounceMs !== undefined
+              && (typeof oi.debounceMs !== 'number' || oi.debounceMs <= 0)) {
+              throw new Error(`fleet.children[${i}].onIdle.debounceMs must be a positive number`);
+            }
           }
         }
       }

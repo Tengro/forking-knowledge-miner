@@ -156,6 +156,7 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
         if (c.env !== undefined) entry.env = c.env;
         if (c.subscription !== undefined) entry.subscription = c.subscription;
         if (c.autoRestart !== undefined) entry.autoRestart = c.autoRestart;
+        if (c.onIdle !== undefined) entry.onIdle = c.onIdle;
         return entry;
       });
     }

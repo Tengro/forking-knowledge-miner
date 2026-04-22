@@ -121,6 +121,12 @@ function dispatch(msg: Record<string, unknown>): void {
       emit({ type: 'command-output', text: '  no real commands here', style: 'system' });
       return;
     }
+    // Echo any received command so tests can observe arrival of auto-
+    // dispatched slash commands (onIdle hook target).  We deliberately
+    // emit command-output rather than silently absorbing so the arrival
+    // is externally observable; the text carries the full command for
+    // matching in tests.
+    emit({ type: 'command-output', text: `mock-received-command: ${cmd}`, style: 'system' });
   }
 }
 

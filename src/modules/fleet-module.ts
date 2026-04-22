@@ -102,6 +102,30 @@ export interface AutoStartChild {
   autoStart?: boolean;
   /** Phase 5 honours this; accepted now for forward-compat. */
   autoRestart?: boolean;
+  /**
+   * When the child's `lifecycle:idle` event persists for `debounceMs` with
+   * no other activity, auto-dispatch the configured slash command via the
+   * same channel as `fleet--command`.  Any event from the child during the
+   * wait cancels the pending dispatch.  The hook re-arms on every
+   * subsequent idle, so it fires once per sustained-idle period rather
+   * than on every transient idle.
+   *
+   * Intended use: wire `{command: "/newtopic", debounceMs: 120000}` on a
+   * ticket-driven miner so that the inter-ticket idle automatically
+   * compresses the last task's context before the next ticket arrives.
+   *
+   * Note: the child's headless runtime clears its idle-tracking state on
+   * `/newtopic`, so the hook won't immediately re-fire on the post-
+   * compression idle — a fresh `inference:started` is required first.
+   */
+  onIdle?: OnIdleHook;
+}
+
+export interface OnIdleHook {
+  /** Slash command to dispatch (should start with "/"). */
+  command: string;
+  /** Sustained-idle threshold before firing.  Default 120_000 (2 min). */
+  debounceMs?: number;
 }
 
 interface LaunchInput {
@@ -112,6 +136,8 @@ interface LaunchInput {
   subscription?: string[];
   /** Respawn on crash. Default false. */
   autoRestart?: boolean;
+  /** Event-driven auto-dispatch hook; see AutoStartChild.onIdle. */
+  onIdle?: OnIdleHook;
 }
 
 type ChildStatus = 'starting' | 'ready' | 'exited' | 'crashed';
@@ -175,6 +201,10 @@ interface FleetChild {
    * tool calls.  Used by fleet--relay.
    */
   lastCompletedSpeech: string;
+  /** onIdle hook config copied from AutoStartChild.  null if not configured. */
+  onIdle: OnIdleHook | null;
+  /** Pending auto-dispatch timer for the onIdle hook, or null. */
+  onIdleTimer: ReturnType<typeof setTimeout> | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +284,7 @@ export class FleetModule implements Module {
       if (child.env !== undefined) input.env = child.env;
       if (child.subscription !== undefined) input.subscription = child.subscription;
       if (child.autoRestart !== undefined) input.autoRestart = child.autoRestart;
+      if (child.onIdle !== undefined) input.onIdle = child.onIdle;
 
       this.handleLaunch(input, { viaAutoStart: true })
         .then((res) => {
@@ -385,6 +416,8 @@ export class FleetModule implements Module {
       killRequested: false,
       restartAttempts: [],
       lastCompletedSpeech: '',  // not persisted; rebuilt on next inference:speech
+      onIdle: null,             // not persisted; an orphan wouldn't have a live timer anyway
+      onIdleTimer: null,
     };
     if (p.env) child.env = p.env;
     return child;
@@ -501,6 +534,7 @@ export class FleetModule implements Module {
       autoRestart: true,
     };
     if (child.env !== undefined) input.env = child.env;
+    if (child.onIdle) input.onIdle = child.onIdle;
 
     // Drop the crashed record so handleLaunch can register a fresh one.
     this.children.delete(child.name);
@@ -522,6 +556,14 @@ export class FleetModule implements Module {
   async stop(): Promise<void> {
     // Mark shutdown so the process 'exit' handlers don't trigger autoRestart.
     this.stopping = true;
+
+    // Cancel any pending onIdle timers — no dispatches during shutdown.
+    for (const c of this.children.values()) {
+      if (c.onIdleTimer) {
+        clearTimeout(c.onIdleTimer);
+        c.onIdleTimer = null;
+      }
+    }
 
     if (this.detachMode) {
       // Detach: close socket references only; leave child processes alive so
@@ -862,6 +904,8 @@ export class FleetModule implements Module {
       killRequested: false,
       restartAttempts: [],
       lastCompletedSpeech: '',
+      onIdle: input.onIdle ?? null,
+      onIdleTimer: null,
     };
     if (input.env !== undefined) child.env = input.env;
     this.children.set(input.name, child);
@@ -918,6 +962,10 @@ export class FleetModule implements Module {
       child.status = code === 0 ? 'exited' : 'crashed';
       try { child.socket?.destroy(); } catch { /* noop */ }
       child.socket = null;
+      if (child.onIdleTimer) {
+        clearTimeout(child.onIdleTimer);
+        child.onIdleTimer = null;
+      }
 
       this.persistState();
 
@@ -1373,6 +1421,46 @@ export class FleetModule implements Module {
     }
     this.fanOutEvent(child.name, event);
     if (statusChanged) this.persistState();
+
+    // onIdle debounce timer: arm on lifecycle:idle, cancel on any other
+    // event.  Non-events (status flips) don't affect the timer.
+    if (child.onIdle) this.tickOnIdleTimer(child, event);
+  }
+
+  /**
+   * Debounce driver for the onIdle hook.  Called from recordEvent whenever
+   * the child has an `onIdle` config.  Semantics:
+   *   - lifecycle:idle → reset & start the timer (dispatches command after debounceMs)
+   *   - any other event → cancel the timer (activity resumed)
+   */
+  private tickOnIdleTimer(child: FleetChild, event: WireEvent): void {
+    if (!child.onIdle) return;
+    const hook = child.onIdle;
+
+    const isIdleEvent = event.type === 'lifecycle'
+      && (event as { phase?: string }).phase === 'idle';
+
+    // Any event (idle or otherwise) first cancels any pending timer.
+    if (child.onIdleTimer) {
+      clearTimeout(child.onIdleTimer);
+      child.onIdleTimer = null;
+    }
+
+    if (!isIdleEvent) return;
+
+    const delayMs = hook.debounceMs ?? 120_000;
+    child.onIdleTimer = setTimeout(() => {
+      child.onIdleTimer = null;
+      if (this.stopping) return;
+      if (child.status !== 'ready') return;
+      if (!child.socket) return;
+      try {
+        this.sendToChild(child, { type: 'command', command: hook.command });
+        console.error(`[fleet] onIdle dispatched "${hook.command}" to "${child.name}" after ${delayMs}ms idle`);
+      } catch (err) {
+        console.error(`[fleet] onIdle dispatch to "${child.name}" failed: ${String(err)}`);
+      }
+    }, delayMs);
   }
 
   private fanOutEvent(childName: string, event: WireEvent): void {
