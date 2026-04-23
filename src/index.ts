@@ -17,7 +17,8 @@
 
 import { Membrane, AnthropicAdapter, NativeFormatter } from '@animalabs/membrane';
 import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, type Module, type MountConfig } from '@animalabs/agent-framework';
-import { resolve, join } from 'node:path';
+import { resolve, join, basename } from 'node:path';
+import { appendFile, mkdir, stat, rename } from 'node:fs/promises';
 import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
@@ -374,22 +375,38 @@ function setupSynesthete(app: AppContext): void {
 // MCPL subprocess stderr log — receipts for "why did that MCPL server break"
 // ---------------------------------------------------------------------------
 
+const MCPL_STDERR_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10 MB; rolls to .1 on overflow.
+
 function setupMcplStderrLog(app: AppContext, storePath: string): void {
-  const { appendFileSync, mkdirSync } = require('node:fs') as typeof import('node:fs');
   const dir = join(storePath, 'mcpl-stderr');
-  mkdirSync(dir, { recursive: true });
+  // Best-effort directory creation — if it fails, per-write attempts will too,
+  // and we'll swallow those quietly. We don't want logging to be load-bearing.
+  void mkdir(dir, { recursive: true }).catch(() => {});
 
   app.framework.onTrace((event) => {
     if (event.type !== 'mcpl:server-stderr') return;
     const e = event as unknown as { serverId: string; line: string; timestamp: number };
     const iso = new Date(e.timestamp).toISOString();
-    const path = join(dir, `${e.serverId}.log`);
-    try {
-      appendFileSync(path, `${iso} ${e.line}\n`);
-    } catch {
-      // If logging itself fails, don't cascade.
-    }
+    // basename guards against a misconfigured serverId like "../foo" escaping dir.
+    const path = join(dir, `${basename(e.serverId)}.log`);
+    const entry = `${iso} ${e.line}\n`;
+    void rotateIfNeeded(path, entry.length)
+      .then(() => appendFile(path, entry))
+      .catch(() => {
+        // If logging itself fails, don't cascade.
+      });
   });
+}
+
+async function rotateIfNeeded(path: string, incomingBytes: number): Promise<void> {
+  try {
+    const s = await stat(path);
+    if (s.size + incomingBytes > MCPL_STDERR_LOG_MAX_BYTES) {
+      await rename(path, `${path}.1`);
+    }
+  } catch {
+    // No existing file (or stat failed) — nothing to rotate.
+  }
 }
 
 // ---------------------------------------------------------------------------

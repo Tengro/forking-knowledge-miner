@@ -39,8 +39,11 @@ interface ActivityState {
  * Recognized shapes:
  *   - `origin: zulip#<channel>#<topic>`
  *   - `reply-to: zulip:<channel>/<topic>`
- *   - YAML frontmatter with both `channel: <name>` and `topic: <name>`
- *     (matches the clerk's existing knowledge-request ticket convention)
+ *   - YAML frontmatter (delimited by leading `---` ... `---`) containing both
+ *     `channel: <name>` and `topic: <name>` — matches the clerk's existing
+ *     knowledge-request ticket convention. Loose `channel:`/`topic:` lines
+ *     outside a frontmatter block are ignored to avoid mis-routing on prose
+ *     files (e.g. README headings, mined artifacts quoting Zulip metadata).
  *
  * All platform hints currently resolve to `zulip:<channel>` — extend here when
  * another MCPL server wants in on origin-routing.
@@ -52,10 +55,14 @@ function parseOriginHint(text: string): { channelId: string; topic: string } | n
   const replyTo = text.match(/reply-to:\s*zulip:([^\s/]+)\/(\S+)/i);
   if (replyTo) return { channelId: `zulip:${replyTo[1]}`, topic: replyTo[2] };
 
-  const channelMatch = text.match(/^channel:\s*(\S+)\s*$/m);
-  const topicMatch = text.match(/^topic:\s*(.+?)\s*$/m);
-  if (channelMatch && topicMatch) {
-    return { channelId: `zulip:${channelMatch[1]}`, topic: topicMatch[1] };
+  const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (frontmatter) {
+    const block = frontmatter[1];
+    const channelMatch = block.match(/^channel:\s*(\S+)\s*$/m);
+    const topicMatch = block.match(/^topic:\s*(.+?)\s*$/m);
+    if (channelMatch && topicMatch) {
+      return { channelId: `zulip:${channelMatch[1]}`, topic: topicMatch[1] };
+    }
   }
 
   return null;
@@ -220,9 +227,8 @@ export class ActivityModule implements Module {
           const buf = Buffer.alloc(2048);
           const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
           const head = buf.toString('utf8', 0, bytesRead);
-          const top = head.split('\n').slice(0, 10).join('\n');
 
-          const origin = parseOriginHint(top);
+          const origin = parseOriginHint(head);
           if (origin && this.channels.has(origin.channelId)) {
             // Merge with any existing metadata so other keys (e.g. senderEmail)
             // survive if the origin refresh is subsequent to an incoming message.
