@@ -96,7 +96,7 @@ export interface RecipeWorkspaceMount {
 }
 
 export interface RecipeModules {
-  subagents?: boolean | { defaultModel?: string };
+  subagents?: boolean | { defaultModel?: string; defaultMaxTokens?: number };
   lessons?: boolean;
   retrieval?: boolean | { model?: string; maxInjected?: number };
   wake?: boolean | import('@animalabs/agent-framework').GateConfig;

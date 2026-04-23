@@ -127,7 +127,7 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
     subagentModule = new SubagentModule({
       parentAgentName: agentName,
       defaultModel: subagentConfig.defaultModel || model,
-      defaultMaxTokens: 4096,
+      defaultMaxTokens: subagentConfig.defaultMaxTokens,
     });
     moduleInstances.push(subagentModule);
   }
