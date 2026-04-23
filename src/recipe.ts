@@ -12,7 +12,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,6 +47,18 @@ export interface RecipeMcpServer {
   toolPrefix?: string;
   enabledFeatureSets?: string[];
   disabledFeatureSets?: string[];
+  /**
+   * Tool allow-list (bare tool names as the server exports them, no toolPrefix).
+   * `*` is a substring wildcard (`read_*`, `*_file`, `*`).
+   * If set, only matching tools are exposed to the model AND callable at dispatch.
+   */
+  enabledTools?: string[];
+  /**
+   * Tool deny-list (same syntax as enabledTools). Wins over enabledTools on overlap.
+   * Denied tools are hidden from the model and rejected at dispatch — both, so a
+   * model that imitates a prior call from message history can't sneak the call through.
+   */
+  disabledTools?: string[];
   reconnect?: boolean;
   reconnectIntervalMs?: number;
   /**
@@ -144,11 +156,19 @@ export interface RecipeWorkspaceMount {
 }
 
 export interface RecipeModules {
-  subagents?: boolean | { defaultModel?: string };
+  subagents?: boolean | { defaultModel?: string; defaultMaxTokens?: number };
   lessons?: boolean;
   retrieval?: boolean | { model?: string; maxInjected?: number };
   wake?: boolean | import('@animalabs/agent-framework').GateConfig;
   workspace?: boolean | { mounts: RecipeWorkspaceMount[]; configMount?: boolean };
+  /**
+   * Surface agent composition activity (typing indicators) to one or more
+   * MCPL channels while inference is active. Opt-in per recipe; channel IDs
+   * use the MCPL format (e.g. `zulip:tracker-miner-f`). The agent can also
+   * adjust the set at runtime via the `activity:show_in` / `activity:hide_in`
+   * tools.
+   */
+  activity?: boolean | { channels?: string[] };
   /**
    * Cross-process child fleet.  When true (shorthand), FleetModule is attached
    * with no pre-configured children.  When an object, declares children the
@@ -157,7 +177,14 @@ export interface RecipeModules {
    * Recipes outside the allowlist require user approval.
    *
    * Recipe path resolution: relative paths in `children[].recipe` are resolved
-   * against the process CWD (same convention as workspace mounts).
+   * at load time against the directory of the parent recipe file (or URL
+   * base), NOT the process CWD. This lets a recipe bundle live anywhere on
+   * disk and reference its siblings portably. Absolute paths and http(s)
+   * URLs pass through unchanged.
+   *
+   * Note: this differs from runtime paths (workspace mounts, `dataDir`),
+   * which stay CWD-relative because they describe where the running process
+   * puts its state.
    */
   fleet?: boolean | RecipeFleet;
 }
@@ -185,7 +212,13 @@ export interface RecipeFleet {
 
 export interface RecipeFleetChild {
   name: string;
-  /** Recipe path (CWD-relative or absolute) or http(s) URL. */
+  /**
+   * Recipe path or http(s) URL.  Relative paths are resolved at `loadRecipe`
+   * time against the directory of the parent recipe file (or URL base), so
+   * a sibling recipe is referenced by its filename regardless of where the
+   * parent is launched from.  Absolute paths and URLs pass through
+   * unchanged.
+   */
   recipe: string;
   /** Data dir override; default `./data/<name>`. */
   dataDir?: string;
@@ -294,27 +327,62 @@ export function substituteEnvVars(value: unknown, source: string): unknown {
 // ---------------------------------------------------------------------------
 
 /**
+ * Base for resolving recipe-relative paths (currently: `children[].recipe`).
+ * `file` sources use the recipe file's directory; `url` sources use the URL
+ * base so a child like `"child.json"` on an `https://example.com/parent.json`
+ * load resolves to `https://example.com/child.json`.
+ */
+type RecipeSourceBase = { kind: 'file'; dir: string } | { kind: 'url'; base: string };
+
+/**
  * Load a recipe from a URL or local file path.
  * If the systemPrompt value is an HTTP(S) URL, fetches the text.
  * Recipe string values containing `${VAR}` patterns are substituted against
  * `process.env` before validation — see substituteEnvVars().
+ * Relative `modules.fleet.children[].recipe` paths are resolved against the
+ * parent recipe's directory (or URL base) so sibling recipes are portable.
  */
 export async function loadRecipe(source: string): Promise<Recipe> {
   let raw: unknown;
+  let sourceBase: RecipeSourceBase;
 
   if (source.startsWith('http://') || source.startsWith('https://')) {
     const res = await fetch(source);
     if (!res.ok) throw new Error(`Failed to fetch recipe from ${source}: ${res.status} ${res.statusText}`);
     raw = await res.json();
+    sourceBase = { kind: 'url', base: source };
   } else {
     const path = resolve(source);
     if (!existsSync(path)) throw new Error(`Recipe file not found: ${path}`);
     raw = JSON.parse(readFileSync(path, 'utf-8'));
+    sourceBase = { kind: 'file', dir: dirname(path) };
   }
 
   raw = substituteEnvVars(raw, source);
   const recipe = validateRecipe(raw);
+  resolveChildRecipePaths(recipe, sourceBase);
   return resolveSystemPrompt(recipe);
+}
+
+/**
+ * Resolve a single `children[].recipe` value against the parent recipe's
+ * source base.  Returns unchanged if absolute or http(s) URL.
+ */
+export function resolveRecipeRelative(child: string, base: RecipeSourceBase): string {
+  if (child.startsWith('http://') || child.startsWith('https://')) return child;
+  if (isAbsolute(child)) return child;
+  if (base.kind === 'file') return resolve(base.dir, child);
+  // URL base: resolve the child against the parent URL.
+  return new URL(child, base.base).href;
+}
+
+function resolveChildRecipePaths(recipe: Recipe, base: RecipeSourceBase): void {
+  const fleet = recipe.modules?.fleet;
+  if (!fleet || typeof fleet !== 'object') return;
+  if (!fleet.children) return;
+  for (const child of fleet.children) {
+    child.recipe = resolveRecipeRelative(child.recipe, base);
+  }
 }
 
 /**
@@ -425,6 +493,12 @@ export function validateRecipe(raw: unknown): Recipe {
           if (typeof (src.inContainer as Record<string, unknown>).path !== 'string') {
             throw new Error(`mcpServers.${id}.source.inContainer.path must be a string`);
           }
+        }
+      }
+      for (const field of ['enabledTools', 'disabledTools'] as const) {
+        if (server[field] === undefined) continue;
+        if (!Array.isArray(server[field]) || !(server[field] as unknown[]).every((p) => typeof p === 'string' && p)) {
+          throw new Error(`mcpServers.${id}.${field} must be an array of non-empty strings`);
         }
       }
     }
