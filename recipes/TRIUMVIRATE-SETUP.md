@@ -11,7 +11,7 @@ One terminal, four AI agents cooperating:
 - **Conductor** (in the TUI, the one you talk to) — supervises the other three, reports status, intervenes only when asked.
 - **Miner** — reads your team's Zulip conversations, extracts structured knowledge, writes **Draft** documents to `library-mined/`.
 - **Reviewer** — critiques the miner's drafts for accuracy, flags unsupported claims, writes **Reviewed** versions to `library-reviewed/`.
-- **Clerk** — sits on a Zulip channel (`#tracker-miner-f` by default), answers questions by quoting the library, files knowledge-request tickets when the library is insufficient.
+- **Clerk** — sits on a Zulip channel (`#${ZULIP_CHANNEL}` by default), answers questions by quoting the library, files knowledge-request tickets when the library is insufficient.
 
 The three specialists coordinate with each other via a **shared filesystem** and **shared Zulip channels** — not through the conductor. Files flow: `library-mined/` → `library-reviewed/` (via reviewer) → cited in clerk's Zulip answers. Knowledge gaps flow: clerk → `knowledge-requests/` (future miner sessions dispatch on these).
 
@@ -102,11 +102,11 @@ site=https://your-org.zulipchat.com
 
 The triumvirate needs one dedicated channel plus whatever channels you want the miner to extract knowledge from.
 
-### The clerk's channel (`#tracker-miner-f`)
+### The clerk's channel (`#${ZULIP_CHANNEL}`)
 
-The clerk agent staffs one specific channel — by convention, `#tracker-miner-f`. It responds to questions posted there by quoting the library.
+The clerk agent staffs one specific channel — by convention, `#${ZULIP_CHANNEL}`. It responds to questions posted there by quoting the library.
 
-1. In Zulip, create a new channel called **`tracker-miner-f`** (or edit the recipe in the next step if you want a different name).
+1. In Zulip, create a new channel called **`${ZULIP_CHANNEL}`** (or edit the recipe in the next step if you want a different name).
 2. Subscribe your bot account to that channel.
 3. Optionally: tell your team this is where they ask library questions.
 
@@ -130,6 +130,12 @@ Required for every run:
 
 ```ini
 ANTHROPIC_API_KEY=sk-ant-...
+
+# The Zulip channel the clerk staffs.  Set to the channel name
+# you created in Step 4 (e.g. `tracker-miner-f`, `knowledge-desk`,
+# `q-and-a` — whatever you picked).  All three recipes substitute
+# this at load time wherever they reference the channel.
+ZULIP_CHANNEL=your-channel-name
 ```
 
 Optional — **only** if you want the miner to extract from those sources (otherwise remove the relevant `mcpServers` block from `recipes/knowledge-miner.json` and skip these):
@@ -192,7 +198,7 @@ To disable: remove the `syncntn` block from `recipes/knowledge-miner.json`. Same
 
 You can also edit `recipes/triumvirate.json` if you want to:
 
-- **Rename the clerk's channel** away from `tracker-miner-f` — edit `recipes/clerk.json`, change `ZULIP_SUBSCRIBE` and the `tracker-channel` wake policy's `channel` field.
+- **Rename the clerk's channel** away from `${ZULIP_CHANNEL}` — edit `recipes/clerk.json`, change `ZULIP_SUBSCRIBE` and the `tracker-channel` wake policy's `channel` field.
 - **Swap the model** — change `"model": "claude-opus-4-6"` to `claude-sonnet-4-6` (faster, cheaper) or another Claude model.
 - **Adjust autoStart** — set `"autoStart": false` on any child if you want to leave them inactive until you (or the conductor) explicitly launch them.
 
@@ -241,7 +247,7 @@ Bypass the conductor and send straight to a child. Useful when you know exactly 
 
 ```
 > @miner Start extracting from channel #platform-design, focus on the Q1 decisions.
-> @clerk Post a status message in #tracker-miner-f saying the library is being rebuilt.
+> @clerk Post a status message in #${ZULIP_CHANNEL} saying the library is being rebuilt.
 > @reviewer Re-check the packet-pipeline doc against the latest lessons.
 ```
 
@@ -298,7 +304,7 @@ See [the Knowledge Reviewer section of SETUP.md](./SETUP.md#reviewing-knowledge-
 
 ### Clerk
 
-- Sits on `#tracker-miner-f`.
+- Sits on `#${ZULIP_CHANNEL}`.
 - When someone posts a question there, the clerk:
   1. Searches both `library-mined/` and `library-reviewed/` for relevant material.
   2. Posts a short, cited answer back in the channel.
@@ -386,7 +392,7 @@ If the conductor itself becomes unresponsive, `Ctrl+C` and relaunch. Children st
 | "ANTHROPIC_API_KEY not set" | Make sure `.env` is in the connectome-host directory and contains a valid key. Bun auto-loads it. |
 | Child status stays "starting" forever | It timed out reaching ready. Check `data/<name>/headless.log` and `startup.log`. Most often: missing / invalid Zulip creds, or missing `../zulip-mcp/build/index.js`. |
 | A child is crashed with "API error 401" | Zulip credentials are wrong or expired. Regenerate the bot's API key, update `.zuliprc`, `/fleet restart <child>`. |
-| Clerk says "I don't see any messages in tracker-miner-f" | Check that the bot is actually subscribed to `#tracker-miner-f` in Zulip. Subscription happens on clerk startup via `ZULIP_SUBSCRIBE` — if the stream doesn't exist, it silently fails. |
+| Clerk says "I don't see any messages in ${ZULIP_CHANNEL}" | Check that the bot is actually subscribed to `#${ZULIP_CHANNEL}` in Zulip. Subscription happens on clerk startup via `ZULIP_SUBSCRIBE` — if the stream doesn't exist, it silently fails. |
 | Miner or clerk launches keep crashing right away | Usually a missing `.zuliprc`, an unset env var, or an MCP server (Notion) that isn't running. Check `data/<child>/startup.log` first — it'll have a clear message like `references environment variable ${GITLAB_TOKEN} which is not set`. Either add the missing value to `.env` or delete the matching `mcpServers` block from the recipe. To isolate: run the recipe standalone with `bun src/index.ts recipes/knowledge-miner.json` (or `recipes/clerk.json`) in the same directory — the same errors come back in the interactive TUI. |
 | "Recipe references environment variable ${FOO} which is not set" | The recipe has `${FOO}` in one of its values but your `.env` doesn't define `FOO`. Either add `FOO=...` to `.env` (if you want the source that references it) or delete the `mcpServers` / module block that uses it (if you don't). |
 | Process view shows fewer children than expected | Check the conductor's own `data/tui-error.log` for errors during child spawn. One child failing shouldn't prevent the others from starting. |
