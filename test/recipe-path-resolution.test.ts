@@ -149,12 +149,22 @@ describe('loadRecipe — children[].recipe resolution', () => {
   });
 
   test('in-tree triumvirate: children resolve to siblings in recipes/', async () => {
-    const triumviratePath = join(REPO_ROOT, 'recipes', 'triumvirate.json');
-    const recipe = await loadRecipe(triumviratePath);
-    const children = fleetChildren(recipe);
-    const byName = Object.fromEntries(children.map((c) => [c.name, c.recipe]));
-    expect(byName.miner).toBe(join(REPO_ROOT, 'recipes', 'knowledge-miner.json'));
-    expect(byName.reviewer).toBe(join(REPO_ROOT, 'recipes', 'knowledge-reviewer.json'));
-    expect(byName.clerk).toBe(join(REPO_ROOT, 'recipes', 'clerk.json'));
+    // The shipped triumvirate.json references ${ZULIP_CHANNEL} in its
+    // conductor prompt; substituteEnvVars throws on missing vars, so set
+    // a placeholder for the load.  We're only testing path resolution.
+    const prevZulipChannel = process.env.ZULIP_CHANNEL;
+    process.env.ZULIP_CHANNEL = 'test-channel';
+    try {
+      const triumviratePath = join(REPO_ROOT, 'recipes', 'triumvirate.json');
+      const recipe = await loadRecipe(triumviratePath);
+      const children = fleetChildren(recipe);
+      const byName = Object.fromEntries(children.map((c) => [c.name, c.recipe]));
+      expect(byName.miner).toBe(join(REPO_ROOT, 'recipes', 'knowledge-miner.json'));
+      expect(byName.reviewer).toBe(join(REPO_ROOT, 'recipes', 'knowledge-reviewer.json'));
+      expect(byName.clerk).toBe(join(REPO_ROOT, 'recipes', 'clerk.json'));
+    } finally {
+      if (prevZulipChannel === undefined) delete process.env.ZULIP_CHANNEL;
+      else process.env.ZULIP_CHANNEL = prevZulipChannel;
+    }
   });
 });

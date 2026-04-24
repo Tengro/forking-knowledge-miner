@@ -73,6 +73,18 @@ export interface RecipeMcpServer {
    * tools that produce deployable artifacts (Docker images, etc.) do.
    */
   source?: RecipeMcpServerSource;
+  /**
+   * Auxiliary credential / config files this MCP server needs at runtime
+   * (e.g. `.zuliprc` for the Zulip adapter, `~/.netrc` for HTTP-auth APIs,
+   * a `gcloud.json` service-account key for Google APIs).  Build tooling
+   * collects values from the operator (env vars or interactive prompts),
+   * writes the file, and bind-mounts it into the container.  The recipe
+   * loader itself does NOT touch these — the runtime reads the file via
+   * whatever path the MCP server expects (typically declared in `env`).
+   *
+   * Like `source`, this is build-tooling metadata.  Ignored at runtime.
+   */
+  credentialFiles?: RecipeCredentialFile[];
 }
 
 /**
@@ -127,6 +139,66 @@ export interface RecipeMcpServerSource {
    * `https://github.com/x/zulip_mcp.git` places the source at `/zulip_mcp`).
    */
   inContainer?: { path: string };
+}
+
+/**
+ * One auxiliary credential or config file the MCP server reads at runtime.
+ * Build tooling (cook, etc.) prompts the operator for the field values,
+ * serializes them in the declared format, and writes the file at the
+ * declared path so the bind-mounted file appears in the container.
+ *
+ * Example for Zulip's `.zuliprc`:
+ * ```json
+ * {
+ *   "path": "./.zuliprc",
+ *   "format": "ini",
+ *   "section": "api",
+ *   "mode": "0600",
+ *   "fields": [
+ *     { "name": "email", "envOverride": "ZULIP_EMAIL", "placeholder": "bot@example.zulipchat.com" },
+ *     { "name": "key",   "envOverride": "ZULIP_KEY",   "placeholder": "abc123...", "secret": true },
+ *     { "name": "site",  "envOverride": "ZULIP_SITE",  "placeholder": "https://example.zulipchat.com" }
+ *   ]
+ * }
+ * ```
+ */
+export interface RecipeCredentialFile {
+  /** Where the runtime expects the file.  In a Docker context this also
+   *  determines the bind-mount target; the host-side path is `<outDir>` +
+   *  basename(path).  Relative paths resolve against the conductor's CWD
+   *  (typically `/app`); absolute paths land verbatim. */
+  path: string;
+  /** Serialization format.  `ini` writes `key=value` lines under an
+   *  optional `[section]` header; `json` writes `{ "field": "value", ... }`;
+   *  `env` writes `KEY=value` (no quoting). */
+  format: 'ini' | 'json' | 'env';
+  /** Optional INI section header (`[<section>]`) preceding the fields.
+   *  Ignored by `json` / `env` formats. */
+  section?: string;
+  /** Filesystem mode as an octal string.  Default `0600` (typical for
+   *  credentials).  Build tooling sets this on the host file before bind-
+   *  mounting; the container inherits the mode through the mount. */
+  mode?: string;
+  /** Fields the operator must supply. */
+  fields: RecipeCredentialFileField[];
+}
+
+export interface RecipeCredentialFileField {
+  /** Field name as written in the file (e.g. `email`, `key`, `site`).
+   *  For `ini` / `env` formats this is the literal key.  For `json` it
+   *  becomes the JSON property name. */
+  name: string;
+  /** Optional env var name that, when set in `process.env` (or supplied
+   *  via cook's `--env-file`), substitutes for prompting.  Lets the
+   *  operator pre-set values in CI / scripted contexts. */
+  envOverride?: string;
+  /** Operator-facing description of what to enter (one short line). */
+  description?: string;
+  /** Placeholder shown next to the prompt (e.g. `bot@example.zulipchat.com`). */
+  placeholder?: string;
+  /** When true, build tooling masks the input (no echo while typing).
+   *  Default `false`. */
+  secret?: boolean;
 }
 
 /**
@@ -499,6 +571,62 @@ export function validateRecipe(raw: unknown): Recipe {
         if (server[field] === undefined) continue;
         if (!Array.isArray(server[field]) || !(server[field] as unknown[]).every((p) => typeof p === 'string' && p)) {
           throw new Error(`mcpServers.${id}.${field} must be an array of non-empty strings`);
+        }
+      }
+      if (server.credentialFiles !== undefined) {
+        if (!Array.isArray(server.credentialFiles)) {
+          throw new Error(`mcpServers.${id}.credentialFiles must be an array`);
+        }
+        const seenPaths = new Set<string>();
+        for (let i = 0; i < server.credentialFiles.length; i++) {
+          const cf = server.credentialFiles[i] as Record<string, unknown>;
+          if (!cf || typeof cf !== 'object') {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}] must be an object`);
+          }
+          if (typeof cf.path !== 'string' || !cf.path) {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].path must be a non-empty string`);
+          }
+          if (seenPaths.has(cf.path)) {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].path "${cf.path}" is duplicated within the same server`);
+          }
+          seenPaths.add(cf.path);
+          if (cf.format !== 'ini' && cf.format !== 'json' && cf.format !== 'env') {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].format must be 'ini', 'json', or 'env'`);
+          }
+          if (cf.section !== undefined && typeof cf.section !== 'string') {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].section must be a string`);
+          }
+          if (cf.mode !== undefined && (typeof cf.mode !== 'string' || !/^0?[0-7]{3,4}$/.test(cf.mode))) {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].mode must be an octal string like "0600"`);
+          }
+          if (!Array.isArray(cf.fields) || cf.fields.length === 0) {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields must be a non-empty array`);
+          }
+          const seenFieldNames = new Set<string>();
+          for (let j = 0; j < cf.fields.length; j++) {
+            const f = cf.fields[j] as Record<string, unknown>;
+            if (!f || typeof f !== 'object') {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}] must be an object`);
+            }
+            if (typeof f.name !== 'string' || !f.name) {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].name must be a non-empty string`);
+            }
+            if (seenFieldNames.has(f.name)) {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].name "${f.name}" is duplicated`);
+            }
+            seenFieldNames.add(f.name);
+            if (f.envOverride !== undefined && (typeof f.envOverride !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(f.envOverride))) {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].envOverride must be a valid env var name`);
+            }
+            for (const optStr of ['description', 'placeholder'] as const) {
+              if (f[optStr] !== undefined && typeof f[optStr] !== 'string') {
+                throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].${optStr} must be a string`);
+              }
+            }
+            if (f.secret !== undefined && typeof f.secret !== 'boolean') {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].secret must be a boolean`);
+            }
+          }
         }
       }
     }
