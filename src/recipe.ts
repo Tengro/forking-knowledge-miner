@@ -318,6 +318,127 @@ export interface Recipe {
   mcpServers?: Record<string, RecipeMcpServer>;
   modules?: RecipeModules;
   sessionNaming?: { examples?: string[] };
+  /**
+   * Sidecar services that build/deploy tooling (e.g. connectome-cook) should
+   * include in the deployment artifact alongside the agent process.
+   * Examples: a MediaWiki container the encyclopedist edits, a database the
+   * wiki backs onto, a search engine, an HTTPS reverse proxy.  The recipe
+   * loader does NOT touch these at runtime — the agent process knows nothing
+   * about its sidecars.  Build-tooling metadata only, like `mcpServers[].source`
+   * and `mcpServers[].credentialFiles`.
+   */
+  services?: RecipeSidecarService[];
+  /**
+   * Templated config files cook should render and bind-mount into the agent
+   * container.  Use case: an MCP server's config.json that's nested enough
+   * to not fit credentialFiles' flat-fields shape (e.g. mediawiki-mcp-server's
+   * nested wikis object).  Cook substitutes `${VAR}` against the same
+   * collected env values as credentialFiles, writes the file to outDir, and
+   * adds a read-only bind mount of the file at the declared in-container path.
+   *
+   * The recipe loader (`substituteEnvVars`) skips this field entirely — its
+   * string contents are reserved for cook, not the agent runtime.  Named
+   * distinctly from the per-service `templateFiles` (under
+   * RecipeSidecarService) so authoring mistakes produce clear errors instead
+   * of silently inverting the two shapes.
+   */
+  containerTemplateFiles?: RecipeContainerTemplateFile[];
+}
+
+/**
+ * Like RecipeTemplateFile (used inside services[]) but with an explicit
+ * `inContainer` path so cook knows where to bind-mount the rendered file
+ * into the agent container.  Sidecar templateFiles already declare their
+ * own bind mount in `volumes`; agent-side templates need cook to emit
+ * the bind mount automatically.
+ */
+export interface RecipeContainerTemplateFile {
+  /** Host-side path (relative to cook output dir).  Cook writes here. */
+  hostPath: string;
+  /** In-container path where the file is bind-mounted (read-only). */
+  inContainer: string;
+  /** Template body.  Substitution: `${VAR}` (required) and
+   *  `${VAR:-default}` (optional with literal fallback) both follow
+   *  substituteEnvVars's semantics.  `$$` is a literal `$` — write
+   *  `$${VAR}` to emit the literal text `${VAR}`.
+   *  The recipe loader skips this field entirely (see substituteEnvVars's
+   *  `skipKeys` and the loadRecipe call site); only build tooling reads it. */
+  template: string;
+  /** File mode, octal string.  Default `'0644'`. */
+  mode?: string;
+}
+
+/**
+ * One sidecar service deployed alongside the agent process.  Build tools
+ * translate this into `docker compose` (or whatever orchestrator) entries.
+ *
+ * Generic enough to cover databases, viewers, search engines, reverse
+ * proxies, etc.  Field shapes mirror compose-spec semantics so the
+ * translation is mostly direct.
+ */
+export interface RecipeSidecarService {
+  /** Service name in docker-compose; also used as container_name. */
+  name: string;
+  /** Container image (e.g. "mediawiki:1.42", "mariadb:11"). */
+  image: string;
+  /** Optional port mappings, in compose's `["host:container"]` form.
+   *  May include `${VAR:-default}` for operator-controlled binding
+   *  (e.g. `"${MEDIAWIKI_BIND:-127.0.0.1}:8080:80"`). */
+  ports?: string[];
+  /** Optional bind volumes.  `source` is host-side (relative to the cook
+   *  output dir).  `target` is container-side. */
+  volumes?: Array<{ source: string; target: string; readOnly?: boolean }>;
+  /** Optional environment variables.  Values may reference `${VAR}` or
+   *  `${VAR:-default}` for substitution at compose-load time. */
+  environment?: Record<string, string>;
+  /** Optional reference to BuildKit / runtime secrets declared elsewhere
+   *  (typically auto-collected by build tooling from `templateFiles` or
+   *  hand-supplied `*_PASSWORD` style env vars). */
+  secrets?: string[];
+  /** Optional dependency on other services (sidecar names from this list,
+   *  or the agent service itself).  Compose `depends_on:` semantics. */
+  dependsOn?: string[];
+  /** Restart policy.  Default `unless-stopped`. */
+  restart?: 'unless-stopped' | 'no' | 'always' | 'on-failure';
+  /** Optional healthcheck — when set, depends_on resolves on healthy state. */
+  healthcheck?: {
+    test: string[];
+    interval?: string;
+    timeout?: string;
+    retries?: number;
+    startPeriod?: string;
+  };
+  /** Optional templated config files this sidecar needs.  Build tools write
+   *  the rendered file to the host path; the sidecar reads it via a bind
+   *  volume the recipe also declares. */
+  templateFiles?: RecipeTemplateFile[];
+}
+
+/**
+ * A config file the build tool generates from a template + collected
+ * variables.  Used for things like MediaWiki's `LocalSettings.php` —
+ * the operator supplies wiki name + URL + secret-key seeds, the build
+ * tool substitutes them into the template body, writes the file at
+ * `path` with the declared `mode`.
+ *
+ * Distinct from `credentialFiles` (which collect operator values into a
+ * structured INI/JSON file).  `templateFiles` is for "render this exact
+ * blob with these substitutions"; `credentialFiles` is for "collect
+ * these field values from the operator and serialize them per format".
+ */
+export interface RecipeTemplateFile {
+  /** Host path (relative to the cook output dir) where the rendered
+   *  file should land.  May include subdirectories — build tools
+   *  create them as needed. */
+  path: string;
+  /** Inline template body.  `${VAR}` interpolates from the build tool's
+   *  collected env values (operator prompts + --env-file + process.env).
+   *  `${VAR:-default}` follows the same semantics as substituteEnvVars
+   *  on the recipe loader side.  Doubled `$$` is a literal `$`. */
+  template: string;
+  /** File mode as an octal string.  Default `'0644'` (non-secret config).
+   *  Use `'0600'` for files that contain secrets. */
+  mode?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -359,23 +480,40 @@ export const DEFAULT_RECIPE: Recipe = {
  *   - `${FOO}` — required.  Throws if FOO is unset (empty string OK).
  *   - `${FOO:-default}` — optional.  Uses FOO when set and non-empty,
  *     otherwise the literal default text.  Default may be empty
- *     (`${FOO:-}`) to mean "use FOO or just empty string, never throw".
+ *     (`${FOO:-}` means "use FOO or empty string, never throw").
+ *   - `$$` — escape: emits a literal `$`.  Use to write a literal
+ *     `${...}` that should NOT be interpreted as a substitution.
+ *     `$${VAR}` renders as the literal string `${VAR}`.
  *   - VAR name: `[A-Za-z_][A-Za-z0-9_]*`.
- *   - Default text: any chars except `}`.  No nested `${...}` parsing
- *     and no escape syntax — keep recipes JSON-friendly.
+ *   - Default text: any chars except `}`.  No nested `${...}` parsing.
  *   - Multiple occurrences in a single string are all substituted.
  *   - Non-string values (numbers, booleans, nulls) pass through unchanged.
  *   - Arrays and objects are walked recursively.
  *
- * No escape syntax yet — a literal `${...}` in recipe JSON is not a supported
- * case.  If that becomes needed, add `$$` → `$` unwrapping as a pre-pass.
+ * `skipKeys`: when present, object keys in this set are passed through
+ * verbatim instead of being recursed into.  Used by `loadRecipe` to keep
+ * build-tooling metadata (`services`, `containerTemplateFiles`) opaque to
+ * the agent runtime — those fields may legitimately contain `${VAR}`
+ * references intended for downstream tools (e.g. cook), not for
+ * substitution at recipe-load time.  Skip applies only at the level the
+ * caller passed it; recursion strips the parameter.
  */
-export function substituteEnvVars(value: unknown, source: string): unknown {
+export function substituteEnvVars(
+  value: unknown,
+  source: string,
+  skipKeys?: Set<string>,
+): unknown {
   if (typeof value === 'string') {
+    // Two-pattern alternation: literal `$$` (escape → emits `$`) OR a
+    // `${VAR}` / `${VAR:-default}` substitution.  Order matters — the
+    // `$$` branch must come first so we don't treat the first `$` of
+    // `$$` as the start of a substitution.
     return value.replace(
-      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
-      (_match, name: string, defaultValue: string | undefined) => {
-        const v = process.env[name];
+      /\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
+      (match, name: string | undefined, defaultValue: string | undefined) => {
+        if (match === '$$') return '$';
+        const n = name!;
+        const v = process.env[n];
         if (defaultValue !== undefined) {
           // ${VAR:-default} — use VAR if set + non-empty, else default.
           return v !== undefined && v !== '' ? v : defaultValue;
@@ -383,8 +521,8 @@ export function substituteEnvVars(value: unknown, source: string): unknown {
         // ${VAR} — required; empty string is allowed if explicitly set.
         if (v === undefined) {
           throw new Error(
-            `Recipe "${source}" references environment variable \${${name}} which is not set. ` +
-            `Add it to your .env file, supply a default with \${${name}:-...}, ` +
+            `Recipe "${source}" references environment variable \${${n}} which is not set. ` +
+            `Add it to your .env file, supply a default with \${${n}:-...}, ` +
             `or delete the section of the recipe that uses it ` +
             `(e.g. remove the mcpServers entry for a source you don't have).`,
           );
@@ -394,12 +532,19 @@ export function substituteEnvVars(value: unknown, source: string): unknown {
     );
   }
   if (Array.isArray(value)) {
+    // Don't propagate skipKeys into recursion — the skip applies only at
+    // the level the caller asked for (typically the top-level Recipe).
     return value.map((v) => substituteEnvVars(v, source));
   }
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = substituteEnvVars(v, source);
+      if (skipKeys?.has(k)) {
+        // Build-tooling metadata — pass through verbatim, no recursion.
+        out[k] = v;
+      } else {
+        out[k] = substituteEnvVars(v, source);
+      }
     }
     return out;
   }
@@ -442,7 +587,15 @@ export async function loadRecipe(source: string): Promise<Recipe> {
     sourceBase = { kind: 'file', dir: dirname(path) };
   }
 
-  raw = substituteEnvVars(raw, source);
+  // `services` and `containerTemplateFiles` are build-tooling metadata
+  // (consumed by tools like connectome-cook).  Their string values may
+  // contain `${VAR}` references intended for those downstream tools, NOT
+  // for the agent runtime — substituting them here would either throw on
+  // unset vars (e.g. WIKI_DB_PASSWORD which only mariadb needs) or
+  // silently bake the wrong value into the template.  Skip recursion
+  // into those keys; everything else (mcpServers, modules, etc.) is
+  // substituted as before.
+  raw = substituteEnvVars(raw, source, new Set(['services', 'containerTemplateFiles']));
   const recipe = validateRecipe(raw);
   resolveChildRecipePaths(recipe, sourceBase);
   return resolveSystemPrompt(recipe);
@@ -491,6 +644,33 @@ async function resolveSystemPrompt(recipe: Recipe): Promise<Recipe> {
 /**
  * Validate raw JSON and fill defaults.
  */
+/** Reject path strings that would escape a sandboxed output dir.  Recipes
+ *  may come from operator-supplied URLs (`cook build https://gist...`),
+ *  so the validator treats every host-side path as untrusted: it must be
+ *  relative AND contain no `..` segments.  Defense-in-depth check at the
+ *  build tool's write time is independent. */
+function rejectPathEscape(label: string, path: string): void {
+  if (path.startsWith('/')) {
+    throw new Error(`${label} must be a relative path (no leading "/"); got "${path}"`);
+  }
+  if (/(^|\/)\.\.(\/|$)/.test(path)) {
+    throw new Error(`${label} contains a ".." segment which is not allowed; got "${path}"`);
+  }
+  // Disallow Windows-style drive letters and UNC paths defensively.
+  if (/^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')) {
+    throw new Error(`${label} must not be an absolute Windows path; got "${path}"`);
+  }
+}
+
+/** Normalize relative paths for cross-validation comparison.  Strips a
+ *  single leading `./` and collapses repeated slashes.  Used so that
+ *  `./foo` and `foo` compare equal when matching
+ *  `services[].templateFiles[].path` against `services[].volumes[].source`
+ *  (operator-supplied JSON has no enforced path-shape rule). */
+function normalizeRelPath(p: string): string {
+  return p.replace(/^\.\//, '').replace(/\/{2,}/g, '/');
+}
+
 export function validateRecipe(raw: unknown): Recipe {
   if (!raw || typeof raw !== 'object') throw new Error('Recipe must be a JSON object');
   const obj = raw as Record<string, unknown>;
@@ -719,6 +899,189 @@ export function validateRecipe(raw: unknown): Recipe {
       if (fleet.defaultSubscription !== undefined) {
         if (!Array.isArray(fleet.defaultSubscription) || !fleet.defaultSubscription.every((s) => typeof s === 'string')) {
           throw new Error('fleet.defaultSubscription must be an array of strings');
+        }
+      }
+    }
+  }
+
+  // Validate top-level containerTemplateFiles if present.  Distinct from
+  // RecipeSidecarService.templateFiles (which is per-sidecar and uses a
+  // different shape — `path` only, with the bind declared in `volumes`).
+  if (obj.containerTemplateFiles !== undefined) {
+    if (!Array.isArray(obj.containerTemplateFiles)) {
+      throw new Error('containerTemplateFiles must be an array');
+    }
+    const seenHostPaths = new Set<string>();
+    const seenContainerPaths = new Set<string>();
+    for (let i = 0; i < obj.containerTemplateFiles.length; i++) {
+      const tf = obj.containerTemplateFiles[i] as Record<string, unknown>;
+      if (!tf || typeof tf !== 'object') {
+        throw new Error(`containerTemplateFiles[${i}] must be an object`);
+      }
+      if (typeof tf.hostPath !== 'string' || !tf.hostPath) {
+        throw new Error(`containerTemplateFiles[${i}].hostPath must be a non-empty string`);
+      }
+      rejectPathEscape(`containerTemplateFiles[${i}].hostPath`, tf.hostPath);
+      if (seenHostPaths.has(tf.hostPath)) {
+        throw new Error(`containerTemplateFiles[${i}].hostPath "${tf.hostPath}" is duplicated`);
+      }
+      seenHostPaths.add(tf.hostPath);
+      if (typeof tf.inContainer !== 'string' || !tf.inContainer) {
+        throw new Error(`containerTemplateFiles[${i}].inContainer must be a non-empty string`);
+      }
+      if (seenContainerPaths.has(tf.inContainer)) {
+        throw new Error(`containerTemplateFiles[${i}].inContainer "${tf.inContainer}" is duplicated`);
+      }
+      seenContainerPaths.add(tf.inContainer);
+      if (typeof tf.template !== 'string') {
+        throw new Error(`containerTemplateFiles[${i}].template must be a string`);
+      }
+      if (tf.mode !== undefined && (typeof tf.mode !== 'string' || !/^0?[0-7]{3,4}$/.test(tf.mode))) {
+        throw new Error(`containerTemplateFiles[${i}].mode must be an octal string like "0644"`);
+      }
+    }
+  }
+  // Help authors who confuse the two shapes: a top-level `templateFiles`
+  // (rather than `containerTemplateFiles`) is almost always a typo.  Reject
+  // with the disambiguating message rather than silently ignore.
+  if (obj.templateFiles !== undefined && obj.containerTemplateFiles === undefined) {
+    throw new Error(
+      'top-level `templateFiles` is not a valid field — use `containerTemplateFiles` ' +
+      '(per-sidecar `templateFiles` lives under `services[].templateFiles`).',
+    );
+  }
+
+  if (obj.services !== undefined) {
+    if (!Array.isArray(obj.services)) {
+      throw new Error('services must be an array');
+    }
+    const seenSvcNames = new Set<string>();
+    for (let i = 0; i < obj.services.length; i++) {
+      const svc = obj.services[i] as Record<string, unknown>;
+      if (!svc || typeof svc !== 'object') {
+        throw new Error(`services[${i}] must be an object`);
+      }
+      if (typeof svc.name !== 'string' || !svc.name || !/^[a-z][a-z0-9_-]*$/.test(svc.name)) {
+        throw new Error(`services[${i}].name must be a non-empty lowercase identifier (a-z 0-9 _ -)`);
+      }
+      if (seenSvcNames.has(svc.name)) {
+        throw new Error(`services[${i}].name "${svc.name}" is duplicated`);
+      }
+      seenSvcNames.add(svc.name);
+      if (typeof svc.image !== 'string' || !svc.image) {
+        throw new Error(`services[${i}].image must be a non-empty string`);
+      }
+      if (svc.ports !== undefined) {
+        if (!Array.isArray(svc.ports) || !(svc.ports as unknown[]).every((p) => typeof p === 'string' && p)) {
+          throw new Error(`services[${i}].ports must be an array of non-empty strings`);
+        }
+      }
+      if (svc.volumes !== undefined) {
+        if (!Array.isArray(svc.volumes)) {
+          throw new Error(`services[${i}].volumes must be an array`);
+        }
+        for (let v = 0; v < svc.volumes.length; v++) {
+          const vol = svc.volumes[v] as Record<string, unknown>;
+          if (!vol || typeof vol !== 'object') {
+            throw new Error(`services[${i}].volumes[${v}] must be an object`);
+          }
+          if (typeof vol.source !== 'string' || !vol.source) {
+            throw new Error(`services[${i}].volumes[${v}].source must be a non-empty string`);
+          }
+          if (typeof vol.target !== 'string' || !vol.target) {
+            throw new Error(`services[${i}].volumes[${v}].target must be a non-empty string`);
+          }
+          if (vol.readOnly !== undefined && typeof vol.readOnly !== 'boolean') {
+            throw new Error(`services[${i}].volumes[${v}].readOnly must be a boolean`);
+          }
+        }
+      }
+      if (svc.environment !== undefined) {
+        if (typeof svc.environment !== 'object' || Array.isArray(svc.environment)) {
+          throw new Error(`services[${i}].environment must be an object`);
+        }
+        for (const [k, val] of Object.entries(svc.environment as Record<string, unknown>)) {
+          if (typeof val !== 'string') {
+            throw new Error(`services[${i}].environment.${k} must be a string`);
+          }
+        }
+      }
+      if (svc.secrets !== undefined) {
+        if (!Array.isArray(svc.secrets) || !(svc.secrets as unknown[]).every((s) => typeof s === 'string' && s)) {
+          throw new Error(`services[${i}].secrets must be an array of non-empty strings`);
+        }
+      }
+      if (svc.dependsOn !== undefined) {
+        if (!Array.isArray(svc.dependsOn) || !(svc.dependsOn as unknown[]).every((s) => typeof s === 'string' && s)) {
+          throw new Error(`services[${i}].dependsOn must be an array of non-empty strings`);
+        }
+      }
+      if (svc.restart !== undefined) {
+        const allowed = ['unless-stopped', 'no', 'always', 'on-failure'];
+        if (typeof svc.restart !== 'string' || !allowed.includes(svc.restart)) {
+          throw new Error(`services[${i}].restart must be one of ${allowed.join(' / ')}`);
+        }
+      }
+      if (svc.healthcheck !== undefined) {
+        if (typeof svc.healthcheck !== 'object' || svc.healthcheck === null) {
+          throw new Error(`services[${i}].healthcheck must be an object`);
+        }
+        const hc = svc.healthcheck as Record<string, unknown>;
+        if (!Array.isArray(hc.test) || !(hc.test as unknown[]).every((s) => typeof s === 'string')) {
+          throw new Error(`services[${i}].healthcheck.test must be an array of strings`);
+        }
+        for (const optStr of ['interval', 'timeout', 'startPeriod'] as const) {
+          if (hc[optStr] !== undefined && typeof hc[optStr] !== 'string') {
+            throw new Error(`services[${i}].healthcheck.${optStr} must be a string`);
+          }
+        }
+        if (hc.retries !== undefined && (typeof hc.retries !== 'number' || hc.retries < 0)) {
+          throw new Error(`services[${i}].healthcheck.retries must be a non-negative number`);
+        }
+      }
+      if (svc.templateFiles !== undefined) {
+        if (!Array.isArray(svc.templateFiles)) {
+          throw new Error(`services[${i}].templateFiles must be an array`);
+        }
+        const seenTfPaths = new Set<string>();
+        // Collect declared volume sources for the cross-check below.
+        // Normalize to a canonical form so `./foo` and `foo` compare
+        // equal — the JSON shape has no enforced path-prefix rule.
+        const volumeSources = new Set<string>();
+        for (const vol of (svc.volumes as Array<Record<string, unknown>> | undefined) ?? []) {
+          if (typeof vol.source === 'string') volumeSources.add(normalizeRelPath(vol.source));
+        }
+        for (let t = 0; t < svc.templateFiles.length; t++) {
+          const tf = svc.templateFiles[t] as Record<string, unknown>;
+          if (!tf || typeof tf !== 'object') {
+            throw new Error(`services[${i}].templateFiles[${t}] must be an object`);
+          }
+          if (typeof tf.path !== 'string' || !tf.path) {
+            throw new Error(`services[${i}].templateFiles[${t}].path must be a non-empty string`);
+          }
+          rejectPathEscape(`services[${i}].templateFiles[${t}].path`, tf.path);
+          const normalizedTfPath = normalizeRelPath(tf.path);
+          if (seenTfPaths.has(normalizedTfPath)) {
+            throw new Error(`services[${i}].templateFiles[${t}].path "${tf.path}" is duplicated within the service`);
+          }
+          seenTfPaths.add(normalizedTfPath);
+          if (typeof tf.template !== 'string') {
+            throw new Error(`services[${i}].templateFiles[${t}].template must be a string`);
+          }
+          if (tf.mode !== undefined && (typeof tf.mode !== 'string' || !/^0?[0-7]{3,4}$/.test(tf.mode))) {
+            throw new Error(`services[${i}].templateFiles[${t}].mode must be an octal string like "0644"`);
+          }
+          // Implicit contract: a sidecar's templateFile is meaningless
+          // unless the sidecar also bind-mounts it via volumes[].source.
+          // Catch the silent-mismatch case here rather than letting cook
+          // produce a render that no one reads.
+          if (!volumeSources.has(normalizedTfPath)) {
+            throw new Error(
+              `services[${i}].templateFiles[${t}].path "${tf.path}" has no matching ` +
+              `entry in services[${i}].volumes[].source — the rendered template will ` +
+              `not be visible to the sidecar.  Add a corresponding volume mount.`,
+            );
+          }
         }
       }
     }
