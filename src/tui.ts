@@ -34,7 +34,7 @@ import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
 import type { SubagentModule, ActiveSubagent } from './modules/subagent-module.js';
 import { FleetTreeAggregator } from './state/fleet-tree-aggregator.js';
 import type { AgentNode } from './state/agent-tree-reducer.js';
-import { type FleetModule, formatChildRow } from './modules/fleet-module.js';
+import { type FleetModule } from './modules/fleet-module.js';
 import type { WireEvent } from './modules/fleet-types.js';
 import { parseFleetRoute } from './modules/fleet-types.js';
 import { handleCommand, resetBranchState } from './commands.js';
@@ -78,7 +78,7 @@ interface TuiState {
    * processes  — cross-process child fleet (new, FleetModule-backed)
    * peek-proc  — peek into a child process's live event stream (new)
    */
-  viewMode: 'chat' | 'fleet' | 'peek' | 'processes' | 'peek-proc';
+  viewMode: 'chat' | 'fleet' | 'peek' | 'peek-proc';
   tokens: TokenUsage;
   peekTarget: string | null;
   /** Name of the child process being peeked at (peek-proc mode). */
@@ -755,7 +755,7 @@ export async function runTui(app: AppContext): Promise<void> {
     visibleNodeIds = [];
 
     const lines: FleetLine[] = [];
-    lines.push({ text: '─── Agent Fleet ──────────────────── ↑↓:nav ───', color: GRAY });
+    lines.push({ text: '─── Agent Fleet ─── ↑↓:nav  ⏎/→:fold  p:peek  Del:stop  r:restart ───', color: GRAY });
     lines.push({ text: '', color: GRAY });
 
     renderNode(tree, 0, lines);
@@ -780,7 +780,7 @@ export async function runTui(app: AppContext): Promise<void> {
     }
   }
 
-  function switchView(mode: 'chat' | 'fleet' | 'processes' | 'peek-proc') {
+  function switchView(mode: 'chat' | 'fleet' | 'peek' | 'peek-proc') {
     state.viewMode = mode;
     scrollBox.visible = mode === 'chat';
     fleetBox.visible = mode !== 'chat';
@@ -789,55 +789,7 @@ export async function runTui(app: AppContext): Promise<void> {
     } else {
       input.blur();
       if (mode === 'fleet') updateFleetView();
-      else if (mode === 'processes') updateProcessesView();
       else if (mode === 'peek-proc') updatePeekProcView();
-    }
-  }
-
-  // ── Process fleet view (cross-process children) ────────────────────
-
-  function updateProcessesView(): void {
-    const lines: FleetLine[] = [];
-    lines.push({ text: `─── Process Fleet ────────────────────── Tab:chat ─── p:peek ─── s:stop ───`, color: GRAY });
-    lines.push({ text: '', color: GRAY });
-
-    if (!fleetMod) {
-      lines.push({ text: '  Fleet module is not enabled in this recipe.', color: DIM_GRAY });
-      lines.push({ text: '  Enable with modules.fleet: true in your recipe JSON.', color: DIM_GRAY });
-    } else {
-      const children = [...fleetMod.getChildren().values()];
-      if (children.length === 0) {
-        lines.push({ text: '  (no children launched — conductor can call fleet--launch)', color: DIM_GRAY });
-      } else {
-        for (let i = 0; i < children.length; i++) {
-          const c = children[i]!;
-          const statusColor =
-            c.status === 'ready' ? GREEN :
-            c.status === 'starting' ? YELLOW :
-            c.status === 'crashed' ? RED :
-            DIM_GRAY;
-          const cursor = i === procCursor ? '▸ ' : '  ';
-          lines.push({
-            text: `${cursor}${formatChildRow(c)}`,
-            color: statusColor,
-          });
-          if (c.exitReason && c.status !== 'ready' && c.status !== 'starting') {
-            lines.push({ text: `    ${c.exitReason}`, color: DIM_GRAY });
-          }
-        }
-      }
-    }
-
-    lines.push({ text: '', color: GRAY });
-    lines.push({ text: '  Up/Down navigate  •  p peek  •  s stop  •  r restart  •  Tab back to chat', color: DIM_GRAY });
-
-    for (const child of [...fleetBox.getChildren()]) fleetBox.remove(child.id);
-    for (const line of lines) {
-      fleetBox.add(new TextRenderable(renderer, {
-        id: `fleet-ln-${++fleetLineCounter}`,
-        content: line.text,
-        fg: line.color,
-      }));
     }
   }
 
@@ -900,9 +852,6 @@ export async function runTui(app: AppContext): Promise<void> {
       }));
     }
   }
-
-  /** Process-fleet cursor (for up/down navigation). */
-  let procCursor = 0;
 
   function enterPeekProc(name: string): void {
     if (!fleetMod) return;
@@ -1554,8 +1503,7 @@ export async function runTui(app: AppContext): Promise<void> {
           if (!known.has(name)) treeAggregator.registerChild(name);
         }
       }
-      if (state.viewMode === 'processes') updateProcessesView();
-      else if (state.viewMode === 'peek-proc') updatePeekProcView();
+      if (state.viewMode === 'peek-proc') updatePeekProcView();
     }
   }, 500);
 
@@ -1565,22 +1513,23 @@ export async function runTui(app: AppContext): Promise<void> {
     if (key.name === 'tab') {
       cleanupPeek();
       cleanupPeekProc();
-      // Tab cycles: chat → subagent-fleet → processes → chat
-      // (skips subagent-fleet if SubagentModule absent; skips processes if FleetModule absent)
-      const next =
-        state.viewMode === 'chat' ? (subMod ? 'fleet' : fleetMod ? 'processes' : 'chat') :
-        state.viewMode === 'fleet' ? (fleetMod ? 'processes' : 'chat') :
-        state.viewMode === 'processes' ? 'chat' :
-        'chat';
+      // Tab toggles between chat and the unified fleet view, which now
+      // subsumes the per-process status that used to live in a separate
+      // "processes" view. The fleet view is useful whenever either
+      // SubagentModule (for local subagents) or FleetModule (for fleet
+      // children) is loaded; otherwise stay on chat.
+      const next = state.viewMode === 'chat'
+        ? ((subMod || fleetMod) ? 'fleet' : 'chat')
+        : 'chat';
       switchView(next);
       updateStatus();
       return;
     }
-    // Ctrl+F: jump directly to processes view from anywhere (or back to chat if already there).
-    if (key.ctrl && key.name === 'f' && fleetMod) {
+    // Ctrl+F: jump directly to fleet view from anywhere (or back to chat if already there).
+    if (key.ctrl && key.name === 'f' && (subMod || fleetMod)) {
       cleanupPeek();
       cleanupPeekProc();
-      switchView(state.viewMode === 'processes' ? 'chat' : 'processes');
+      switchView(state.viewMode === 'fleet' ? 'chat' : 'fleet');
       updateStatus();
       return;
     }
@@ -1657,42 +1606,12 @@ export async function runTui(app: AppContext): Promise<void> {
       return;
     }
 
-    // Peek-proc view: Escape goes back to processes view
+    // Peek-proc view: Escape goes back to the unified fleet view
     if (state.viewMode === 'peek-proc') {
       if (key.name === 'escape' || key.name === 'p') {
         cleanupPeekProc();
-        switchView('processes');
+        switchView('fleet');
         updateStatus();
-      }
-      return;
-    }
-
-    // Processes view: navigate, peek, stop, restart
-    if (state.viewMode === 'processes') {
-      const names = fleetMod ? [...fleetMod.getChildren().keys()] : [];
-      if (key.name === 'up') {
-        procCursor = Math.max(0, procCursor - 1);
-        updateProcessesView();
-      } else if (key.name === 'down') {
-        procCursor = Math.min(Math.max(0, names.length - 1), procCursor + 1);
-        updateProcessesView();
-      } else if (key.name === 'p') {
-        const name = names[procCursor];
-        if (name) enterPeekProc(name);
-      } else if (key.name === 's' || key.name === 'delete') {
-        const name = names[procCursor];
-        if (name && fleetMod) {
-          fleetMod.handleToolCall({ id: `tui-kill-${Date.now()}`, name: 'kill', input: { name } })
-            .then(() => { updateProcessesView(); })
-            .catch(() => { /* noop — error surfaces in status */ });
-        }
-      } else if (key.name === 'r') {
-        const name = names[procCursor];
-        if (name && fleetMod) {
-          fleetMod.handleToolCall({ id: `tui-restart-${Date.now()}`, name: 'restart', input: { name } })
-            .then(() => { updateProcessesView(); })
-            .catch(() => { /* noop */ });
-        }
       }
       return;
     }
@@ -1754,6 +1673,14 @@ export async function runTui(app: AppContext): Promise<void> {
           }
           // fleet-child-agent: no per-agent stop yet (would need the child to
           // expose a cancel command over IPC). Future work.
+        }
+      } else if (key.name === 'r') {
+        const nodeId = visibleNodeIds[fleetCursor];
+        if (nodeId?.startsWith('proc:') && fleetMod) {
+          const childName = nodeId.slice('proc:'.length);
+          fleetMod.handleToolCall({ id: `tui-restart-${Date.now()}`, name: 'restart', input: { name: childName } })
+            .then(() => updateFleetView())
+            .catch(() => { /* error surfaces in status */ });
         }
       }
     }
@@ -1867,11 +1794,12 @@ export async function runTui(app: AppContext): Promise<void> {
         });
       }
 
-      // /fleet view → switch to processes view.
+      // /fleet view → switch to the unified fleet view (formerly the
+      // processes view, now subsumed by the unified subagent + fleet tree).
       if (result.switchToFleetView) {
         cleanupPeek();
         cleanupPeekProc();
-        switchView('processes');
+        switchView('fleet');
         updateStatus();
       }
 
@@ -1974,8 +1902,6 @@ function formatStatusLeft(
   }
   if (state.viewMode === 'fleet' || state.viewMode === 'peek') {
     bar += state.viewMode === 'peek' ? ` | peek: ${state.peekTarget}` : ' | fleet view';
-  } else if (state.viewMode === 'processes') {
-    bar += ' | processes';
   } else if (state.viewMode === 'peek-proc') {
     bar += ` | peek-proc: ${state.peekProcTarget}`;
   } else if (state.viewMode === 'chat') {
