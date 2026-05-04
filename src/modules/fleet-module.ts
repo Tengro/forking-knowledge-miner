@@ -35,6 +35,26 @@ import { existsSync, mkdirSync, unlinkSync, openSync, closeSync, appendFileSync 
 import { join, resolve, isAbsolute } from 'node:path';
 import { type IncomingCommand, type WireEvent, matchesSubscription } from './fleet-types.js';
 import { loadRecipe } from '../recipe.js';
+import { REDUCER_REQUIRED_EVENTS } from '../state/agent-tree-reducer.js';
+
+/**
+ * Force the events the unified-tree reducer needs into every subscription
+ * sent to a fleet child. Recipes can still narrow chatty events out of the
+ * wire stream; they just can't accidentally turn off rendering by omitting
+ * `inference:tool_calls_yielded` or `tool:started` etc.
+ *
+ * If `'*'` is present we leave the subscription alone — everything already
+ * flows. Otherwise each required event is added unless it's already covered
+ * (literal match or prefix-glob like `tool:*`).
+ */
+export function unionWithReducerRequired(subscription: readonly string[]): string[] {
+  if (subscription.includes('*')) return [...subscription];
+  const set = new Set(subscription);
+  for (const required of REDUCER_REQUIRED_EVENTS) {
+    if (!matchesSubscription(required, set)) set.add(required);
+  }
+  return [...set];
+}
 
 export type FleetEventCallback = (childName: string, event: WireEvent) => void;
 
@@ -1436,7 +1456,18 @@ export class FleetModule implements Module {
     if (!child.socket) {
       throw new Error(`Child '${child.name}' has no socket`);
     }
-    child.socket.write(JSON.stringify(cmd) + '\n');
+    // Single chokepoint for outgoing commands. We force the reducer-required
+    // events into every subscribe so recipe authors (or agents calling the
+    // subscribe tool) can't accidentally disable the unified-tree rendering
+    // by omitting events like `inference:tool_calls_yielded` — the reducer
+    // would drift into showing fleet children with empty subtrees and stale
+    // 'ready' status. The wire is fatter by ~10 event types but they're tiny
+    // relative to inference token streams.
+    let outgoing = cmd;
+    if (cmd.type === 'subscribe' && Array.isArray(cmd.events)) {
+      outgoing = { type: 'subscribe', events: unionWithReducerRequired(cmd.events) };
+    }
+    child.socket.write(JSON.stringify(outgoing) + '\n');
   }
 
   /**

@@ -338,3 +338,38 @@ export class AgentTreeReducer {
 // Avoid an unused-import lint by exporting the constant (callers may want a
 // shared "no usage" sentinel for tests / display code).
 export { ZERO_TOKENS };
+
+/**
+ * The minimum set of framework TraceEvent types this reducer needs to fold
+ * an accurate per-agent tree.
+ *
+ * If the wire-level subscription between a parent and a fleet child does not
+ * include these events, the parent's reducer drifts: subagent discovery
+ * stops happening (no `inference:tool_calls_yielded` → empty callIdIndex →
+ * tool events route nowhere → spawn calls don't create child nodes), token
+ * counts stay at zero between completion events, and phase indicators never
+ * leave the terminal states.
+ *
+ * FleetModule unions this set into every subscribe it sends (see
+ * `unionWithReducerRequired` in fleet-module.ts), so recipe-level
+ * subscription filters effectively become "what *additional* events I want
+ * beyond what rendering needs" rather than "what events are allowed at all."
+ *
+ * Add to this list whenever a new event type is wired into `applyEvent`.
+ */
+export const REDUCER_REQUIRED_EVENTS: readonly string[] = [
+  'inference:started',
+  'inference:tokens',
+  'inference:tool_calls_yielded',
+  'inference:usage',
+  'inference:completed',
+  'inference:failed',
+  'inference:aborted',
+  'inference:exhausted',
+  'inference:stream_resumed',
+  'inference:stream_restarted',
+  'inference:turn_ended',
+  'tool:started',
+  'tool:completed',
+  'tool:failed',
+] as const;

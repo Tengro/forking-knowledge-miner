@@ -224,5 +224,18 @@ Phase 2 is now the keystone. Phase 1 simplifies dramatically once Phase 2 exists
 
 - **Late-attach replay gap** between child startup and TUI attach is partially papered over by `describe`-on-attach, but events that fired before the parent existed at all (e.g. child started by a previous TUI session) are gone from the framework's perspective; only the snapshot's current state is recoverable. This is the same property single-process traces have and is accepted.
 - **Clock skew across children.** Each child stamps `ts` with its own `Date.now()`. Per-tree rendering doesn't care; only matters if a future cross-child timeline view is built (out of scope here).
-- **TUI subscription density at scale.** Default `['*']` subscription means every child fires every trace event. Fine for current recipes (≤ ~5 children); could need narrowing if fleets grow much larger. Not addressed here.
 - **`findingsCount` for framework agents.** Currently only tracked per-subagent in `ActiveSubagent`. Top-level framework agents will report 0 / undefined. If this ever matters, extend the reducer to count "findings-shaped" tool calls; not addressed here.
+
+## Subscription contract
+
+Recipe authors can narrow the wire-level event subscription per fleet child to keep traffic lean (e.g. `["lifecycle", "inference:completed"]`). But the unified-tree reducer needs a specific set of events to function — without `inference:tool_calls_yielded` it never discovers subagents; without `tool:started` it can't route tool events to the right agent; without `inference:usage` it can't accumulate token totals; without `inference:started`/`inference:tokens` it can't show phase transitions.
+
+To prevent recipes from accidentally disabling the rendering layer, `FleetModule.sendToChild` forces the reducer-required events (`REDUCER_REQUIRED_EVENTS` exported from `agent-tree-reducer.ts`) into every `subscribe` it sends. The recipe-specified subscription becomes "events I want *in addition* to what rendering needs" rather than "events I'm willing to receive at all." The contract:
+
+- `["*"]` is left unchanged — everything already flows.
+- Glob coverage is honored (e.g. `tool:*` covers `tool:started`/`tool:completed`/`tool:failed`).
+- Only literal events not already covered are added.
+
+The chokepoint is `sendToChild`, which is the one outgoing-command function FleetModule uses; this means the union applies to every code path that subscribes (initial setup, post-launch, agent-callable subscribe tool, reattach-on-restart).
+
+When `REDUCER_REQUIRED_EVENTS` changes (new event types added to the reducer's fold), update the constant; old recipes self-heal on next session start with no recipe edits required.
