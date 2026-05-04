@@ -565,6 +565,59 @@ export async function runTui(app: AppContext): Promise<void> {
     return node;
   }
 
+  /** Pick the "busiest" active phase from a list of reducer nodes.
+   *  Active phases (sending/streaming/invoking/executing) win over quiescent
+   *  ones (done/idle/failed) — we want to know whether the subtree is *currently*
+   *  doing work, not whether it ever did. Returns null if nothing is busy. */
+  function rollupActivePhase(nodes: AgentNode[]): SubagentPhase | null {
+    const PRIORITY: Partial<Record<SubagentPhase, number>> = {
+      streaming: 5,
+      invoking: 4,
+      executing: 3,
+      sending: 2,
+    };
+    let best: SubagentPhase | null = null;
+    let bestScore = -1;
+    for (const n of nodes) {
+      const score = PRIORITY[n.phase as SubagentPhase];
+      if (score !== undefined && score > bestScore) {
+        best = n.phase as SubagentPhase;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  /** "Is anything underneath the researcher busy?" Aggregates across local
+   *  subagents + every fleet child's reducer. Used so the researcher header
+   *  shows activity even when the researcher's own inference is idle. */
+  function anyDescendantActive(): SubagentPhase | null {
+    let best: SubagentPhase | null = null;
+    const PRIORITY: Partial<Record<SubagentPhase, number>> = {
+      streaming: 5, invoking: 4, executing: 3, sending: 2,
+    };
+    let bestScore = -1;
+    const consider = (phase: SubagentPhase): void => {
+      const score = PRIORITY[phase];
+      if (score !== undefined && score > bestScore) {
+        best = phase;
+        bestScore = score;
+      }
+    };
+    for (const sa of state.subagents) {
+      if (sa.status === 'running') {
+        consider(subagentPhase.get(sa.name) ?? 'sending');
+      }
+    }
+    if (treeAggregator && fleetMod) {
+      for (const childName of fleetMod.getChildren().keys()) {
+        const phase = rollupActivePhase(treeAggregator.getChildNodes(childName));
+        if (phase) consider(phase);
+      }
+    }
+    return best;
+  }
+
   function renderNode(node: FleetNode, depth: number, lines: FleetLine[]): void {
     const indent = '  '.repeat(depth);
     const isExpanded = expandedNodes.has(node.name);
@@ -573,7 +626,15 @@ export async function runTui(app: AppContext): Promise<void> {
     // Determine node color based on status
     let nodeColor: string;
     if (node.kind === 'researcher') {
-      nodeColor = state.status === 'idle' ? GRAY : WHITE;
+      // Researcher color: own activity wins; otherwise reflect descendants.
+      if (state.status !== 'idle' && state.status !== 'error') {
+        nodeColor = WHITE;
+      } else {
+        const descendant = anyDescendantActive();
+        nodeColor = state.status === 'error' ? RED
+          : descendant ? PHASE_COLOR[descendant]
+          : GRAY;
+      }
     } else if (node.kind === 'subagent') {
       const sa = node.agent!;
       if (sa.status === 'running') {
@@ -584,10 +645,17 @@ export async function runTui(app: AppContext): Promise<void> {
       }
     } else if (node.kind === 'fleet-child') {
       const fc = fleetMod?.getChildren().get(node.fleetChildName!);
-      nodeColor = fc?.status === 'ready' ? CYAN
-        : fc?.status === 'starting' ? YELLOW
-        : fc?.status === 'crashed' ? RED
-        : DIM_GRAY;
+      if (fc?.status === 'ready') {
+        // Process is alive — surface the busiest agent inside it instead of
+        // a flat "ready", so the user can see *what* the child is doing without
+        // having to unfold and inspect each agent.
+        const active = rollupActivePhase(treeAggregator?.getChildNodes(node.fleetChildName!) ?? []);
+        nodeColor = active ? PHASE_COLOR[active] : CYAN;
+      } else {
+        nodeColor = fc?.status === 'starting' ? YELLOW
+          : fc?.status === 'crashed' ? RED
+          : DIM_GRAY;
+      }
     } else {
       // fleet-child-agent
       const rn = node.reducerNode!;
@@ -604,9 +672,17 @@ export async function runTui(app: AppContext): Promise<void> {
     // Status tag
     let statusTag: string;
     if (node.kind === 'researcher') {
-      statusTag = state.status === 'idle' ? '✓ idle'
-        : state.status === 'error' ? '✗ error'
-        : `… ${state.status}`;
+      if (state.status === 'error') {
+        statusTag = '✗ error';
+      } else if (state.status !== 'idle') {
+        statusTag = `… ${state.status}`;
+      } else {
+        // Researcher's own inference is idle — but if anything underneath
+        // (local subagent or fleet child) is active, surface that so the
+        // header doesn't lie about an "idle" tree where work is happening.
+        const descendant = anyDescendantActive();
+        statusTag = descendant ? `… ${descendant} (descendant)` : '✓ idle';
+      }
     } else if (node.kind === 'subagent') {
       const sa = node.agent!;
       const endTime = sa.completedAt ?? Date.now();
@@ -620,7 +696,16 @@ export async function runTui(app: AppContext): Promise<void> {
     } else if (node.kind === 'fleet-child') {
       const fc = fleetMod?.getChildren().get(node.fleetChildName!);
       const elapsed = fc ? Math.floor((Date.now() - fc.startedAt) / 1000) : 0;
-      statusTag = fc ? `${fc.status} ${elapsed}s` : 'unknown';
+      if (fc?.status === 'ready') {
+        // Roll up agent activity from inside the child. Lifecycle 'ready' is
+        // the boring case ("process alive, doing nothing right now"); when
+        // any agent is busy, surface that phase instead so the header
+        // reflects what's actually happening.
+        const active = rollupActivePhase(treeAggregator?.getChildNodes(node.fleetChildName!) ?? []);
+        statusTag = active ? `${active} ${elapsed}s` : `ready ${elapsed}s`;
+      } else {
+        statusTag = fc ? `${fc.status} ${elapsed}s` : 'unknown';
+      }
     } else {
       // fleet-child-agent
       const rn = node.reducerNode!;
