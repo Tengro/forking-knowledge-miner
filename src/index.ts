@@ -163,6 +163,10 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
     }
     if (fleetCfg.allowedRecipes !== undefined) fleetModuleConfig.allowedRecipes = fleetCfg.allowedRecipes;
     if (fleetCfg.defaultSubscription !== undefined) fleetModuleConfig.defaultSubscription = fleetCfg.defaultSubscription;
+    if (fleetCfg.socketWaitTimeoutMs !== undefined) fleetModuleConfig.socketWaitTimeoutMs = fleetCfg.socketWaitTimeoutMs;
+    if (fleetCfg.readyTimeoutMs !== undefined) fleetModuleConfig.readyTimeoutMs = fleetCfg.readyTimeoutMs;
+    if (fleetCfg.gracefulShutdownMs !== undefined) fleetModuleConfig.gracefulShutdownMs = fleetCfg.gracefulShutdownMs;
+    if (fleetCfg.sigtermEscalationMs !== undefined) fleetModuleConfig.sigtermEscalationMs = fleetCfg.sigtermEscalationMs;
     moduleInstances.push(new FleetModule(fleetModuleConfig));
   }
 
