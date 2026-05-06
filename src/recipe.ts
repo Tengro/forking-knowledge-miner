@@ -280,6 +280,15 @@ export interface RecipeFleet {
   allowedRecipes?: string[];
   /** Default subscription sent to each child at handshake if they don't specify their own. */
   defaultSubscription?: string[];
+  /**
+   * Spawn-readiness timeouts forwarded to FleetModule.  Bump these when a
+   * child's startup work (heavy MCP servers, large state load) won't fit
+   * inside the FleetModule defaults (15s / 10s / 10s / 5s respectively).
+   */
+  socketWaitTimeoutMs?: number;
+  readyTimeoutMs?: number;
+  gracefulShutdownMs?: number;
+  sigtermEscalationMs?: number;
 }
 
 export interface RecipeFleetChild {
@@ -719,6 +728,11 @@ export function validateRecipe(raw: unknown): Recipe {
       if (fleet.defaultSubscription !== undefined) {
         if (!Array.isArray(fleet.defaultSubscription) || !fleet.defaultSubscription.every((s) => typeof s === 'string')) {
           throw new Error('fleet.defaultSubscription must be an array of strings');
+        }
+      }
+      for (const k of ['socketWaitTimeoutMs', 'readyTimeoutMs', 'gracefulShutdownMs', 'sigtermEscalationMs'] as const) {
+        if (fleet[k] !== undefined && (typeof fleet[k] !== 'number' || (fleet[k] as number) < 0)) {
+          throw new Error(`fleet.${k} must be a non-negative number`);
         }
       }
     }
