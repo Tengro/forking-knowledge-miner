@@ -128,9 +128,15 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   let subscription = new Set<string>(['*']);
 
   // Events that bypass subscription filtering: protocol responses, not telemetry.
-  // 'snapshot' is the response to a 'describe' request — clients always need
-  // it regardless of how they've narrowed their event stream.
-  const FILTER_EXEMPT = new Set<string>(['snapshot']);
+  // Clients narrow their event stream for bandwidth, not protocol correctness —
+  // request/response pairs would be useless if the response got dropped.
+  const FILTER_EXEMPT = new Set<string>([
+    'snapshot',
+    'lessons-snapshot',
+    'workspace-mounts-snapshot',
+    'workspace-tree-snapshot',
+    'workspace-file-snapshot',
+  ]);
 
   function emit(event: Record<string, unknown>): void {
     if (!currentClient) return;
@@ -229,6 +235,98 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
             callIdIndex: snap.callIdIndex,
           },
         });
+        return;
+      }
+      case 'request-lessons': {
+        const mod = app.framework.getAllModules().find((m) => m.name === 'lessons') as
+          | { getLessons(): Array<{ id: string; content: string; confidence: number; tags: string[]; deprecated: boolean; deprecationReason?: string; created?: number; updated?: number }> }
+          | undefined;
+        if (!mod) {
+          emit({ type: 'lessons-snapshot', corrId: cmd.corrId, loaded: false, lessons: [] });
+          return;
+        }
+        const lessons = mod.getLessons().map(l => ({
+          id: l.id,
+          content: l.content,
+          confidence: l.confidence,
+          tags: l.tags,
+          deprecated: l.deprecated,
+          ...(l.deprecationReason ? { deprecationReason: l.deprecationReason } : {}),
+          ...(typeof l.created === 'number' ? { created: l.created } : {}),
+          ...(typeof l.updated === 'number' ? { updated: l.updated } : {}),
+        }));
+        emit({ type: 'lessons-snapshot', corrId: cmd.corrId, loaded: true, lessons });
+        return;
+      }
+      case 'request-workspace-mounts': {
+        const mod = app.framework.getAllModules().find((m) => m.name === 'workspace') as
+          | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; error?: string }> }
+          | undefined;
+        if (!mod) {
+          emit({ type: 'workspace-mounts-snapshot', corrId: cmd.corrId, loaded: false, mounts: [] });
+          return;
+        }
+        try {
+          const result = await mod.handleToolCall({ name: 'ls', input: {}, id: `headless-ls-${Date.now()}` });
+          const data = (result.data ?? {}) as { mounts?: Array<{ name: string; path: string; mode: string }> };
+          emit({ type: 'workspace-mounts-snapshot', corrId: cmd.corrId, loaded: true, mounts: data.mounts ?? [] });
+        } catch {
+          emit({ type: 'workspace-mounts-snapshot', corrId: cmd.corrId, loaded: true, mounts: [] });
+        }
+        return;
+      }
+      case 'request-workspace-tree': {
+        const mod = app.framework.getAllModules().find((m) => m.name === 'workspace') as
+          | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; error?: string }> }
+          | undefined;
+        if (!mod) {
+          emit({ type: 'workspace-tree-snapshot', corrId: cmd.corrId, mount: cmd.mount, entries: [] });
+          return;
+        }
+        try {
+          const result = await mod.handleToolCall({
+            name: 'ls', input: { path: cmd.mount, recursive: true }, id: `headless-tree-${Date.now()}`,
+          });
+          const data = (result.data ?? {}) as { entries?: Array<{ path: string; size: number }> };
+          emit({ type: 'workspace-tree-snapshot', corrId: cmd.corrId, mount: cmd.mount, entries: data.entries ?? [] });
+        } catch {
+          emit({ type: 'workspace-tree-snapshot', corrId: cmd.corrId, mount: cmd.mount, entries: [] });
+        }
+        return;
+      }
+      case 'request-workspace-file': {
+        const mod = app.framework.getAllModules().find((m) => m.name === 'workspace') as
+          | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; error?: string }> }
+          | undefined;
+        if (!mod) {
+          emit({ type: 'workspace-file-snapshot', corrId: cmd.corrId, path: cmd.path, totalLines: 0, fromLine: 1, toLine: 0, content: '', truncated: false, error: 'workspace module not loaded' });
+          return;
+        }
+        const LIMIT = 5000;
+        try {
+          const result = await mod.handleToolCall({
+            name: 'read', input: { path: cmd.path, limit: LIMIT }, id: `headless-read-${Date.now()}`,
+          });
+          if (!result.success) {
+            emit({ type: 'workspace-file-snapshot', corrId: cmd.corrId, path: cmd.path, totalLines: 0, fromLine: 1, toLine: 0, content: '', truncated: false, error: result.error ?? 'read failed' });
+            return;
+          }
+          const data = (result.data ?? {}) as { path?: string; totalLines?: number; fromLine?: number; toLine?: number; content?: string };
+          const totalLines = data.totalLines ?? 0;
+          const toLine = data.toLine ?? totalLines;
+          emit({
+            type: 'workspace-file-snapshot',
+            corrId: cmd.corrId,
+            path: data.path ?? cmd.path,
+            totalLines,
+            fromLine: data.fromLine ?? 1,
+            toLine,
+            content: data.content ?? '',
+            truncated: toLine < totalLines,
+          });
+        } catch (err) {
+          emit({ type: 'workspace-file-snapshot', corrId: cmd.corrId, path: cmd.path, totalLines: 0, fromLine: 1, toLine: 0, content: '', truncated: false, error: err instanceof Error ? err.message : String(err) });
+        }
         return;
       }
       default: {
