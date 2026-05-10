@@ -299,13 +299,32 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
   // -- Build strategy --
   const strategyConfig = recipe.agent.strategy;
   const strategyType = strategyConfig?.type ?? 'autobiographical';
-  const autobiographicalOpts = {
+  const autobiographicalOpts: Record<string, unknown> = {
     headWindowTokens: strategyConfig?.headWindowTokens ?? 4000,
     recentWindowTokens: strategyConfig?.recentWindowTokens ?? 30000,
     compressionModel: strategyConfig?.compressionModel ?? model,
     autoTickOnNewMessage: true,
     maxMessageTokens: strategyConfig?.maxMessageTokens ?? 10000,
   };
+  // Pass-through additional fields if the recipe sets them (kept narrow:
+  // only fields the recipe schema actually accepts get forwarded).
+  for (const key of [
+    'enforceBudget',
+    'maxSpeculativeL1s',
+    'positionedRecallPairs',
+    'recallHeaderTemplate',
+    'targetChunkTokens',
+    'mergeThreshold',
+    'summaryTargetTokens',
+    'l1BudgetTokens',
+    'l2BudgetTokens',
+    'l3BudgetTokens',
+    'toolResultMaxLastN',
+    'toolUseInputMaxTokens',
+  ] as const) {
+    const v = (strategyConfig as Record<string, unknown> | undefined)?.[key];
+    if (v !== undefined) autobiographicalOpts[key] = v;
+  }
   const strategy = strategyType === 'passthrough'
     ? new PassthroughStrategy()
     : strategyType === 'frontdesk'
