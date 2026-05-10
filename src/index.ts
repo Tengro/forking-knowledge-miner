@@ -19,7 +19,7 @@ import { Membrane, AnthropicAdapter, NativeFormatter } from '@animalabs/membrane
 import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, type Module, type MountConfig } from '@animalabs/agent-framework';
 import { resolve, join, basename } from 'node:path';
 import { appendFile, mkdir, stat, rename } from 'node:fs/promises';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, renameSync, readFileSync, existsSync } from 'node:fs';
 import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
@@ -553,6 +553,26 @@ async function runPiped(app: AppContext) {
 }
 
 // ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+/** Count non-empty lines in a file. Returns 0 if the file doesn't exist. */
+function countLines(path: string): number {
+  if (!existsSync(path)) return 0;
+  try {
+    const buf = readFileSync(path, 'utf8');
+    if (buf.length === 0) return 0;
+    let n = 0;
+    for (let i = 0; i < buf.length; i++) if (buf.charCodeAt(i) === 10) n++;
+    // If the last byte isn't a newline, there's a partial trailing line that counts too.
+    if (buf.charCodeAt(buf.length - 1) !== 10) n++;
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -566,7 +586,28 @@ async function main() {
   // The `beforeRequest` hook receives the NormalizedRequest plus the raw
   // provider-format request (the literal body that's about to hit the API),
   // so we capture the exact shape the provider sees including model + temperature.
+  //
+  // Rotation: file is rotated every LLM_CALL_LOG_ROTATE_AT entries (default 50).
+  // The active file is always llm-calls.jsonl; rotated copies become
+  // llm-calls.<ISO-timestamp>.jsonl. Old files are kept (no auto-prune) so
+  // post-mortem of any historical session is possible.
   const llmCallLogPath = join(config.dataDir, 'llm-calls.jsonl');
+  const ROTATE_AT = Number(process.env.LLM_CALL_LOG_ROTATE_AT) || 50;
+  let llmCallCount = countLines(llmCallLogPath);
+  const rotateLlmCallLog = () => {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const rotated = llmCallLogPath.replace(/\.jsonl$/, `.${ts}.jsonl`);
+    try {
+      renameSync(llmCallLogPath, rotated);
+    } catch {
+      // File may not exist yet; ignore.
+    }
+    llmCallCount = 0;
+  };
+  // If the existing log is already at/over threshold from a prior run,
+  // rotate it on startup so the next request lands in a fresh file.
+  if (llmCallCount >= ROTATE_AT) rotateLlmCallLog();
+
   const membrane = new Membrane(adapter, {
     formatter: new NativeFormatter(),
     hooks: {
@@ -578,6 +619,8 @@ async function main() {
             rawRequest,
           };
           appendFileSync(llmCallLogPath, JSON.stringify(entry) + '\n');
+          llmCallCount++;
+          if (llmCallCount >= ROTATE_AT) rotateLlmCallLog();
         } catch {
           // Logging is best-effort; never break inference because the disk is full.
         }
