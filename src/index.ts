@@ -19,6 +19,7 @@ import { Membrane, AnthropicAdapter, NativeFormatter } from '@animalabs/membrane
 import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, type Module, type MountConfig } from '@animalabs/agent-framework';
 import { resolve, join, basename } from 'node:path';
 import { appendFile, mkdir, stat, rename } from 'node:fs/promises';
+import { appendFileSync } from 'node:fs';
 import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
@@ -559,7 +560,31 @@ async function main() {
   const recipe = await resolveRecipe();
 
   const adapter = new AnthropicAdapter({ apiKey: config.apiKey! });
-  const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
+
+  // LLM call log: appends one JSON line per request to {dataDir}/llm-calls.jsonl.
+  // Useful for post-mortem debugging when the TUI/headless flashes errors past.
+  // The `beforeRequest` hook receives the NormalizedRequest plus the raw
+  // provider-format request (the literal body that's about to hit the API),
+  // so we capture the exact shape the provider sees including model + temperature.
+  const llmCallLogPath = join(config.dataDir, 'llm-calls.jsonl');
+  const membrane = new Membrane(adapter, {
+    formatter: new NativeFormatter(),
+    hooks: {
+      beforeRequest: (normalizedRequest, rawRequest) => {
+        try {
+          const entry = {
+            ts: new Date().toISOString(),
+            normalizedConfig: normalizedRequest.config,
+            rawRequest,
+          };
+          appendFileSync(llmCallLogPath, JSON.stringify(entry) + '\n');
+        } catch {
+          // Logging is best-effort; never break inference because the disk is full.
+        }
+        return rawRequest;
+      },
+    },
+  });
 
   // Session management
   const sessionManager = new SessionManager(config.dataDir);
