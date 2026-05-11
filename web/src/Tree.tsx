@@ -175,7 +175,9 @@ function NodeLabel(props: { node: UiNode; onUsageClick: () => void }) {
           title="Show agent usage"
         />
         <Show when={a.toolCallsCount > 0}>
-          <span title="tool calls">·{a.toolCallsCount}</span>
+          {/* Use × instead of · to keep the count from reading as a negative
+              ("·11" at this font size is easy to misparse as "-11"). */}
+          <span title="tool calls">×{a.toolCallsCount}</span>
         </Show>
       </span>
     </>
