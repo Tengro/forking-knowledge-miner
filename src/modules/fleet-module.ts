@@ -38,10 +38,22 @@ import { loadRecipe } from '../recipe.js';
 import { REDUCER_REQUIRED_EVENTS } from '../state/agent-tree-reducer.js';
 
 /**
- * Force the events the unified-tree reducer needs into every subscription
- * sent to a fleet child. Recipes can still narrow chatty events out of the
- * wire stream; they just can't accidentally turn off rendering by omitting
- * `inference:tool_calls_yielded` or `tool:started` etc.
+ * Cross-process telemetry the parent host needs from every child, on top of
+ * what the unified-tree reducer needs. `usage:updated` is the cumulative
+ * session-usage signal — the TUI status bar and the WebUI header roll it up
+ * across children, so children that narrow their subscription (e.g. the
+ * triumvirate recipe) shouldn't be allowed to silently turn it off. Kept
+ * separate from REDUCER_REQUIRED_EVENTS because it isn't reducer-required;
+ * the wire just needs it for host-level observability.
+ */
+const HOST_FORCED_TELEMETRY_EVENTS: readonly string[] = ['usage:updated'];
+
+/**
+ * Force the events the unified-tree reducer + host telemetry need into every
+ * subscription sent to a fleet child. Recipes can still narrow chatty events
+ * out of the wire stream; they just can't accidentally disable rendering by
+ * omitting `inference:tool_calls_yielded` / `tool:started`, or starve the
+ * host's session-usage roll-up by omitting `usage:updated`.
  *
  * If `'*'` is present we leave the subscription alone — everything already
  * flows. Otherwise each required event is added unless it's already covered
@@ -51,6 +63,9 @@ export function unionWithReducerRequired(subscription: readonly string[]): strin
   if (subscription.includes('*')) return [...subscription];
   const set = new Set(subscription);
   for (const required of REDUCER_REQUIRED_EVENTS) {
+    if (!matchesSubscription(required, set)) set.add(required);
+  }
+  for (const required of HOST_FORCED_TELEMETRY_EVENTS) {
     if (!matchesSubscription(required, set)) set.add(required);
   }
   return [...set];

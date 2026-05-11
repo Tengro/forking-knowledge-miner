@@ -134,7 +134,19 @@ interface SharedServerState {
   allowedOrigins: string[];
   clients: Map<number, ClientState>;
   nextClientId: number;
+  /** Aggregate session usage published to clients: parent's own totals plus
+   *  the most-recent `usage:updated` totals reported by each fleet child.
+   *  Recomputed from `parentUsage` + `childUsage` on every relevant event. */
   latestUsage: TokenUsage;
+  /** Parent process' own session totals (from local `usage:updated`). Kept
+   *  separately so child-side updates don't clobber the parent's number when
+   *  recomputing the aggregate. */
+  parentUsage: TokenUsage;
+  /** Most-recent `usage:updated` totals per fleet child, keyed by childName.
+   *  Each entry overwrites on the next event from that child — children's
+   *  UsageTrackers already emit cumulative session totals, so summing across
+   *  the map gives the fleet-wide total without double-counting rounds. */
+  childUsage: Map<string, TokenUsage>;
   /** Per-agent cost breakdown captured alongside latestUsage. Re-derived on
    *  every usage:updated event so the welcome and live UsageMessage frames
    *  carry consistent values. */
@@ -205,6 +217,8 @@ export class WebUiModule implements Module {
       clients: new Map(),
       nextClientId: 1,
       latestUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      parentUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      childUsage: new Map(),
       latestPerAgentCost: [],
       pendingFleetRequests: new Map(),
       childRecipeCache: new Map(),
@@ -281,6 +295,17 @@ export class WebUiModule implements Module {
     // session switch) would carry stale or empty per-agent costs until the
     // next inference completes.
     ss.latestPerAgentCost = this.collectPerAgentCost();
+
+    // Session switch rebuilds the framework with a fresh UsageTracker; any
+    // tally accumulated on the previous framework would be misleading carried
+    // forward. Children's `usage:updated` events repopulate childUsage live;
+    // resetting here keeps the header total in lockstep with the new session.
+    // Seed parentUsage from the framework's restored snapshot so a session
+    // reopened from disk shows its historical totals immediately rather than
+    // appearing reset until the next inference event lands.
+    ss.parentUsage = this.snapshotParentUsage();
+    ss.childUsage.clear();
+    ss.latestUsage = aggregateFleetUsage(ss);
     // Recipe cache is keyed by file path; on session switch the framework
     // is fresh but children may carry over, so the cache is still valid.
     // Only clear if the entire app reference changed in a way that matters —
@@ -355,6 +380,39 @@ export class WebUiModule implements Module {
       return; // don't fan out — these are private replies, not telemetry
     }
 
+    // Roll up fleet-child session usage so the header total reflects every
+    // process the operator is paying for, not just the parent. Children emit
+    // their own `usage:updated` events; we cache the last `totals` for each
+    // and sum into the aggregate that goes out as latestUsage. Drop the
+    // child's entry on graceful exit so its stale totals don't keep counting
+    // after fleet--stop.
+    let usageChanged = false;
+    if (eType === 'usage:updated') {
+      const totalsObj = (event as unknown as { totals?: unknown }).totals;
+      const parsed = parseUsageTotals(totalsObj);
+      if (parsed) {
+        sharedServer!.childUsage.set(childName, parsed);
+        usageChanged = true;
+      }
+    } else if (eType === 'lifecycle') {
+      const phase = (event as { phase?: unknown }).phase;
+      if (phase === 'exiting' || phase === 'exited') {
+        if (sharedServer!.childUsage.delete(childName)) usageChanged = true;
+      }
+    }
+
+    let usageMsg: WebUiServerMessage | null = null;
+    if (usageChanged) {
+      sharedServer!.latestUsage = aggregateFleetUsage(sharedServer!);
+      usageMsg = {
+        type: 'usage',
+        usage: sharedServer!.latestUsage,
+        ...(sharedServer!.latestPerAgentCost.length > 0
+          ? { perAgentCost: sharedServer!.latestPerAgentCost }
+          : {}),
+      };
+    }
+
     if (sharedServer!.clients.size === 0) return;
     // Forward the verbatim event so the SPA can fold it into its own
     // per-child AgentTreeReducer for live updates.
@@ -366,6 +424,7 @@ export class WebUiModule implements Module {
     for (const client of sharedServer!.clients.values()) {
       if (!client.welcomed) continue;
       this.send(client, msg);
+      if (usageMsg) this.send(client, usageMsg);
     }
   }
 
@@ -432,16 +491,9 @@ export class WebUiModule implements Module {
     // clients get a current value.
     if (event.type === 'usage:updated') {
       const e = event as unknown as { totals?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number; estimatedCost?: { total: number; currency: string } } };
-      const t = e.totals;
-      if (t) {
-        sharedServer!.latestUsage = {
-          input: t.inputTokens ?? 0,
-          output: t.outputTokens ?? 0,
-          cacheRead: t.cacheReadTokens ?? 0,
-          cacheWrite: t.cacheCreationTokens ?? 0,
-          ...(t.estimatedCost ? { cost: { total: t.estimatedCost.total, currency: t.estimatedCost.currency } } : {}),
-        };
-      }
+      const parsed = parseUsageTotals(e.totals);
+      if (parsed) sharedServer!.parentUsage = parsed;
+      sharedServer!.latestUsage = aggregateFleetUsage(sharedServer!);
       // Re-derive the per-agent slice from the framework's snapshot. This
       // is the only place we reach into framework internals on the trace
       // hot path; the call is O(agents) and guarded by the cached snapshot.
@@ -536,6 +588,32 @@ export class WebUiModule implements Module {
       out.push({ name: agent.agentName, cost: { total: c.total, currency: c.currency }, inferenceCount: agent.inferenceCount });
     }
     return out;
+  }
+
+  /** Pull the parent UsageTracker's running totals so the header reflects a
+   *  restored session's prior spend immediately on connect, instead of
+   *  reading 0 until the next inference event fires. */
+  private snapshotParentUsage(): TokenUsage {
+    const empty: TokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    if (!sharedServer?.app) return empty;
+    const fw = sharedServer.app.framework as unknown as {
+      getSessionUsage?(): {
+        totals: {
+          inputTokens: number;
+          outputTokens: number;
+          cacheCreationTokens: number;
+          cacheReadTokens: number;
+          estimatedCost?: { total: number; currency: string };
+        };
+      };
+    };
+    if (typeof fw.getSessionUsage !== 'function') return empty;
+    try {
+      const snap = fw.getSessionUsage();
+      return parseUsageTotals(snap.totals) ?? empty;
+    } catch {
+      return empty;
+    }
   }
 
   private async maybeEmitTrigger(messageId: string, source: string): Promise<void> {
@@ -1807,6 +1885,76 @@ function extractText(content: ReadonlyArray<unknown>): string {
     if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text);
   }
   return parts.join('\n');
+}
+
+/** Parse a `usage:updated` `totals` payload into the wire `TokenUsage` shape.
+ *  Returns null if the input doesn't look like a SessionUsage object — the
+ *  caller leaves cached state untouched in that case, which is safer than
+ *  zeroing on every malformed frame. Negative / non-finite token values get
+ *  clamped to 0; they aren't a legitimate signal and end up rendering as
+ *  "-1in" badges if let through. */
+function parseUsageTotals(raw: unknown): TokenUsage | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const t = raw as {
+    inputTokens?: unknown;
+    outputTokens?: unknown;
+    cacheReadTokens?: unknown;
+    cacheCreationTokens?: unknown;
+    estimatedCost?: unknown;
+  };
+  const sanitize = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+  const usage: TokenUsage = {
+    input: sanitize(t.inputTokens),
+    output: sanitize(t.outputTokens),
+    cacheRead: sanitize(t.cacheReadTokens),
+    cacheWrite: sanitize(t.cacheCreationTokens),
+  };
+  const cost = t.estimatedCost as { total?: unknown; currency?: unknown } | undefined;
+  if (
+    cost
+    && typeof cost.total === 'number'
+    && Number.isFinite(cost.total)
+    && cost.total >= 0
+    && typeof cost.currency === 'string'
+  ) {
+    usage.cost = { total: cost.total, currency: cost.currency };
+  }
+  return usage;
+}
+
+/** Combine parent + per-child session totals into the single number shown in
+ *  the header. Cost folds when every contributor reports the same currency;
+ *  mismatched currencies drop cost entirely (better than silently summing
+ *  USD + EUR). */
+function aggregateFleetUsage(ss: SharedServerState): TokenUsage {
+  const out: TokenUsage = {
+    input: ss.parentUsage.input,
+    output: ss.parentUsage.output,
+    cacheRead: ss.parentUsage.cacheRead,
+    cacheWrite: ss.parentUsage.cacheWrite,
+  };
+  let costTotal = 0;
+  let costCurrency: string | null = null;
+  let costAbandoned = false;
+  const accumulateCost = (c: { total: number; currency: string } | undefined): void => {
+    if (costAbandoned) return;
+    if (!c) return;
+    if (costCurrency === null) { costCurrency = c.currency; costTotal = c.total; return; }
+    if (costCurrency !== c.currency) { costAbandoned = true; return; }
+    costTotal += c.total;
+  };
+  accumulateCost(ss.parentUsage.cost);
+  for (const u of ss.childUsage.values()) {
+    out.input += u.input;
+    out.output += u.output;
+    out.cacheRead += u.cacheRead;
+    out.cacheWrite += u.cacheWrite;
+    accumulateCost(u.cost);
+  }
+  if (!costAbandoned && costCurrency !== null) {
+    out.cost = { total: costTotal, currency: costCurrency };
+  }
+  return out;
 }
 
 function mimeFor(path: string): string {
