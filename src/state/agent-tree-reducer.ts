@@ -301,11 +301,19 @@ export class AgentTreeReducer {
   applySnapshot(snapshot: AgentTreeSnapshot): void {
     this.nodes.clear();
     this.callIdIndex.clear();
+    const sanitize = (n: number): number => (Number.isFinite(n) && n > 0 ? n : 0);
     for (const node of snapshot.nodes) {
       // Defensive copy so subsequent mutations don't escape into caller's data.
+      // Token values get clamped here as well — snapshots can carry the same
+      // bad data live events do, and applySnapshot wipes prior valid state.
       this.nodes.set(node.name, {
         ...node,
-        tokens: { ...node.tokens },
+        tokens: {
+          input: sanitize(node.tokens.input),
+          output: sanitize(node.tokens.output),
+          cacheRead: sanitize(node.tokens.cacheRead),
+          cacheWrite: sanitize(node.tokens.cacheWrite),
+        },
       });
     }
     for (const [callId, agentName] of Object.entries(snapshot.callIdIndex)) {
@@ -391,13 +399,18 @@ export class AgentTreeReducer {
     node: AgentNode,
     usage: { input?: number; output?: number; cacheRead?: number; cacheCreation?: number },
   ): void {
+    // Clamp negative / non-finite values: a few wire paths can land sentinel
+    // -1s here (e.g. a stream that aborted before usage was finalized) and
+    // letting them propagate produces "-1cx" badges and confusing aggregates
+    // downstream. Token counts are never legitimately negative.
+    const clamp = (n: number): number => (Number.isFinite(n) && n > 0 ? n : 0);
     // Input represents context window size at this round; overwrite, don't sum
     // (summing inputs would double-count history that's already in the next round's input).
-    if (typeof usage.input === 'number') node.tokens.input = usage.input;
+    if (typeof usage.input === 'number') node.tokens.input = clamp(usage.input);
     // Output / cache are per-round costs; accumulate.
-    if (typeof usage.output === 'number') node.tokens.output += usage.output;
-    if (typeof usage.cacheRead === 'number') node.tokens.cacheRead += usage.cacheRead;
-    if (typeof usage.cacheCreation === 'number') node.tokens.cacheWrite += usage.cacheCreation;
+    if (typeof usage.output === 'number') node.tokens.output += clamp(usage.output);
+    if (typeof usage.cacheRead === 'number') node.tokens.cacheRead += clamp(usage.cacheRead);
+    if (typeof usage.cacheCreation === 'number') node.tokens.cacheWrite += clamp(usage.cacheCreation);
   }
 
   // ----- private --------------------------------------------------------
