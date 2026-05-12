@@ -20,10 +20,30 @@ import { dirname, isAbsolute, resolve } from 'node:path';
 
 export interface RecipeStrategy {
   type: 'autobiographical' | 'passthrough' | 'frontdesk';
+  // Core window/compression sizing
   headWindowTokens?: number;
   recentWindowTokens?: number;
   compressionModel?: string;
   maxMessageTokens?: number;
+  // Compression/merge tuning passed through to the underlying
+  // autobiographical strategy (and frontdesk, which extends it).
+  // Declared here so a typo in a recipe (e.g. `l1BudgetTokes`) fails
+  // at recipe validation rather than silently defaulting at strategy
+  // construction. Keep in sync with `AutobiographicalConfig` in
+  // @animalabs/context-manager; this interface is the source of truth
+  // for what the recipe loader accepts under `agent.strategy`.
+  enforceBudget?: boolean;
+  maxSpeculativeL1s?: number;
+  positionedRecallPairs?: boolean;
+  recallHeaderTemplate?: string;
+  targetChunkTokens?: number;
+  mergeThreshold?: number;
+  summaryTargetTokens?: number;
+  l1BudgetTokens?: number;
+  l2BudgetTokens?: number;
+  l3BudgetTokens?: number;
+  toolResultMaxLastN?: number;
+  toolUseInputMaxTokens?: number;
 }
 
 export interface RecipeAgent {

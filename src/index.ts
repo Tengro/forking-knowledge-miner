@@ -19,11 +19,12 @@ import { Membrane, AnthropicAdapter, NativeFormatter } from '@animalabs/membrane
 import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, type Module, type MountConfig } from '@animalabs/agent-framework';
 import { resolve, join, basename } from 'node:path';
 import { appendFile, mkdir, stat, rename } from 'node:fs/promises';
+import { readFileSync, existsSync } from 'node:fs';
 import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
-import type { RecipeWorkspaceMount } from './recipe.js';
+import type { RecipeWorkspaceMount, RecipeStrategy } from './recipe.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
 import { FleetModule, type FleetModuleConfig } from './modules/fleet-module.js';
@@ -297,15 +298,44 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
   // No server augmentation needed — gate is wired via FrameworkConfig.gate
 
   // -- Build strategy --
+  //
+  // Build the options object with typed property access — no
+  // `Record<string, unknown>` cast on `strategyConfig`. Every field we
+  // forward is declared on `RecipeStrategy` (see recipe.ts); a typo in a
+  // recipe (e.g. `l1BudgetTokes`) now fails at recipe validation rather
+  // than silently being a no-op at strategy construction. AutobiographicalStrategy
+  // and FrontdeskStrategy share this option bag today; if strategy-specific
+  // fields are ever added, this should split into per-strategy types.
   const strategyConfig = recipe.agent.strategy;
   const strategyType = strategyConfig?.type ?? 'autobiographical';
-  const autobiographicalOpts = {
+  const autobiographicalOpts: Record<string, unknown> = {
     headWindowTokens: strategyConfig?.headWindowTokens ?? 4000,
     recentWindowTokens: strategyConfig?.recentWindowTokens ?? 30000,
     compressionModel: strategyConfig?.compressionModel ?? model,
     autoTickOnNewMessage: true,
     maxMessageTokens: strategyConfig?.maxMessageTokens ?? 10000,
   };
+  // Forward optional tuning fields when set. The key list is typed
+  // against `RecipeStrategy`, so an unknown field name is a compile
+  // error here rather than a silent no-op at runtime.
+  const passthroughKeys: ReadonlyArray<keyof RecipeStrategy> = [
+    'enforceBudget',
+    'maxSpeculativeL1s',
+    'positionedRecallPairs',
+    'recallHeaderTemplate',
+    'targetChunkTokens',
+    'mergeThreshold',
+    'summaryTargetTokens',
+    'l1BudgetTokens',
+    'l2BudgetTokens',
+    'l3BudgetTokens',
+    'toolResultMaxLastN',
+    'toolUseInputMaxTokens',
+  ];
+  for (const key of passthroughKeys) {
+    const v = strategyConfig?.[key];
+    if (v !== undefined) autobiographicalOpts[key] = v;
+  }
   const strategy = strategyType === 'passthrough'
     ? new PassthroughStrategy()
     : strategyType === 'frontdesk'
@@ -552,6 +582,26 @@ async function runPiped(app: AppContext) {
 }
 
 // ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+/** Count non-empty lines in a file. Returns 0 if the file doesn't exist. */
+function countLines(path: string): number {
+  if (!existsSync(path)) return 0;
+  try {
+    const buf = readFileSync(path, 'utf8');
+    if (buf.length === 0) return 0;
+    let n = 0;
+    for (let i = 0; i < buf.length; i++) if (buf.charCodeAt(i) === 10) n++;
+    // If the last byte isn't a newline, there's a partial trailing line that counts too.
+    if (buf.charCodeAt(buf.length - 1) !== 10) n++;
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -559,7 +609,76 @@ async function main() {
   const recipe = await resolveRecipe();
 
   const adapter = new AnthropicAdapter({ apiKey: config.apiKey! });
-  const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
+
+  // LLM call log: appends one JSON line per request to {dataDir}/llm-calls.jsonl.
+  // Useful for post-mortem debugging when the TUI/headless flashes errors past.
+  // The `beforeRequest` hook receives the NormalizedRequest plus the raw
+  // provider-format request (the literal body that's about to hit the API),
+  // so we capture the exact shape the provider sees including model + temperature.
+  //
+  // Rotation: every LLM_CALL_LOG_ROTATE_AT entries (default 50), the active
+  // file `llm-calls.jsonl` is renamed to `llm-calls.<ISO-timestamp>.jsonl`
+  // and the next request opens a fresh one. Old files are kept (no auto-
+  // prune) so post-mortem of any historical session is possible.
+  //
+  // Note: the log captures rawRequest bodies, which contain full message
+  // content — secrets, user input, etc. Treat `llm-calls.jsonl*` like a
+  // secrets-bearing file (chmod 600 if needed; exclude from tarballs).
+  const llmCallLogPath = join(config.dataDir, 'llm-calls.jsonl');
+  // Parse ROTATE_AT explicitly so `LLM_CALL_LOG_ROTATE_AT=0` doesn't
+  // silently fall back to 50 via `||`'s falsy-zero footgun. We require a
+  // positive integer; anything else (NaN, 0, negative) keeps the default.
+  const rotateAtRaw = Number.parseInt(process.env.LLM_CALL_LOG_ROTATE_AT ?? '', 10);
+  const ROTATE_AT = Number.isFinite(rotateAtRaw) && rotateAtRaw > 0 ? rotateAtRaw : 50;
+  let llmCallCount = countLines(llmCallLogPath);
+  const rotateLlmCallLog = async (): Promise<void> => {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const rotated = llmCallLogPath.replace(/\.jsonl$/, `.${ts}.jsonl`);
+    try {
+      await rename(llmCallLogPath, rotated);
+    } catch (err) {
+      // ENOENT is expected on the very first rotation when the file
+      // doesn't exist yet. Anything else (EPERM, EBUSY, ENOSPC, EXDEV
+      // when dataDir is on tmpfs / a different device) should be visible
+      // to the operator so they know the post-mortem log is fiction.
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT') {
+        console.warn('[llm-call-log] rotation failed:', code ?? String(err));
+      }
+    }
+    llmCallCount = 0;
+  };
+  // If the existing log is already at/over threshold from a prior run,
+  // rotate it on startup so the next request lands in a fresh file. This
+  // is async at module level, so a brief startup race is possible: a
+  // request fired in the first ~ms could append to the file that's about
+  // to be renamed. Acceptable trade — alternative is awaiting at the top
+  // of main(), which blocks all other module init for no real benefit.
+  if (llmCallCount >= ROTATE_AT) void rotateLlmCallLog();
+
+  const membrane = new Membrane(adapter, {
+    formatter: new NativeFormatter(),
+    hooks: {
+      beforeRequest: (normalizedRequest, rawRequest) => {
+        const entry = {
+          ts: new Date().toISOString(),
+          normalizedConfig: normalizedRequest.config,
+          rawRequest,
+        };
+        // Async, fire-and-forget — the hook is allowed to be synchronous,
+        // and we explicitly don't want to block the request on disk I/O.
+        // Pre-fix this was appendFileSync, which would stall the event
+        // loop on every inference (and on every rotation flush). Best-
+        // effort semantics: a swallowed error keeps the request going.
+        appendFile(llmCallLogPath, JSON.stringify(entry) + '\n').catch(() => {
+          // Logging is best-effort; never break inference because the disk is full.
+        });
+        llmCallCount++;
+        if (llmCallCount >= ROTATE_AT) void rotateLlmCallLog();
+        return rawRequest;
+      },
+    },
+  });
 
   // Session management
   const sessionManager = new SessionManager(config.dataDir);

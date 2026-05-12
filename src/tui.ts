@@ -341,7 +341,18 @@ export async function runTui(app: AppContext): Promise<void> {
 
   function updateStatus() {
     statusLeft.content = formatStatusLeft(state, SPINNER[spinnerFrame], streamOutputTokens);
-    statusRight.content = formatTokens(state.tokens, verboseChat);
+    statusRight.content = formatTokens(state.tokens, verboseChat) + formatMemStats(getRootCM());
+  }
+
+  /** Best-effort handle to the root agent's ContextManager, for stats queries. */
+  function getRootCM(): { getRenderStats?: () => unknown; getStrategy?: () => { getStats?: () => unknown } } | null {
+    try {
+      const ag = app.framework.getAgent(rootAgentName);
+      if (!ag) return null;
+      return ag.getContextManager() as any;
+    } catch {
+      return null;
+    }
   }
 
   function beginStream() {
@@ -1181,12 +1192,22 @@ export async function runTui(app: AppContext): Promise<void> {
 
       case 'inference:usage': {
         // Per-round usage updates during yielding streams
-        const roundUsage = event.tokenUsage as { input?: number; output?: number } | undefined;
+        const roundUsage = event.tokenUsage as {
+          input?: number; output?: number; cacheCreation?: number; cacheRead?: number;
+        } | undefined;
         if (agent && roundUsage?.input) {
           agentContextTokens.set(agent, roundUsage.input);
           const short = agent.replace(/^(spawn|fork)-/, '').replace(/-\d+$/, '').replace(/-retry\d+$/, '');
           if (short !== agent) agentContextTokens.set(short, roundUsage.input);
           if (state.viewMode === 'fleet') updateFleetView();
+        }
+        // Update root-agent token state for status-line display.
+        if (agent === rootAgentName && roundUsage) {
+          if (roundUsage.input !== undefined) state.tokens.input = roundUsage.input;
+          if (roundUsage.output !== undefined) state.tokens.output = (state.tokens.output ?? 0) + (roundUsage.output ?? 0);
+          if (roundUsage.cacheRead !== undefined) state.tokens.cacheRead = roundUsage.cacheRead;
+          if (roundUsage.cacheCreation !== undefined) state.tokens.cacheWrite = roundUsage.cacheCreation;
+          updateStatus();
         }
         break;
       }
@@ -1995,10 +2016,77 @@ function formatTokens(tokens: TokenUsage, verbose: boolean): string {
   const total = tokens.input + tokens.output;
   if (total > 0) {
     let s = `${fmtTokens(tokens.input)}in ${fmtTokens(tokens.output)}out`;
-    if (tokens.cacheRead > 0) s += ` ${fmtTokens(tokens.cacheRead)}cache`;
+    if (tokens.cacheRead > 0) s += ` ${fmtTokens(tokens.cacheRead)}hit`;
+    if (tokens.cacheWrite > 0) s += ` ${fmtTokens(tokens.cacheWrite)}write`;
     parts.push(s);
   }
 
   parts.push(verbose ? 'C-v:terse' : 'C-v:verbose');
   return parts.join('  ');
+}
+
+/**
+ * Render strategy memory stats for the status line. Prefers the richer
+ * `getRenderStats()` (tail size + per-level token sums) and falls back to
+ * `getStats()` if only that's available.
+ *
+ * Output shape: `mem: L1=5/9k L2=1/2k tail=770/495k (3 pending, 1 merge)`
+ *   - L1=count/totalTokens (compact e.g. 9k = 9000)
+ *   - tail=messageCount/tokenCount
+ */
+function formatMemStats(
+  cm: { getRenderStats?: () => unknown; getStrategy?: () => { getStats?: () => unknown } } | null,
+): string {
+  if (!cm) return '';
+  try {
+    if (typeof cm.getRenderStats === 'function') {
+      const r = cm.getRenderStats() as {
+        head?: { messages: number; tokens: number };
+        tail?: { messages: number; tokens: number };
+        summaries?: {
+          l1?: { count: number; tokens: number };
+          l2?: { count: number; tokens: number };
+          l3?: { count: number; tokens: number };
+        };
+        pending?: { chunks: number; merges: number };
+      } | null;
+      if (!r) return '';
+      const sumLevel = (lvl?: { count: number; tokens: number }) =>
+        lvl && lvl.count > 0 ? `${lvl.count}/${fmtTokens(lvl.tokens)}t` : null;
+      const parts: string[] = [];
+      const l1 = sumLevel(r.summaries?.l1);
+      const l2 = sumLevel(r.summaries?.l2);
+      const l3 = sumLevel(r.summaries?.l3);
+      if (l1) parts.push(`L1=${l1}`);
+      if (l2) parts.push(`L2=${l2}`);
+      if (l3) parts.push(`L3=${l3}`);
+      if (r.tail && r.tail.messages > 0) parts.push(`tail=${r.tail.messages}msg/${fmtTokens(r.tail.tokens)}t`);
+      const tags: string[] = [];
+      if (r.pending && r.pending.chunks > 0) tags.push(`${r.pending.chunks} pending`);
+      if (r.pending && r.pending.merges > 0) tags.push(`${r.pending.merges} merge`);
+      if (parts.length === 0 && tags.length === 0) return '';
+      return `  mem: ${parts.join(' ')}${tags.length > 0 ? ` (${tags.join(', ')})` : ''}`;
+    }
+    // Fallback to old getStats
+    const strategy = cm.getStrategy?.();
+    if (!strategy?.getStats) return '';
+    const s = strategy.getStats() as {
+      l1?: number; l2?: number; l3?: number;
+      pendingMerges?: number;
+      chunksTotal?: number; chunksCompressed?: number;
+    };
+    const l1 = s.l1 ?? 0;
+    const l2 = s.l2 ?? 0;
+    const l3 = s.l3 ?? 0;
+    if (l1 === 0 && l2 === 0 && l3 === 0) return '';
+    const pending = (s.chunksTotal ?? 0) - (s.chunksCompressed ?? 0);
+    let out = `  mem: L1=${l1}`;
+    if (l2 > 0) out += ` L2=${l2}`;
+    if (l3 > 0) out += ` L3=${l3}`;
+    if (pending > 0) out += ` (${pending} pending)`;
+    if ((s.pendingMerges ?? 0) > 0) out += ` (${s.pendingMerges} merge)`;
+    return out;
+  } catch {
+    return '';
+  }
 }
