@@ -19,7 +19,7 @@ import { Membrane, AnthropicAdapter, NativeFormatter } from '@animalabs/membrane
 import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, type Module, type MountConfig } from '@animalabs/agent-framework';
 import { resolve, join, basename } from 'node:path';
 import { appendFile, mkdir, stat, rename } from 'node:fs/promises';
-import { appendFileSync, renameSync, readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
@@ -587,43 +587,65 @@ async function main() {
   // provider-format request (the literal body that's about to hit the API),
   // so we capture the exact shape the provider sees including model + temperature.
   //
-  // Rotation: file is rotated every LLM_CALL_LOG_ROTATE_AT entries (default 50).
-  // The active file is always llm-calls.jsonl; rotated copies become
-  // llm-calls.<ISO-timestamp>.jsonl. Old files are kept (no auto-prune) so
-  // post-mortem of any historical session is possible.
+  // Rotation: every LLM_CALL_LOG_ROTATE_AT entries (default 50), the active
+  // file `llm-calls.jsonl` is renamed to `llm-calls.<ISO-timestamp>.jsonl`
+  // and the next request opens a fresh one. Old files are kept (no auto-
+  // prune) so post-mortem of any historical session is possible.
+  //
+  // Note: the log captures rawRequest bodies, which contain full message
+  // content — secrets, user input, etc. Treat `llm-calls.jsonl*` like a
+  // secrets-bearing file (chmod 600 if needed; exclude from tarballs).
   const llmCallLogPath = join(config.dataDir, 'llm-calls.jsonl');
-  const ROTATE_AT = Number(process.env.LLM_CALL_LOG_ROTATE_AT) || 50;
+  // Parse ROTATE_AT explicitly so `LLM_CALL_LOG_ROTATE_AT=0` doesn't
+  // silently fall back to 50 via `||`'s falsy-zero footgun. We require a
+  // positive integer; anything else (NaN, 0, negative) keeps the default.
+  const rotateAtRaw = Number.parseInt(process.env.LLM_CALL_LOG_ROTATE_AT ?? '', 10);
+  const ROTATE_AT = Number.isFinite(rotateAtRaw) && rotateAtRaw > 0 ? rotateAtRaw : 50;
   let llmCallCount = countLines(llmCallLogPath);
-  const rotateLlmCallLog = () => {
+  const rotateLlmCallLog = async (): Promise<void> => {
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
     const rotated = llmCallLogPath.replace(/\.jsonl$/, `.${ts}.jsonl`);
     try {
-      renameSync(llmCallLogPath, rotated);
-    } catch {
-      // File may not exist yet; ignore.
+      await rename(llmCallLogPath, rotated);
+    } catch (err) {
+      // ENOENT is expected on the very first rotation when the file
+      // doesn't exist yet. Anything else (EPERM, EBUSY, ENOSPC, EXDEV
+      // when dataDir is on tmpfs / a different device) should be visible
+      // to the operator so they know the post-mortem log is fiction.
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ENOENT') {
+        console.warn('[llm-call-log] rotation failed:', code ?? String(err));
+      }
     }
     llmCallCount = 0;
   };
   // If the existing log is already at/over threshold from a prior run,
-  // rotate it on startup so the next request lands in a fresh file.
-  if (llmCallCount >= ROTATE_AT) rotateLlmCallLog();
+  // rotate it on startup so the next request lands in a fresh file. This
+  // is async at module level, so a brief startup race is possible: a
+  // request fired in the first ~ms could append to the file that's about
+  // to be renamed. Acceptable trade — alternative is awaiting at the top
+  // of main(), which blocks all other module init for no real benefit.
+  if (llmCallCount >= ROTATE_AT) void rotateLlmCallLog();
 
   const membrane = new Membrane(adapter, {
     formatter: new NativeFormatter(),
     hooks: {
       beforeRequest: (normalizedRequest, rawRequest) => {
-        try {
-          const entry = {
-            ts: new Date().toISOString(),
-            normalizedConfig: normalizedRequest.config,
-            rawRequest,
-          };
-          appendFileSync(llmCallLogPath, JSON.stringify(entry) + '\n');
-          llmCallCount++;
-          if (llmCallCount >= ROTATE_AT) rotateLlmCallLog();
-        } catch {
+        const entry = {
+          ts: new Date().toISOString(),
+          normalizedConfig: normalizedRequest.config,
+          rawRequest,
+        };
+        // Async, fire-and-forget — the hook is allowed to be synchronous,
+        // and we explicitly don't want to block the request on disk I/O.
+        // Pre-fix this was appendFileSync, which would stall the event
+        // loop on every inference (and on every rotation flush). Best-
+        // effort semantics: a swallowed error keeps the request going.
+        appendFile(llmCallLogPath, JSON.stringify(entry) + '\n').catch(() => {
           // Logging is best-effort; never break inference because the disk is full.
-        }
+        });
+        llmCallCount++;
+        if (llmCallCount >= ROTATE_AT) void rotateLlmCallLog();
         return rawRequest;
       },
     },
