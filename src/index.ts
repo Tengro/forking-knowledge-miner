@@ -23,7 +23,7 @@ import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
-import type { RecipeWorkspaceMount } from './recipe.js';
+import type { RecipeWorkspaceMount, RecipeStrategy } from './recipe.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
 import { FleetModule, type FleetModuleConfig } from './modules/fleet-module.js';
@@ -297,6 +297,14 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
   // No server augmentation needed — gate is wired via FrameworkConfig.gate
 
   // -- Build strategy --
+  //
+  // Build the options object with typed property access — no
+  // `Record<string, unknown>` cast on `strategyConfig`. Every field we
+  // forward is declared on `RecipeStrategy` (see recipe.ts); a typo in a
+  // recipe (e.g. `l1BudgetTokes`) now fails at recipe validation rather
+  // than silently being a no-op at strategy construction. AutobiographicalStrategy
+  // and FrontdeskStrategy share this option bag today; if strategy-specific
+  // fields are ever added, this should split into per-strategy types.
   const strategyConfig = recipe.agent.strategy;
   const strategyType = strategyConfig?.type ?? 'autobiographical';
   const autobiographicalOpts: Record<string, unknown> = {
@@ -306,9 +314,10 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
     autoTickOnNewMessage: true,
     maxMessageTokens: strategyConfig?.maxMessageTokens ?? 10000,
   };
-  // Pass-through additional fields if the recipe sets them (kept narrow:
-  // only fields the recipe schema actually accepts get forwarded).
-  for (const key of [
+  // Forward optional tuning fields when set. The key list is typed
+  // against `RecipeStrategy`, so an unknown field name is a compile
+  // error here rather than a silent no-op at runtime.
+  const passthroughKeys: ReadonlyArray<keyof RecipeStrategy> = [
     'enforceBudget',
     'maxSpeculativeL1s',
     'positionedRecallPairs',
@@ -321,8 +330,9 @@ async function createFramework(membrane: Membrane, storePath: string, recipe: Re
     'l3BudgetTokens',
     'toolResultMaxLastN',
     'toolUseInputMaxTokens',
-  ] as const) {
-    const v = (strategyConfig as Record<string, unknown> | undefined)?.[key];
+  ];
+  for (const key of passthroughKeys) {
+    const v = strategyConfig?.[key];
     if (v !== undefined) autobiographicalOpts[key] = v;
   }
   const strategy = strategyType === 'passthrough'
