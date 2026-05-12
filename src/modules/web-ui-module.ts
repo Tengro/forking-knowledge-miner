@@ -30,6 +30,7 @@ import type {
   ToolCall,
   ToolResult,
   TraceEvent,
+  SessionUsageSnapshot,
 } from '@animalabs/agent-framework';
 import type { ServerWebSocket } from 'bun';
 import { readFile, stat } from 'node:fs/promises';
@@ -385,7 +386,10 @@ export class WebUiModule implements Module {
     // their own `usage:updated` events; we cache the last `totals` for each
     // and sum into the aggregate that goes out as latestUsage. Drop the
     // child's entry on graceful exit so its stale totals don't keep counting
-    // after fleet--stop.
+    // after fleet--stop. SIGKILL'd / crashed children never emit
+    // `lifecycle:exiting`, so their last reported totals stay in the map
+    // until the next session reset — accepted trade-off, the map is bounded
+    // by total-children-ever-spawned-this-session and crashes are rare.
     let usageChanged = false;
     if (eType === 'usage:updated') {
       const totalsObj = (event as unknown as { totals?: unknown }).totals;
@@ -490,8 +494,8 @@ export class WebUiModule implements Module {
     // Update cached usage snapshot first so welcomes for late-connecting
     // clients get a current value.
     if (event.type === 'usage:updated') {
-      const e = event as unknown as { totals?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number; estimatedCost?: { total: number; currency: string } } };
-      const parsed = parseUsageTotals(e.totals);
+      const totalsObj = (event as unknown as { totals?: unknown }).totals;
+      const parsed = parseUsageTotals(totalsObj);
       if (parsed) sharedServer!.parentUsage = parsed;
       sharedServer!.latestUsage = aggregateFleetUsage(sharedServer!);
       // Re-derive the per-agent slice from the framework's snapshot. This
@@ -567,20 +571,8 @@ export class WebUiModule implements Module {
    *  Returns [] if the framework isn't bound or no agents have been billed
    *  yet. Used by both the welcome payload and live UsageMessage frames. */
   private collectPerAgentCost(): import('../web/protocol.js').PerAgentCost[] {
-    if (!sharedServer?.app) return [];
-    const fw = sharedServer.app.framework as unknown as {
-      getSessionUsage?(): {
-        byAgent: Array<{
-          agentName: string;
-          usage: { estimatedCost?: { total: number; currency: string } };
-          inferenceCount: number;
-        }>;
-      };
-    };
-    if (typeof fw.getSessionUsage !== 'function') return [];
-    let snap;
-    try { snap = fw.getSessionUsage(); }
-    catch { return []; }
+    const snap = this.readSessionUsage();
+    if (!snap) return [];
     const out: import('../web/protocol.js').PerAgentCost[] = [];
     for (const agent of snap.byAgent) {
       const c = agent.usage.estimatedCost;
@@ -595,24 +587,19 @@ export class WebUiModule implements Module {
    *  reading 0 until the next inference event fires. */
   private snapshotParentUsage(): TokenUsage {
     const empty: TokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-    if (!sharedServer?.app) return empty;
-    const fw = sharedServer.app.framework as unknown as {
-      getSessionUsage?(): {
-        totals: {
-          inputTokens: number;
-          outputTokens: number;
-          cacheCreationTokens: number;
-          cacheReadTokens: number;
-          estimatedCost?: { total: number; currency: string };
-        };
-      };
-    };
-    if (typeof fw.getSessionUsage !== 'function') return empty;
+    const snap = this.readSessionUsage();
+    return snap ? (parseUsageTotals(snap.totals) ?? empty) : empty;
+  }
+
+  /** Read a defensive snapshot of the bound framework's UsageTracker. Returns
+   *  null if no app is bound or the call throws. The try/catch survives the
+   *  trace hot path: a thrown UsageTracker shouldn't take the WebUI down. */
+  private readSessionUsage(): SessionUsageSnapshot | null {
+    if (!sharedServer?.app) return null;
     try {
-      const snap = fw.getSessionUsage();
-      return parseUsageTotals(snap.totals) ?? empty;
+      return sharedServer.app.framework.getSessionUsage();
     } catch {
-      return empty;
+      return null;
     }
   }
 
@@ -1890,9 +1877,7 @@ function extractText(content: ReadonlyArray<unknown>): string {
 /** Parse a `usage:updated` `totals` payload into the wire `TokenUsage` shape.
  *  Returns null if the input doesn't look like a SessionUsage object — the
  *  caller leaves cached state untouched in that case, which is safer than
- *  zeroing on every malformed frame. Negative / non-finite token values get
- *  clamped to 0; they aren't a legitimate signal and end up rendering as
- *  "-1in" badges if let through. */
+ *  zeroing on every malformed frame. */
 function parseUsageTotals(raw: unknown): TokenUsage | null {
   if (!raw || typeof raw !== 'object') return null;
   const t = raw as {
@@ -1902,21 +1887,14 @@ function parseUsageTotals(raw: unknown): TokenUsage | null {
     cacheCreationTokens?: unknown;
     estimatedCost?: unknown;
   };
-  const sanitize = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
   const usage: TokenUsage = {
-    input: sanitize(t.inputTokens),
-    output: sanitize(t.outputTokens),
-    cacheRead: sanitize(t.cacheReadTokens),
-    cacheWrite: sanitize(t.cacheCreationTokens),
+    input: typeof t.inputTokens === 'number' ? t.inputTokens : 0,
+    output: typeof t.outputTokens === 'number' ? t.outputTokens : 0,
+    cacheRead: typeof t.cacheReadTokens === 'number' ? t.cacheReadTokens : 0,
+    cacheWrite: typeof t.cacheCreationTokens === 'number' ? t.cacheCreationTokens : 0,
   };
   const cost = t.estimatedCost as { total?: unknown; currency?: unknown } | undefined;
-  if (
-    cost
-    && typeof cost.total === 'number'
-    && Number.isFinite(cost.total)
-    && cost.total >= 0
-    && typeof cost.currency === 'string'
-  ) {
+  if (cost && typeof cost.total === 'number' && typeof cost.currency === 'string') {
     usage.cost = { total: cost.total, currency: cost.currency };
   }
   return usage;

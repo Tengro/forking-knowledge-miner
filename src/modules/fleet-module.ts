@@ -62,10 +62,7 @@ const HOST_FORCED_TELEMETRY_EVENTS: readonly string[] = ['usage:updated'];
 export function unionWithReducerRequired(subscription: readonly string[]): string[] {
   if (subscription.includes('*')) return [...subscription];
   const set = new Set(subscription);
-  for (const required of REDUCER_REQUIRED_EVENTS) {
-    if (!matchesSubscription(required, set)) set.add(required);
-  }
-  for (const required of HOST_FORCED_TELEMETRY_EVENTS) {
+  for (const required of [...REDUCER_REQUIRED_EVENTS, ...HOST_FORCED_TELEMETRY_EVENTS]) {
     if (!matchesSubscription(required, set)) set.add(required);
   }
   return [...set];
@@ -267,6 +264,23 @@ export class FleetModule implements Module {
     // stay in Phase 2/3 "open" mode so ad-hoc instantiation isn't broken.
     this.allowlistEnabled = explicit !== undefined || implicit.length > 0;
     this.allowlist = [...(explicit ?? []), ...implicit];
+
+    // Children are spawned detached + unref'd so they survive parent restart
+    // for adoption.  The downside: if .stop() never runs (test teardown
+    // forgot it, parent crashed), they re-parent to PID 1 and run forever.
+    // Synchronous SIGKILL on 'exit' catches the common forgotten-cleanup
+    // case.  Detach mode opts out — those children are *meant* to survive.
+    // Signal-aborted parents (SIGKILL on us, hard crash) still leak; 'exit'
+    // doesn't fire for those.
+    process.on('exit', () => {
+      if (this.detachMode) return;
+      for (const c of this.children.values()) {
+        const proc = c.process;
+        if (proc && proc.exitCode === null && proc.signalCode === null) {
+          try { proc.kill('SIGKILL'); } catch { /* noop */ }
+        }
+      }
+    });
   }
 
   async start(ctx: ModuleContext): Promise<void> {
