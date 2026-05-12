@@ -193,6 +193,171 @@ export interface SubagentPeekSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Fork materialisation
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the tool_result text the fork stream sees in place of the generic
+ * "Subagent X forked. Running in background." that the parent stream sees.
+ *
+ * The wording frames the fork as a parallel continuation of the same self
+ * rather than a separate agent — both streams inherit everything, the fork
+ * stream's job is to set aside the broader agenda and pursue one intention.
+ *
+ * This addresses fork-disorientation by naming the dual-stream situation
+ * explicitly and salient-placing it as the matching tool_result of the
+ * fork tool_use the model just emitted.
+ */
+export function buildIntentionFramedForkResult(
+  name: string,
+  task: string,
+  depth: number,
+  maxDepth: number,
+): string {
+  const depthLine = depth < maxDepth
+    ? `You are at depth ${depth} of ${maxDepth} (${maxDepth - depth} sub-fork levels remaining).`
+    : `You are at depth ${depth} of ${maxDepth} — at max depth, you cannot sub-fork.`;
+  return (
+    `Two parallel streams of you continue from this point, both inheriting everything you've done so far. ` +
+    `An instance of you still runs as the parent stream, carrying on the broader agenda; ` +
+    `the self reading this is the fork — set aside that broader agenda and focus exclusively on the intention ` +
+    `you set for this stream: ${task}\n\n` +
+    `${depthLine}\n\n` +
+    `When this intention is complete, return your findings via subagent--return so the parent stream can integrate them.`
+  );
+}
+
+interface MinimalMessage {
+  participant: string;
+  content: ContentBlock[];
+}
+
+/**
+ * Transform parent's compiled context into the fork stream's inherited view:
+ *   1. find the assistant turn containing the fork tool_use with id === callToolUseId
+ *   2. strip sibling subagent--fork tool_use blocks from that assistant turn
+ *   3. find (or synthesise) the matching tool_result user turn; strip sibling
+ *      fork tool_results from it; rewrite the matching one with intention framing
+ *   4. drop every message after the matching tool_result (post-fork tail —
+ *      peek calls, zombie returns, parent narrative — is the other major
+ *      load-bearing source of parent-coherent evidence)
+ *
+ * Returns null if the matching tool_use cannot be located (e.g. compressed
+ * away by the parent's strategy). Callers should fall back to wholesale
+ * copy + synthetic intention-framed append in that case.
+ */
+export function materialiseStructuralFork(
+  compiled: ReadonlyArray<MinimalMessage>,
+  callToolUseId: string,
+  forkName: string,
+  forkTask: string,
+  depth: number,
+  maxDepth: number,
+): MinimalMessage[] | null {
+  // 1. Locate the assistant turn whose content includes the fork tool_use we're materialising.
+  let forkAssistantIdx = -1;
+  for (let i = 0; i < compiled.length; i++) {
+    const content = compiled[i].content;
+    if (!Array.isArray(content)) continue;
+    const hit = content.some(b =>
+      b && b.type === 'tool_use' &&
+      (b as { id?: string; name?: string }).id === callToolUseId &&
+      (b as { name?: string }).name === 'subagent--fork',
+    );
+    if (hit) { forkAssistantIdx = i; break; }
+  }
+  if (forkAssistantIdx < 0) return null;
+
+  const forkAssistantMsg = compiled[forkAssistantIdx];
+  const siblingForkIds = new Set<string>();
+  for (const b of forkAssistantMsg.content) {
+    if (!b || b.type !== 'tool_use') continue;
+    const tu = b as { id: string; name: string };
+    if (tu.name === 'subagent--fork' && tu.id !== callToolUseId) {
+      siblingForkIds.add(tu.id);
+    }
+  }
+
+  // 2. Find the next user-side message holding the matching tool_result (if any).
+  // Stop searching at the next assistant turn — the matching tool_result must
+  // be in the immediately following tool-result turn or it's not there yet.
+  let matchingResultIdx = -1;
+  for (let i = forkAssistantIdx + 1; i < compiled.length; i++) {
+    const m = compiled[i];
+    if (!Array.isArray(m.content)) continue;
+    const hit = m.content.some(b =>
+      b && b.type === 'tool_result' &&
+      (b as { toolUseId?: string }).toolUseId === callToolUseId,
+    );
+    if (hit) { matchingResultIdx = i; break; }
+    // If this message contains any tool_use, it's a new assistant turn — bail.
+    const hasToolUse = m.content.some(b => b && b.type === 'tool_use');
+    if (hasToolUse) break;
+  }
+
+  const out: MinimalMessage[] = [];
+
+  // Pre-fork history verbatim.
+  for (let i = 0; i < forkAssistantIdx; i++) {
+    out.push({ participant: compiled[i].participant, content: [...compiled[i].content] });
+  }
+
+  // Fork assistant turn with sibling fork tool_use blocks stripped.
+  const trimmedAssistantContent = forkAssistantMsg.content.filter(b => {
+    if (!b || b.type !== 'tool_use') return true;
+    const tu = b as { id: string; name: string };
+    return !(tu.name === 'subagent--fork' && siblingForkIds.has(tu.id));
+  });
+  if (trimmedAssistantContent.length === 0) return null;
+  out.push({ participant: forkAssistantMsg.participant, content: trimmedAssistantContent });
+
+  // Matching tool_result user turn — rewritten with intention framing; siblings stripped.
+  const intentionFramed = buildIntentionFramedForkResult(forkName, forkTask, depth, maxDepth);
+  if (matchingResultIdx >= 0) {
+    const matchingMsg = compiled[matchingResultIdx];
+    const trimmedResultContent: ContentBlock[] = [];
+    for (const b of matchingMsg.content) {
+      if (!b) continue;
+      if (b.type === 'tool_result') {
+        const tr = b as { toolUseId: string; type: 'tool_result' };
+        if (siblingForkIds.has(tr.toolUseId)) continue;
+        if (tr.toolUseId === callToolUseId) {
+          trimmedResultContent.push({
+            type: 'tool_result',
+            toolUseId: callToolUseId,
+            content: intentionFramed,
+          });
+          continue;
+        }
+      }
+      trimmedResultContent.push(b);
+    }
+    if (trimmedResultContent.length === 0) {
+      // All siblings, nothing else — synthesise the matching result alone.
+      trimmedResultContent.push({
+        type: 'tool_result',
+        toolUseId: callToolUseId,
+        content: intentionFramed,
+      });
+    }
+    out.push({ participant: matchingMsg.participant, content: trimmedResultContent });
+  } else {
+    // Parent's tool_result for this fork isn't in compiled context yet — synthesise it.
+    out.push({
+      participant: 'user',
+      content: [{
+        type: 'tool_result',
+        toolUseId: callToolUseId,
+        content: intentionFramed,
+      }],
+    });
+  }
+
+  // Post-fork tail intentionally dropped.
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 
@@ -446,12 +611,18 @@ export class SubagentModule implements Module {
       },
       {
         name: 'fork',
-        description: 'Fork a subagent that inherits your current context. Async by default — returns immediately and delivers results as a message. Pass sync:true to block until completion.',
+        description:
+          "Fork the current conversation into two parallel streams that share all memory of what you've done so far. " +
+          "Both streams are continuations of the same self — one carries on with the broader agenda, the other focuses " +
+          "exclusively on a new intention (the `task`). After the call, the tool_result tells you which stream you are: " +
+          "if it begins with \"Subagent '<name>' forked. Running in background.\" you are the parent stream; if it begins " +
+          "with \"Two parallel streams of you continue from this point...\" you are the fork stream — set aside the broader " +
+          "agenda and pursue your assigned intention to completion via subagent--return. Async by default; pass sync:true to block.",
         inputSchema: {
           type: 'object',
           properties: {
-            name: { type: 'string', description: 'Short name for the forked agent' },
-            task: { type: 'string', description: 'Additional task for the fork to perform' },
+            name: { type: 'string', description: 'Short name for the forked stream' },
+            task: { type: 'string', description: 'The intention this fork stream should pursue' },
             systemPrompt: { type: 'string', description: 'Override system prompt (optional, defaults to parent)' },
             model: { type: 'string', description: 'Model override (optional)' },
             maxTokens: { type: 'number', description: 'Max output tokens per inference (optional). Defaults to the recipe-level subagent default, else the parent agent\'s maxTokens.' },
@@ -512,7 +683,7 @@ export class SubagentModule implements Module {
       case 'spawn':
         return this.handleSpawn(call.input as SpawnInput, caller);
       case 'fork':
-        return this.handleFork(call.input as ForkInput, caller);
+        return this.handleFork(call.input as ForkInput, caller, call.id);
       case 'hud':
         return this.handleHud(call.input as { enabled: boolean });
       case 'concurrency':
@@ -1087,7 +1258,7 @@ export class SubagentModule implements Module {
     return { success: true, data: `Subagent '${input.name}' spawned. Running in background.` };
   }
 
-  private async handleFork(input: ForkInput, callerAgentName?: string): Promise<ToolResult> {
+  private async handleFork(input: ForkInput, callerAgentName?: string, callToolUseId?: string): Promise<ToolResult> {
     const callerDepth = callerAgentName ? (this.agentDepths.get(callerAgentName) ?? 0) : 0;
     if (callerDepth >= this.maxDepth) {
       return {
@@ -1103,7 +1274,7 @@ export class SubagentModule implements Module {
     // Default timeout applies (600s) — auto-detaches to background.
     if (input.sync) {
       const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runFork(input, callerAgentName, callerDepth, timeoutMs);
+      const promise = this.runFork(input, callerAgentName, callerDepth, timeoutMs, callToolUseId);
       const result = await this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs);
       return result;
     }
@@ -1111,7 +1282,7 @@ export class SubagentModule implements Module {
     // Async mode (default): fire-and-forget, deliver result as message.
     // No default timeout — async agents run until they finish unless
     // the caller explicitly sets timeoutMs.
-    const promise = this.runFork(input, callerAgentName, callerDepth, input.timeoutMs);
+    const promise = this.runFork(input, callerAgentName, callerDepth, input.timeoutMs, callToolUseId);
     this.asyncHandles.set(input.name, { name: input.name, type: 'fork', promise, parentAgentName });
 
     promise
@@ -1431,7 +1602,7 @@ export class SubagentModule implements Module {
     }
   }
 
-  private async runFork(input: ForkInput, callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number): Promise<SubagentResult> {
+  private async runFork(input: ForkInput, callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number, callToolUseId?: string): Promise<SubagentResult> {
     const { waitedMs } = await this.acquireSlot();
     const childDepth = callerDepth + 1;
 
@@ -1489,43 +1660,63 @@ export class SubagentModule implements Module {
         this.registerLive(input.name, agentName, systemPrompt, contextManager);
 
         try {
-          // Copy parent's compiled (already-compressed) context into the fork.
-          // Deduplicate: after context compression, compile() can return both
-          // original messages and their compressed summaries, causing duplication.
+          // Materialise the fork's inherited context structurally:
+          //  - locate the parent's matching subagent--fork tool_use by id
+          //  - strip sibling fork tool_use blocks (and their tool_results) from
+          //    the parent's last assistant turn — they read as fleet-dispatch
+          //    evidence and convince the model it's the parent
+          //  - rewrite the matching tool_result with intention-stream framing
+          //    that names the dual-self situation explicitly
+          //  - drop everything after that tool_result (post-fork peek/wait
+          //    turns are the other big chunk of parent-coherence signal)
+          // If parent context is compressed past the fork point and the
+          // matching tool_use can't be located, fall back to wholesale copy
+          // plus a synthetic intention-framed fork tool_use/tool_result.
           if (parentAgent) {
             const parentCM = parentAgent.getContextManager();
             const { messages: compiled } = await parentCM.compile();
+            const transformed = callToolUseId
+              ? materialiseStructuralFork(
+                  compiled,
+                  callToolUseId,
+                  input.name,
+                  input.task,
+                  childDepth,
+                  this.maxDepth,
+                )
+              : null;
+
             const seen = new Set<string>();
-            for (const msg of compiled) {
-              // Hash by participant + content to detect exact duplicates
+            const addMsg = (msg: { participant: string; content: ContentBlock[] }) => {
               const key = msg.participant + '\0' + JSON.stringify(msg.content);
-              if (seen.has(key)) continue;
+              if (seen.has(key)) return;
               seen.add(key);
               const participant = msg.participant === parentAgent.name ? agentName : msg.participant;
               contextManager.addMessage(participant, msg.content);
+            };
+
+            if (transformed) {
+              for (const msg of transformed) addMsg(msg);
+            } else {
+              for (const msg of compiled) addMsg(msg);
+
+              // Fallback synthetic fork tool_use + intention-framed tool_result —
+              // used when we can't locate the matching tool_use in the parent's
+              // compiled context (e.g. compressed away, or callToolUseId missing).
+              const fallbackForkId = `fork-${input.name}-${Date.now()}`;
+              contextManager.addMessage(agentName, [{
+                type: 'tool_use',
+                id: fallbackForkId,
+                name: 'subagent--fork',
+                input: { name: input.name, task: input.task },
+              }] as ContentBlock[]);
+              contextManager.addMessage('user', [{
+                type: 'tool_result',
+                toolUseId: fallbackForkId,
+                content: buildIntentionFramedForkResult(input.name, input.task, childDepth, this.maxDepth),
+              }] as ContentBlock[]);
             }
           }
-
-          // Fork identity: the fork is the same self that decided to fork.
-          // Show it as a tool call it "made" with a result confirming it's inside.
-          const forkCallId = `fork-${input.name}-${Date.now()}`;
-          contextManager.addMessage(agentName, [{
-            type: 'tool_use',
-            id: forkCallId,
-            name: 'subagent--fork',
-            input: { name: input.name, task: input.task },
-          }] as ContentBlock[]);
-          contextManager.addMessage('user', [{
-            type: 'tool_result',
-            toolUseId: forkCallId,
-            content: `Fork successful — you are now running inside the fork "${input.name}" ` +
-              `(depth ${childDepth}/${this.maxDepth}). ` +
-              `Complete your task, then call subagent--return with your findings to deliver ` +
-              `them back to the parent agent.` +
-              (childDepth < this.maxDepth
-                ? ` You can sub-fork if needed (${this.maxDepth - childDepth} levels remaining).`
-                : ` You are at max depth — you cannot sub-fork.`),
-          }] as ContentBlock[]);
 
           // Pre-validate prompt size
           const { messages } = await contextManager.compile();
