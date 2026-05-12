@@ -42,9 +42,18 @@ interface AppContext {
 
 export type Line = { text: string; style?: 'user' | 'agent' | 'tool' | 'system' };
 
-// Undo/redo stacks: track (branchId, messageId) pairs for time-travel
+// Undo/redo stacks: track (branchName, messageId) pairs for time-travel.
+//
+// Earlier shape had a separate `branchId: string` field alongside
+// `branchName`. After the fix for `/redo` / `/restore` / `/checkout` (which
+// required these handlers to pass a NAME to `switchBranch`), every write
+// stored a name in both fields and every read preferred branchName. The
+// field name was actively lying: the next reader naturally fills
+// `branchId` with `branch.id` and reintroduces the exact bug the rename
+// is meant to prevent. Collapsed to a single `branchName` so the type
+// system enforces the actual contract — `switchBranch` only accepts
+// names; nothing else is a valid identifier here.
 export interface StatePoint {
-  branchId: string;
   branchName: string;
   messageId?: string;
 }
@@ -626,12 +635,8 @@ function handleUndo(app: AppContext): CommandResult {
     return { lines: [{ text: `Undo failed (branchAt): ${err}`, style: 'system' }] };
   }
 
-  bs.redoStack.push({
-    branchId: currentBranch.name, // store NAME — switchBranch expects name
-    branchName: currentBranch.name,
-  });
+  bs.redoStack.push({ branchName: currentBranch.name });
   bs.undoStack.push({
-    branchId: createdBranchName,
     branchName: createdBranchName,
     messageId: undoPoint,
   });
@@ -665,9 +670,7 @@ function handleRedo(app: AppContext): CommandResult {
   }
 
   const point = bs.redoStack.pop()!;
-  // Use branchName (the canonical key for switchBranch), with branchId as
-  // a fallback for legacy entries that may still hold the chronicle id.
-  const target = point.branchName || point.branchId;
+  const target = point.branchName;
 
   const asyncWork = Promise.resolve(cm.switchBranch(target))
     .then(() => ({
@@ -693,11 +696,7 @@ function handleCheckpoint(app: AppContext, name?: string): CommandResult {
   if (!cm) return { lines: [{ text: 'No agent context manager.', style: 'system' }] };
 
   const branch = cm.currentBranch();
-  // Save NAME as the primary identifier — switchBranch only accepts names.
-  app.branchState.checkpoints.set(name, {
-    branchId: branch.name,
-    branchName: branch.name,
-  });
+  app.branchState.checkpoints.set(name, { branchName: branch.name });
 
   return { lines: [{ text: `Checkpoint "${name}" saved at branch ${branch.name} (head: ${branch.head}).`, style: 'system' }] };
 }
@@ -724,7 +723,7 @@ function handleRestore(app: AppContext, name?: string): CommandResult {
   const cm = getAgentCM(app.framework);
   if (!cm) return { lines: [{ text: 'No agent context manager.', style: 'system' }] };
 
-  const target = point.branchName || point.branchId;
+  const target = point.branchName;
 
   // switchBranch is async — strategy reinit needs to complete before next op.
   const asyncWork = Promise.resolve(cm.switchBranch(target))
