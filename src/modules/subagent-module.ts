@@ -29,6 +29,7 @@ import type {
 } from '@animalabs/agent-framework';
 import type { AgentFramework } from '@animalabs/agent-framework';
 import { KnowledgeStrategy } from '@animalabs/agent-framework';
+import { isToolResultContent, isToolUseContent } from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
 
 // ---------------------------------------------------------------------------
@@ -227,6 +228,8 @@ export function buildIntentionFramedForkResult(
   );
 }
 
+/** Structural subset of context-manager's Message — accepting this wider
+ *  shape lets the helper be unit-tested without importing the framework. */
 interface MinimalMessage {
   participant: string;
   content: ContentBlock[];
@@ -260,9 +263,7 @@ export function materialiseStructuralFork(
     const content = compiled[i].content;
     if (!Array.isArray(content)) continue;
     const hit = content.some(b =>
-      b && b.type === 'tool_use' &&
-      (b as { id?: string; name?: string }).id === callToolUseId &&
-      (b as { name?: string }).name === 'subagent--fork',
+      isToolUseContent(b) && b.id === callToolUseId && b.name === 'subagent--fork',
     );
     if (hit) { forkAssistantIdx = i; break; }
   }
@@ -271,10 +272,9 @@ export function materialiseStructuralFork(
   const forkAssistantMsg = compiled[forkAssistantIdx];
   const siblingForkIds = new Set<string>();
   for (const b of forkAssistantMsg.content) {
-    if (!b || b.type !== 'tool_use') continue;
-    const tu = b as { id: string; name: string };
-    if (tu.name === 'subagent--fork' && tu.id !== callToolUseId) {
-      siblingForkIds.add(tu.id);
+    if (!isToolUseContent(b)) continue;
+    if (b.name === 'subagent--fork' && b.id !== callToolUseId) {
+      siblingForkIds.add(b.id);
     }
   }
 
@@ -285,30 +285,27 @@ export function materialiseStructuralFork(
   for (let i = forkAssistantIdx + 1; i < compiled.length; i++) {
     const m = compiled[i];
     if (!Array.isArray(m.content)) continue;
-    const hit = m.content.some(b =>
-      b && b.type === 'tool_result' &&
-      (b as { toolUseId?: string }).toolUseId === callToolUseId,
-    );
+    const hit = m.content.some(b => isToolResultContent(b) && b.toolUseId === callToolUseId);
     if (hit) { matchingResultIdx = i; break; }
     // If this message contains any tool_use, it's a new assistant turn — bail.
-    const hasToolUse = m.content.some(b => b && b.type === 'tool_use');
-    if (hasToolUse) break;
+    if (m.content.some(b => isToolUseContent(b))) break;
   }
 
   const out: MinimalMessage[] = [];
 
-  // Pre-fork history verbatim.
+  // Pre-fork history verbatim. Blocks are shared by reference everywhere in
+  // the framework's context flow — no cloning here either.
   for (let i = 0; i < forkAssistantIdx; i++) {
-    out.push({ participant: compiled[i].participant, content: [...compiled[i].content] });
+    out.push({ participant: compiled[i].participant, content: compiled[i].content });
   }
 
-  // Fork assistant turn with sibling fork tool_use blocks stripped.
+  // Fork assistant turn with sibling fork tool_use blocks stripped. The
+  // matching tool_use is excluded from siblingForkIds by construction, so
+  // this filter always keeps at least one block.
   const trimmedAssistantContent = forkAssistantMsg.content.filter(b => {
-    if (!b || b.type !== 'tool_use') return true;
-    const tu = b as { id: string; name: string };
-    return !(tu.name === 'subagent--fork' && siblingForkIds.has(tu.id));
+    if (!isToolUseContent(b)) return true;
+    return !(b.name === 'subagent--fork' && siblingForkIds.has(b.id));
   });
-  if (trimmedAssistantContent.length === 0) return null;
   out.push({ participant: forkAssistantMsg.participant, content: trimmedAssistantContent });
 
   // Matching tool_result user turn — rewritten with intention framing; siblings stripped.
@@ -317,11 +314,9 @@ export function materialiseStructuralFork(
     const matchingMsg = compiled[matchingResultIdx];
     const trimmedResultContent: ContentBlock[] = [];
     for (const b of matchingMsg.content) {
-      if (!b) continue;
-      if (b.type === 'tool_result') {
-        const tr = b as { toolUseId: string; type: 'tool_result' };
-        if (siblingForkIds.has(tr.toolUseId)) continue;
-        if (tr.toolUseId === callToolUseId) {
+      if (isToolResultContent(b)) {
+        if (siblingForkIds.has(b.toolUseId)) continue;
+        if (b.toolUseId === callToolUseId) {
           trimmedResultContent.push({
             type: 'tool_result',
             toolUseId: callToolUseId,
@@ -614,10 +609,8 @@ export class SubagentModule implements Module {
         description:
           "Fork the current conversation into two parallel streams that share all memory of what you've done so far. " +
           "Both streams are continuations of the same self — one carries on with the broader agenda, the other focuses " +
-          "exclusively on a new intention (the `task`). After the call, the tool_result tells you which stream you are: " +
-          "if it begins with \"Subagent '<name>' forked. Running in background.\" you are the parent stream; if it begins " +
-          "with \"Two parallel streams of you continue from this point...\" you are the fork stream — set aside the broader " +
-          "agenda and pursue your assigned intention to completion via subagent--return. Async by default; pass sync:true to block.",
+          "exclusively on a new intention (the `task`). The tool_result you receive identifies which stream you are. " +
+          "Async by default; pass sync:true to block until completion.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -1698,12 +1691,15 @@ export class SubagentModule implements Module {
             if (transformed) {
               for (const msg of transformed) addMsg(msg);
             } else {
+              // Fallback path: matching tool_use not located (parent compressed it
+              // away, or no callToolUseId). Wholesale copy is safe here because
+              // the cascade-bait — the matching fork tool_use and its siblings —
+              // got compressed away with the rest of the assistant turn. Append
+              // a synthetic intention-framed result so the child still gets the
+              // dual-stream framing as the salient last message.
               for (const msg of compiled) addMsg(msg);
 
-              // Fallback synthetic fork tool_use + intention-framed tool_result —
-              // used when we can't locate the matching tool_use in the parent's
-              // compiled context (e.g. compressed away, or callToolUseId missing).
-              const fallbackForkId = `fork-${input.name}-${Date.now()}`;
+              const fallbackForkId = `fork-${input.name}-${crypto.randomUUID()}`;
               contextManager.addMessage(agentName, [{
                 type: 'tool_use',
                 id: fallbackForkId,
