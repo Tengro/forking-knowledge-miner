@@ -154,7 +154,7 @@ Bun auto-loads `.env`, so nothing else to wire. If a recipe references a `${VAR}
 
 ## Step 6: Decide which data sources you want
 
-The miner child uses `recipes/knowledge-miner.json`, which comes pre-wired to talk to **Zulip, Notion, and GitLab**. The recipe itself references credentials via `${VAR}` placeholders — you don't edit the recipe to fill in secrets; you set the env vars in Step 5 and the framework substitutes at load time.
+The miner child uses `recipes/knowledge-miner.json`, which comes pre-wired to talk to **Zulip, Notion, GitLab, and DuckDuckGo** (public web). The recipe itself references credentials via `${VAR}` placeholders — you don't edit the recipe to fill in secrets; you set the env vars in Step 5 and the framework substitutes at load time.
 
 You decide which sources are active by whether you **set the matching env vars** and whether you **keep the matching mcpServers block in the recipe**.
 
@@ -186,6 +186,27 @@ NOTION_WORKSPACE_ID=...
 
 To disable: remove the `syncntn` block from `recipes/knowledge-miner.json`. Same behavior as above — unset env + kept block = startup failure with a clear message.
 
+### DuckDuckGo web search (optional, enabled by default)
+
+The miner is wired to [`nickclyde/duckduckgo-mcp-server`](https://github.com/nickclyde/duckduckgo-mcp-server) as `ddg`. No API key — DuckDuckGo's public HTML search, scraped at request time.
+
+To enable: install the server once as a sibling of `connectome-host/`:
+
+```bash
+cd ..
+git clone https://github.com/nickclyde/duckduckgo-mcp-server.git
+cd duckduckgo-mcp-server
+python3 -m venv .venv
+.venv/bin/pip install -e .
+cd ../connectome-host
+```
+
+The recipe expects the entry-point at `../duckduckgo-mcp-server/.venv/bin/duckduckgo-mcp-server`. No env vars required.
+
+Web hits get tagged `[WEB: <url>]` in mined reports — internal `[SRC]` always wins over `[WEB]` for org-specific terms; the reviewer flags collisions.
+
+To disable: remove the `ddg` block from `recipes/knowledge-miner.json`. The agent will skip the public web.
+
 ### Summary table
 
 | Source | Keep the block in recipe? | Env vars needed |
@@ -193,6 +214,7 @@ To disable: remove the `syncntn` block from `recipes/knowledge-miner.json`. Same
 | Zulip | Yes | (configured via `.zuliprc`, no `${VAR}`) |
 | GitLab | Yes if using, remove otherwise | `GITLAB_TOKEN`, `GITLAB_API_URL` |
 | Notion | Yes if using, remove otherwise | `NOTION_STORAGE_URL`, `NOTION_WORKSPACE_ID` |
+| DuckDuckGo | Yes if you want public web search, remove otherwise | none (no API key) |
 
 ### Tweaks you can still make to the recipe files
 
@@ -284,11 +306,11 @@ This is the "leave the bots working overnight, come back tomorrow" workflow.
 
 ### Miner
 
-- Uses `recipes/knowledge-miner.json`. Reads whatever data sources you configured in Step 6 (Zulip always; optionally Notion and/or GitLab).
+- Uses `recipes/knowledge-miner.json`. Reads whatever data sources you configured in Step 6 (Zulip always; optionally Notion, GitLab, and DuckDuckGo web search).
 - Wakes automatically when the clerk files a new ticket in `knowledge-requests/` — the miner's wake policy watches that directory.
 - Forks sub-agents to read across sources in parallel, extracts decisions / patterns / people / processes.
 - Writes Draft documents into `library-mined/` and creates structured "lessons" in its Chronicle store.
-- Tags every non-trivial claim with confidence markers — `[SRC: ...]`, `[INF]`, `[GEN]`, `❓`. These propagate all the way to the final library.
+- Tags every non-trivial claim with confidence markers — `[SRC: ...]` for internal sources, `[WEB: ...]` for public web hits, plus `[INF]`, `[GEN]`, and `❓`. These propagate all the way to the final library.
 
 ### Reviewer
 

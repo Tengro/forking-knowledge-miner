@@ -81,6 +81,23 @@ Typical setup:
 
 Don't have a Notion MCP server? Remove the `syncntn` entry from the recipe — the agent will adapt and work with whatever sources remain.
 
+### DuckDuckGo web search (optional, but enabled by default)
+
+The recipe ships with [`nickclyde/duckduckgo-mcp-server`](https://github.com/nickclyde/duckduckgo-mcp-server) wired as `ddg`. It gives the miner one public source — handy when a question has a regulatory, standards-body, or vendor-spec component the internal sources can't answer on their own. The agent emits `[WEB: <url>]` for any claim backed by a web hit, so the citation chain stays auditable.
+
+Install once as a sibling of `connectome-host/`:
+
+```bash
+cd ..
+git clone https://github.com/nickclyde/duckduckgo-mcp-server.git
+cd duckduckgo-mcp-server
+python3 -m venv .venv
+.venv/bin/pip install -e .
+cd ../connectome-host
+```
+
+The recipe expects the entry-point script at `../duckduckgo-mcp-server/.venv/bin/duckduckgo-mcp-server`. No API key needed. Don't want public-web access? Remove the `ddg` block from the recipe.
+
 ## Step 3: Configure the recipe
 
 Copy the template recipe and fill in your credentials:
@@ -117,6 +134,10 @@ Edit `my-recipe.json` and replace the placeholder values in `mcpServers`:
         "GITLAB_PERSONAL_ACCESS_TOKEN": "YOUR_GITLAB_TOKEN",  // <-- replace
         "GITLAB_API_URL": "https://gitlab.example.com/api/v4" // <-- replace
       }
+    },
+    "ddg": {
+      "command": "../duckduckgo-mcp-server/.venv/bin/duckduckgo-mcp-server"
+      // no creds; public web. Remove this block to disable web search.
     }
   }
 }
@@ -265,7 +286,15 @@ A domain expert can complete this checklist in 10-20 minutes without reading the
 
 ### The confidence markers
 
-The Knowledge Miner tags document claims with `[SRC]`, `[INF]`, `[GEN]`, or `❓`. The Reviewer audits these. If the Miner missed markers (unmarked claims that look like general knowledge), the Reviewer flags them.
+The Knowledge Miner tags document claims with `[SRC]`, `[WEB]`, `[INF]`, `[GEN]`, or `❓`. The Reviewer audits these. If the Miner missed markers (unmarked claims that look like general knowledge), the Reviewer flags them.
+
+- `[SRC: source]` — direct quote from an **internal** system (Zulip, Notion, GitLab)
+- `[WEB: url]` — quote from a public web page via the DuckDuckGo MCP; the URL is the citation
+- `[INF]` — inferred from multiple sources
+- `[GEN]` — general domain knowledge with no citation (prefer `[WEB]` when checkable)
+- `❓` — knowledge gap; needs a human expert
+
+Internal `[SRC]` always wins over `[WEB]` when both speak to the same org-specific term — the miner is instructed to keep the two meanings visibly separate, and the reviewer flags collisions.
 
 ## Troubleshooting
 
