@@ -42,9 +42,18 @@ interface AppContext {
 
 export type Line = { text: string; style?: 'user' | 'agent' | 'tool' | 'system' };
 
-// Undo/redo stacks: track (branchId, messageId) pairs for time-travel
+// Undo/redo stacks: track (branchName, messageId) pairs for time-travel.
+//
+// Earlier shape had a separate `branchId: string` field alongside
+// `branchName`. After the fix for `/redo` / `/restore` / `/checkout` (which
+// required these handlers to pass a NAME to `switchBranch`), every write
+// stored a name in both fields and every read preferred branchName. The
+// field name was actively lying: the next reader naturally fills
+// `branchId` with `branch.id` and reintroduces the exact bug the rename
+// is meant to prevent. Collapsed to a single `branchName` so the type
+// system enforces the actual contract — `switchBranch` only accepts
+// names; nothing else is a valid identifier here.
 export interface StatePoint {
-  branchId: string;
   branchName: string;
   messageId?: string;
 }
@@ -613,28 +622,42 @@ function handleUndo(app: AppContext): CommandResult {
     return { lines: [{ text: 'Nothing to undo (no agent messages found).', style: 'system' }] };
   }
 
+  // Snapshot the current branch's NAME so /redo can return here. Chronicle's
+  // switchBranch is keyed by name, not the internal numeric id.
+  const currentBranch = cm.currentBranch();
+  const newBranchName = `undo-${Date.now()}`;
+
+  let createdBranchName: string;
   try {
-    // Save current state for redo
-    const currentBranch = cm.currentBranch();
-    bs.redoStack.push({
-      branchId: currentBranch.id,
-      branchName: currentBranch.name,
-    });
-
-    // Create a new branch from the undo point
-    const newBranchId = cm.branchAt(undoPoint, `undo-${Date.now()}`);
-    cm.switchBranch(newBranchId);
-
-    bs.undoStack.push({
-      branchId: newBranchId,
-      branchName: `undo-${Date.now()}`,
-      messageId: undoPoint,
-    });
-
-    return { lines: [{ text: `Undone. Switched to branch ${newBranchId}.`, style: 'system' }], branchChanged: true };
+    // branchAt returns the new branch's NAME (the only thing switchBranch accepts).
+    createdBranchName = cm.branchAt(undoPoint, newBranchName);
   } catch (err) {
-    return { lines: [{ text: `Undo failed: ${err}`, style: 'system' }] };
+    return { lines: [{ text: `Undo failed (branchAt): ${err}`, style: 'system' }] };
   }
+
+  bs.redoStack.push({ branchName: currentBranch.name });
+  bs.undoStack.push({
+    branchName: createdBranchName,
+    messageId: undoPoint,
+  });
+
+  // switchBranch is async — it re-initializes the strategy on the new branch
+  // (autobio reloads its persisted summaries / pins / mergeQueue). Without
+  // awaiting, the next /compile or send-message could see stale strategy
+  // state from the prior branch.
+  const asyncWork = Promise.resolve(cm.switchBranch(createdBranchName))
+    .then(() => ({
+      lines: [{ text: `Undone. Switched to branch "${createdBranchName}".`, style: 'system' as const }],
+      branchChanged: true,
+    }))
+    .catch(err => ({
+      lines: [{ text: `Undo failed (switchBranch): ${err}`, style: 'system' as const }],
+    }));
+
+  return {
+    lines: [{ text: `Undoing → branch "${createdBranchName}"...`, style: 'system' }],
+    asyncWork,
+  };
 }
 
 function handleRedo(app: AppContext): CommandResult {
@@ -647,12 +670,21 @@ function handleRedo(app: AppContext): CommandResult {
   }
 
   const point = bs.redoStack.pop()!;
-  try {
-    cm.switchBranch(point.branchId);
-    return { lines: [{ text: `Redone. Switched to branch ${point.branchName}.`, style: 'system' }], branchChanged: true };
-  } catch (err) {
-    return { lines: [{ text: `Redo failed: ${err}`, style: 'system' }] };
-  }
+  const target = point.branchName;
+
+  const asyncWork = Promise.resolve(cm.switchBranch(target))
+    .then(() => ({
+      lines: [{ text: `Redone. Switched to branch "${target}".`, style: 'system' as const }],
+      branchChanged: true,
+    }))
+    .catch(err => ({
+      lines: [{ text: `Redo failed: ${err}`, style: 'system' as const }],
+    }));
+
+  return {
+    lines: [{ text: `Redoing → branch "${target}"...`, style: 'system' }],
+    asyncWork,
+  };
 }
 
 function handleCheckpoint(app: AppContext, name?: string): CommandResult {
@@ -664,10 +696,7 @@ function handleCheckpoint(app: AppContext, name?: string): CommandResult {
   if (!cm) return { lines: [{ text: 'No agent context manager.', style: 'system' }] };
 
   const branch = cm.currentBranch();
-  app.branchState.checkpoints.set(name, {
-    branchId: branch.id,
-    branchName: branch.name,
-  });
+  app.branchState.checkpoints.set(name, { branchName: branch.name });
 
   return { lines: [{ text: `Checkpoint "${name}" saved at branch ${branch.name} (head: ${branch.head}).`, style: 'system' }] };
 }
@@ -694,12 +723,22 @@ function handleRestore(app: AppContext, name?: string): CommandResult {
   const cm = getAgentCM(app.framework);
   if (!cm) return { lines: [{ text: 'No agent context manager.', style: 'system' }] };
 
-  try {
-    cm.switchBranch(point.branchId);
-    return { lines: [{ text: `Restored to checkpoint "${name}" (branch: ${point.branchName}).`, style: 'system' }], branchChanged: true };
-  } catch (err) {
-    return { lines: [{ text: `Restore failed: ${err}`, style: 'system' }] };
-  }
+  const target = point.branchName;
+
+  // switchBranch is async — strategy reinit needs to complete before next op.
+  const asyncWork = Promise.resolve(cm.switchBranch(target))
+    .then(() => ({
+      lines: [{ text: `Restored to checkpoint "${name}" (branch: ${target}).`, style: 'system' as const }],
+      branchChanged: true,
+    }))
+    .catch(err => ({
+      lines: [{ text: `Restore failed: ${err}`, style: 'system' as const }],
+    }));
+
+  return {
+    lines: [{ text: `Restoring → branch "${target}"...`, style: 'system' }],
+    asyncWork,
+  };
 }
 
 function handleBranches(framework: AgentFramework): CommandResult {
@@ -735,12 +774,23 @@ function handleCheckout(framework: AgentFramework, name?: string): CommandResult
     return { lines: [{ text: `Branch "${name}" not found. Use /branches to list.`, style: 'system' }] };
   }
 
-  try {
-    cm.switchBranch(target.id);
-    return { lines: [{ text: `Switched to branch ${target.name}.`, style: 'system' }], branchChanged: true };
-  } catch (err) {
-    return { lines: [{ text: `Checkout failed: ${err}`, style: 'system' }] };
-  }
+  // switchBranch only accepts the branch name (chronicle is name-keyed).
+  // It's also async — re-initializes the strategy on the new branch so any
+  // persistent strategy state (autobio summaries / pins / mergeQueue) is
+  // reloaded for the destination branch's chronicle view.
+  const asyncWork = Promise.resolve(cm.switchBranch(target.name))
+    .then(() => ({
+      lines: [{ text: `Switched to branch ${target.name}.`, style: 'system' as const }],
+      branchChanged: true,
+    }))
+    .catch(err => ({
+      lines: [{ text: `Checkout failed: ${err}`, style: 'system' as const }],
+    }));
+
+  return {
+    lines: [{ text: `Switching → branch ${target.name}...`, style: 'system' }],
+    asyncWork,
+  };
 }
 
 function handleHistory(framework: AgentFramework): CommandResult {
