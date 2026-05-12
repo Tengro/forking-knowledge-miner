@@ -24,14 +24,22 @@ interface ToolResultLike {
 
 describe('FleetModule — no-subfleets invariant', () => {
   let tmpDir: string;
+  // Tests 3 and 4 pass validation and actually spawn a (detached) bun child;
+  // without explicit cleanup the children orphan to PID 1.  Track every
+  // FleetModule we construct so afterAll can reap them.
+  const activeFleets: FleetModule[] = [];
 
   beforeAll(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'fkm-no-subfleets-'));
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    // Reap in parallel — production shutdown timeouts (graceful 10s + SIGTERM 5s
+    // + SIGKILL 2s ≈ 17s per fleet) would blow Bun's 5s hook budget if awaited
+    // serially. The constructor below also overrides those to snappy values.
+    await Promise.all(activeFleets.map((f) => f.stop().catch(() => { /* noop */ })));
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
-  });
+  }, 30_000);
 
   async function runLaunch(recipeBody: object): Promise<ToolResultLike> {
     const recipePath = join(tmpDir, `recipe-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
@@ -40,7 +48,12 @@ describe('FleetModule — no-subfleets invariant', () => {
     const fleet = new FleetModule({
       childRuntimePath: 'bun',
       childIndexPath: INDEX_PATH,
+      // Snappy shutdown so afterAll reaping stays within the hook budget
+      // even if a spawned child is uncooperative (no API key, etc.).
+      gracefulShutdownMs: 1_000,
+      sigtermEscalationMs: 500,
     });
+    activeFleets.push(fleet);
     // FleetModule.start() reads/writes Chronicle state; for a pure validation
     // test we drive handleToolCall directly without start(). The launch path
     // we exercise here checks the recipe before any subprocess spawn.

@@ -242,6 +242,8 @@ export class FleetModule implements Module {
    * different slices of the same wire stream.
    */
   private eventSubscribers = new Map<string, Set<FleetEventSubscription>>();
+  /** Installed by start(), removed by stop(); see killAllOnExitSync(). */
+  private exitHandler: (() => void) | null = null;
 
   constructor(config: FleetModuleConfig = {}) {
     this.config = {
@@ -264,27 +266,44 @@ export class FleetModule implements Module {
     // stay in Phase 2/3 "open" mode so ad-hoc instantiation isn't broken.
     this.allowlistEnabled = explicit !== undefined || implicit.length > 0;
     this.allowlist = [...(explicit ?? []), ...implicit];
+  }
 
-    // Children are spawned detached + unref'd so they survive parent restart
-    // for adoption.  The downside: if .stop() never runs (test teardown
-    // forgot it, parent crashed), they re-parent to PID 1 and run forever.
-    // Synchronous SIGKILL on 'exit' catches the common forgotten-cleanup
-    // case.  Detach mode opts out — those children are *meant* to survive.
-    // Signal-aborted parents (SIGKILL on us, hard crash) still leak; 'exit'
-    // doesn't fire for those.
-    process.on('exit', () => {
-      if (this.detachMode) return;
-      for (const c of this.children.values()) {
-        const proc = c.process;
-        if (proc && proc.exitCode === null && proc.signalCode === null) {
-          try { proc.kill('SIGKILL'); } catch { /* noop */ }
-        }
+  /**
+   * Synchronous SIGKILL of every live child this fleet owns. Invoked from
+   * the 'exit' listener installed in start(); also safe to call directly.
+   *
+   * Coverage and limits:
+   *  - Spawned children (proc handle present): killed via proc.kill.
+   *  - Adopted children (proc null, pid populated): killed via
+   *    process.kill(pid). Without this, adopt-on-restart cleanup is a no-op.
+   *  - Detach mode: skipped — those children are *meant* to survive for
+   *    the next parent to adopt.
+   *  - Hard-crash / SIGKILL of the parent: 'exit' does not fire, so this
+   *    cannot help. Detached children orphan to PID 1 in that path.
+   */
+  private killAllOnExitSync(): void {
+    if (this.detachMode) return;
+    for (const c of this.children.values()) {
+      const proc = c.process;
+      if (proc && proc.exitCode === null && proc.signalCode === null) {
+        try { proc.kill('SIGKILL'); } catch { /* noop */ }
+      } else if (!proc && c.pid !== null && (c.status === 'ready' || c.status === 'starting')) {
+        try { process.kill(c.pid, 'SIGKILL'); } catch { /* noop */ }
       }
-    });
+    }
   }
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
+
+    // Defensive cleanup if the parent exits without stop() running: synchronously
+    // SIGKILL any live children. See killAllOnExitSync() for coverage/limits.
+    // Installed here (not in the constructor) so listeners don't leak and a
+    // stopped FleetModule can be GC'd; we remove it in stop().
+    if (!this.exitHandler) {
+      this.exitHandler = (): void => this.killAllOnExitSync();
+      process.on('exit', this.exitHandler);
+    }
 
     // First, try to adopt any still-alive children from a prior parent run.
     // Adoption is best-effort: for each persisted child we probe liveness
@@ -572,6 +591,14 @@ export class FleetModule implements Module {
   async stop(): Promise<void> {
     // Mark shutdown so the process 'exit' handlers don't trigger autoRestart.
     this.stopping = true;
+
+    // Uninstall the 'exit' safety net first so we don't pin this instance in
+    // memory after a clean shutdown, and so MaxListenersExceededWarning doesn't
+    // accumulate across many start/stop cycles in the same process.
+    if (this.exitHandler) {
+      process.off('exit', this.exitHandler);
+      this.exitHandler = null;
+    }
 
     if (this.detachMode) {
       // Detach: close socket references only; leave child processes alive so
@@ -1571,9 +1598,11 @@ export class FleetModule implements Module {
   }
 
   private async killChild(child: FleetChild): Promise<void> {
-    const proc = child.process;
-    if (!proc) return;
     if (child.status === 'exited' || child.status === 'crashed') return;
+    const proc = child.process;
+    const pid = child.pid;
+    // Nothing to kill: never spawned and no adopted pid recorded.
+    if (!proc && pid === null) return;
 
     // Mark intent so the exit handler doesn't trigger autoRestart.
     child.killRequested = true;
@@ -1581,13 +1610,21 @@ export class FleetModule implements Module {
     if (child.socket) {
       try { this.sendToChild(child, { type: 'shutdown', graceful: true }); } catch { /* noop */ }
     }
-    if (await this.waitForExit(proc, this.config.gracefulShutdownMs)) return;
 
-    try { proc.kill('SIGTERM'); } catch { /* noop */ }
-    if (await this.waitForExit(proc, this.config.sigtermEscalationMs)) return;
+    // Adopted children have no ChildProcess handle; we can still send signals
+    // via the recorded pid and poll liveness with signal 0.
+    const waitExit = (ms: number): Promise<boolean> =>
+      proc !== null ? this.waitForExit(proc, ms) : this.waitForExitByPid(pid!, ms);
+    const sendSignal = (sig: NodeJS.Signals): void => {
+      if (proc) { try { proc.kill(sig); } catch { /* noop */ } }
+      else if (pid !== null) { try { process.kill(pid, sig); } catch { /* noop */ } }
+    };
 
-    try { proc.kill('SIGKILL'); } catch { /* noop */ }
-    await this.waitForExit(proc, 2_000);
+    if (await waitExit(this.config.gracefulShutdownMs)) return;
+    sendSignal('SIGTERM');
+    if (await waitExit(this.config.sigtermEscalationMs)) return;
+    sendSignal('SIGKILL');
+    await waitExit(2_000);
   }
 
   private waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
@@ -1602,6 +1639,24 @@ export class FleetModule implements Module {
         res(true);
       };
       proc.once('exit', onExit);
+    });
+  }
+
+  /** Poll-based liveness for adopted children (no ChildProcess handle).
+   *  `kill(pid, 0)` throws ESRCH once the process is gone. */
+  private waitForExitByPid(pid: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((res) => {
+      const tick = (): void => {
+        try {
+          process.kill(pid, 0);
+          if (Date.now() >= deadline) return res(false);
+          setTimeout(tick, 100);
+        } catch {
+          res(true);  // ESRCH (or EPERM rarely) — assume gone
+        }
+      };
+      tick();
     });
   }
 }

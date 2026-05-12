@@ -208,6 +208,12 @@ describe('FleetModule — Phase 2', () => {
 describe('FleetModule — Phase 4 autoStart + allowlist', () => {
   let tmpDir: string;
   let recipePath: string;
+  // Each test below builds its own FleetModule and (in the happy path) calls
+  // .stop() before returning.  But if a test throws or times out — or, like
+  // adopt-on-restart, intentionally uses detachMode — children spawned with
+  // detached:true survive and orphan to PID 1.  Push every fleet here so
+  // afterAll can defensively reap whatever the test bodies missed.
+  const activeFleets: FleetModule[] = [];
 
   beforeAll(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'fkm-fleet-as-'));
@@ -216,9 +222,16 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
     process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'sk-test-fleet-smoke';
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    // Reap in parallel; serial awaits would exceed Bun's hook budget on the
+    // worst-case timeout path. undo any leftover detach-mode (adopt-on-restart
+    // sets it) so stop() actually kills children, not just disconnects sockets.
+    await Promise.all(activeFleets.map(async (f) => {
+      try { f.setDetachMode(false); } catch { /* noop */ }
+      try { await f.stop(); } catch { /* noop */ }
+    }));
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
-  });
+  }, 30_000);
 
   test('autoStart children launch during start() and reach ready', async () => {
     const fleet = new FleetModule({
@@ -232,6 +245,7 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
       gracefulShutdownMs: 5_000,
       sigtermEscalationMs: 2_000,
     });
+    activeFleets.push(fleet);
 
     // Minimal ModuleContext stub — start() only uses ctx for .setState which we don't exercise here.
     await fleet.start({} as unknown as Parameters<typeof fleet.start>[0]);
@@ -261,6 +275,7 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
       gracefulShutdownMs: 5_000,
       sigtermEscalationMs: 2_000,
     });
+    activeFleets.push(fleet);
     await fleet.start({} as unknown as Parameters<typeof fleet.start>[0]);
 
     const bogus = join(tmpDir, 'bogus-recipe.json');
@@ -292,6 +307,7 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
       gracefulShutdownMs: 5_000,
       sigtermEscalationMs: 2_000,
     });
+    activeFleets.push(fleet);
     await fleet.start({} as unknown as Parameters<typeof fleet.start>[0]);
 
     const allEvents: string[] = [];
@@ -339,7 +355,12 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
       childIndexPath: INDEX_PATH,
       socketWaitTimeoutMs: 15_000,
       readyTimeoutMs: 10_000,
+      // Snappy shutdown so the afterAll safety net stays within hook budget
+      // if anything between detach and the explicit kill below throws.
+      gracefulShutdownMs: 1_000,
+      sigtermEscalationMs: 500,
     });
+    activeFleets.push(fleet1);
     await fleet1.start(stubCtx);
     const dataDir = join(tmpDir, 'adopt');
     const res1 = await fleet1.handleToolCall({
@@ -361,7 +382,10 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
       childIndexPath: INDEX_PATH,
       socketWaitTimeoutMs: 15_000,
       readyTimeoutMs: 10_000,
+      gracefulShutdownMs: 1_000,
+      sigtermEscalationMs: 500,
     });
+    activeFleets.push(fleet2);
     await fleet2.start(stubCtx);
 
     // The adopted child should be in the new fleet's map, ready, with the SAME pid.
@@ -399,6 +423,7 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
       gracefulShutdownMs: 5_000,
       sigtermEscalationMs: 2_000,
     });
+    activeFleets.push(fleet);
     await fleet.start({} as unknown as Parameters<typeof fleet.start>[0]);
 
     // Run the launch from the recipe's directory so CWD-resolving "recipe.json"
@@ -430,6 +455,7 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
       gracefulShutdownMs: 5_000,
       sigtermEscalationMs: 2_000,
     });
+    activeFleets.push(fleet);
     await fleet.start({} as unknown as Parameters<typeof fleet.start>[0]);
 
     // Any recipe under tmpDir/ should match.
