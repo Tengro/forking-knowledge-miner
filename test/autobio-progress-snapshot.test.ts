@@ -6,8 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 async function initializedStrategy() {
-  const root = mkdtempSync(join(tmpdir(), 'autobio-progress-'));
-  const path = join(root, 'store');
+  const path = mkdtempSync(join(tmpdir(), 'autobio-progress-'));
   const strategy = new AutobiographicalStrategy({
     compressionModel: 'claude-sonnet-4-5-20250929',
     autoTickOnNewMessage: false,
@@ -17,7 +16,7 @@ async function initializedStrategy() {
     strategy,
     close: () => {
       cm.close();
-      rmSync(root, { recursive: true, force: true });
+      rmSync(path, { recursive: true, force: true });
     },
   };
 }
