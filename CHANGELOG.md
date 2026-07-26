@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Pin id picker sourced the wrong ids.** It read `/debug/context/curve`, which
+  looked right but isn't: on a live store 0 of 208 raw entries carried a
+  `sourceMessageId`, and the 26 entries that *did* have an `id` were summaries,
+  whose ids (`L3-544`) are not message ids. Pinning with one would have created a
+  pin matching no message and silently done nothing. The picker now uses the
+  client's own message list, where `WelcomeMessageEntry.id` is the store id and
+  server-sourced rows are exactly those carrying a store `index`; it also gains a
+  text/id filter. Caught by checking the endpoint against a real store before
+  anyone used the panel.
+
+## Unreleased
+
 ## 0.6.0 — 2026-07-26
 
 ### Added

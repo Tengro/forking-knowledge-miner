@@ -12,8 +12,8 @@
  * degrades to raw — a safe superset, but not what was asked for — so the panel
  * warns rather than letting it pass silently.
  *
- * Message ids come from /debug/context/curve (cheap: ~14ms) so the operator
- * picks from the live context instead of pasting ids.
+ * Ids are picked from the client's own message list (real store ids) rather than
+ * typed. See PinCandidate for why /debug/context/curve is NOT a usable source.
  */
 
 import { createSignal, For, Show } from 'solid-js';
@@ -37,14 +37,22 @@ export interface PinsState {
   deepestLevel?: number;
 }
 
-interface CurveEntry {
-  i: number;
-  kind: string;
-  id: string | null;
-  participant?: string;
-  rendered?: number;
-  msgCount?: number;
-  text?: string;
+/**
+ * A pinnable message.
+ *
+ * MUST be a real message-store id. /debug/context/curve looked like the natural
+ * source but is not: on a live store its raw entries carry no `sourceMessageId`
+ * (0 of 208 had one) and the entries that DO have an `id` are summaries, whose
+ * ids (`L3-544`) are not message ids at all. Pinning with one would create a pin
+ * matching no message and silently do nothing. The client's own message list is
+ * authoritative — `WelcomeMessageEntry.id` is the store id, and server-sourced
+ * rows are exactly those with a store `index`.
+ */
+export interface PinCandidate {
+  id: string;
+  index: number;
+  participant: string;
+  text: string;
 }
 
 const ago = (ms: number) => {
@@ -67,6 +75,8 @@ export function PinsPanel(props: {
   loaded: boolean;
   state: PinsState | null;
   agent?: string;
+  /** Pinnable messages — server-sourced rows only (real store ids). */
+  candidates?: PinCandidate[];
   onRefresh(): void;
   onAdd(input: {
     kind: 'pin' | 'document';
@@ -85,26 +95,16 @@ export function PinsPanel(props: {
   const [lvl, setLvl] = createSignal('1');
   const [asDoc, setAsDoc] = createSignal(false);
 
-  const [curve, setCurve] = createSignal<CurveEntry[] | null>(null);
-  const [curveErr, setCurveErr] = createSignal<string | null>(null);
-  const [picking, setPicking] = createSignal(false);
+  const [showPicker, setShowPicker] = createSignal(false);
+  const [filter, setFilter] = createSignal('');
 
-  /** /debug/context/curve is the cheap endpoint (~14ms) and the only one that
-   *  exposes per-entry store ids alongside a text preview. */
-  const loadCurve = async () => {
-    setPicking(true);
-    setCurveErr(null);
-    try {
-      const qs = props.agent ? `?agent=${encodeURIComponent(props.agent)}` : '';
-      const res = await fetch(`/debug/context/curve${qs}`, { credentials: 'same-origin' });
-      const body = await res.json();
-      if (!res.ok) { setCurveErr(body?.error ?? `HTTP ${res.status}`); return; }
-      setCurve((body.entries ?? []) as CurveEntry[]);
-    } catch (e) {
-      setCurveErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setPicking(false);
-    }
+  const candidates = () => {
+    const q = filter().trim().toLowerCase();
+    const all = props.candidates ?? [];
+    const hit = q ? all.filter((c) => c.text.toLowerCase().includes(q) || c.id.includes(q)) : all;
+    // Newest last is how the operator reads the conversation; cap the list so a
+    // long history doesn't build thousands of rows.
+    return hit.slice(-200);
   };
 
   const submit = () => {
@@ -273,42 +273,45 @@ export function PinsPanel(props: {
             </button>
             <button type="button"
               class="px-2 py-0.5 text-[10px] rounded font-mono bg-neutral-800 hover:bg-neutral-700 text-neutral-300"
-              onClick={() => void loadCurve()}>
-              {picking() ? 'loading…' : curve() ? 'reload ids' : 'pick from context'}
+              onClick={() => setShowPicker((v) => !v)}>
+              {showPicker() ? 'hide messages' : `pick from messages (${(props.candidates ?? []).length})`}
             </button>
           </div>
 
-          <Show when={curveErr()}>
-            <div class="text-[10px] text-amber-400/90 mb-2">{curveErr()}</div>
-          </Show>
-
-          {/* ---- id picker ---- */}
-          <Show when={curve()}>
+          <Show when={showPicker()}>
+            <input value={filter()} onInput={(e) => setFilter(e.currentTarget.value)}
+              placeholder="filter by text or id"
+              class="w-full mb-1 bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5
+                     font-mono text-[10px] text-neutral-100" />
+            <Show when={candidates().length === 0}>
+              <div class="text-[10px] text-neutral-600 italic">
+                No pinnable messages loaded. Pins need a real store id, so only
+                server-sourced rows qualify — scroll the chat to load history.
+              </div>
+            </Show>
             <div class="max-h-64 overflow-y-auto border border-neutral-800 rounded">
-              <For each={curve()!.filter((e) => e.id)}>
-                {(e) => (
+              <For each={candidates()}>
+                {(c) => (
                   <div class="flex items-start gap-1.5 px-1.5 py-1 border-b border-neutral-900
                               hover:bg-neutral-900/60">
-                    <span class="text-[9px] font-mono text-neutral-600 w-8 shrink-0">#{e.i}</span>
-                    <span class={`text-[9px] font-mono w-8 shrink-0 ${
-                      e.kind === 'raw' ? 'text-emerald-400/80' : 'text-orange-400/80'
-                    }`}>{e.kind}</span>
-                    <span class="text-[10px] text-neutral-400 flex-1 truncate"
-                      title={e.text ?? ''}>{(e.text ?? '').slice(0, 90)}</span>
+                    <span class="text-[9px] font-mono text-neutral-600 w-8 shrink-0">#{c.index}</span>
+                    <span class="text-[9px] font-mono text-cyan-400/70 w-12 shrink-0 truncate">
+                      {c.participant}
+                    </span>
+                    <span class="text-[10px] text-neutral-400 flex-1 truncate" title={c.text}>
+                      {c.text.slice(0, 90)}
+                    </span>
                     <button type="button"
                       class="text-[9px] font-mono px-1 rounded bg-neutral-800 hover:bg-neutral-700
                              text-neutral-400 shrink-0"
-                      onClick={() => setFirst(e.id!)}>from</button>
+                      onClick={() => setFirst(c.id)}>from</button>
                     <button type="button" disabled={asDoc()}
                       class="text-[9px] font-mono px-1 rounded bg-neutral-800 hover:bg-neutral-700
                              text-neutral-400 shrink-0 disabled:opacity-30"
-                      onClick={() => setLast(e.id!)}>to</button>
+                      onClick={() => setLast(c.id)}>to</button>
                   </div>
                 )}
               </For>
-            </div>
-            <div class="text-[10px] text-neutral-600 mt-1">
-              Entries without a store id (merged summaries) are omitted — a pin needs a message id.
             </div>
           </Show>
         </div>

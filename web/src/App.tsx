@@ -11,7 +11,7 @@ import { LessonsPanel, type LessonRow } from './Lessons';
 import { McplPanel, type McplServerRow } from './Mcpl';
 import { SettingsPanel, type SettingsState } from './Settings';
 import { DryContext, type DryContextData } from './DryContext';
-import { PinsPanel, type PinsState } from './Pins';
+import { PinsPanel, type PinsState, type PinCandidate } from './Pins';
 import { FilesPanel, FileViewerModal, type Mount, type FlatEntry, type FileViewer } from './Files';
 import { ContextPanel } from './Context';
 import { ContextDocument } from './ContextDocument';
@@ -1271,6 +1271,11 @@ export function App() {
                 loaded={pinsLoaded()}
                 state={pinsState()}
                 agent={pinsState()?.agent}
+                candidates={messages
+                  .filter((m) => m.index !== undefined && m.id)
+                  .map<PinCandidate>((m) => ({
+                    id: m.id, index: m.index!, participant: m.participant, text: m.text ?? '',
+                  }))}
                 onRefresh={refreshPins}
                 onAdd={(input) => wire.send({ type: 'pin-add', ...input })}
                 onRemove={(pinId) => wire.send({ type: 'pin-remove', pinId })}
