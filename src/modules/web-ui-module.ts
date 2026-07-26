@@ -1988,10 +1988,11 @@ export class WebUiModule implements Module {
       case 'settings-update': {
         const agentName = this.resolveSettingsAgent(parsed.agent);
         try {
-          const patch: Record<string, number> = {};
+          const patch: Record<string, number | boolean> = {};
           if (parsed.contextBudgetTokens !== undefined) patch.contextBudgetTokens = parsed.contextBudgetTokens;
           if (parsed.tailTokens !== undefined) patch.tailTokens = parsed.tailTokens;
           if (parsed.transitionPaceTokens !== undefined) patch.transitionPaceTokens = parsed.transitionPaceTokens;
+          if (parsed.immediate !== undefined) patch.immediate = parsed.immediate;
           const fw = sharedServer!.app.framework as unknown as {
             updateAgentRuntimeSettings: (n: string, p: unknown, o?: { persist?: boolean }) => unknown;
           };

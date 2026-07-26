@@ -701,6 +701,10 @@ export interface SettingsUpdateMessage {
   contextBudgetTokens?: number;
   tailTokens?: number;
   transitionPaceTokens?: number;
+  /** Apply a budget DECREASE immediately (one-shot fold-down, KV
+   *  invalidation paid this turn) instead of starting a paced descent.
+   *  The emergency lever for refusal streaks / over-wall wedges. */
+  immediate?: boolean;
   persist?: boolean;
   notify?: boolean;
 }
@@ -864,7 +868,7 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
       return isOptionalNonEmptyString(v.agent);
     case 'settings-update': {
       if (!isOptionalNonEmptyString(v.agent)) return false;
-      if (!isOptionalBool(v.persist) || !isOptionalBool(v.notify)) return false;
+      if (!isOptionalBool(v.persist) || !isOptionalBool(v.notify) || !isOptionalBool(v.immediate)) return false;
       // Positive-integer-or-absent for each knob. The semantic gate (budget must
       // exceed max response tokens; tail/pace need a hot-configurable strategy)
       // lives in Agent.validateRuntimeSettingsPatch — this only guarantees the

@@ -96,6 +96,7 @@ export function SettingsPanel(props: {
     contextBudgetTokens?: number;
     tailTokens?: number;
     transitionPaceTokens?: number;
+    immediate?: boolean;
     persist: boolean;
     notify: boolean;
   }): void;
@@ -109,6 +110,7 @@ export function SettingsPanel(props: {
   const [pace, setPace] = createSignal<string>('');
   const [persist, setPersist] = createSignal(true);
   const [notify, setNotify] = createSignal(false);
+  const [immediate, setImmediate] = createSignal(false);
 
   const [preview, setPreview] = createSignal<PreviewResult | null>(null);
   const [acct, setAcct] = createSignal<PreviewAccounting | null>(null);
@@ -196,7 +198,12 @@ export function SettingsPanel(props: {
     if (t !== undefined && t !== cur?.tailTokens) patch.tailTokens = t;
     if (p !== undefined && p !== cur?.transitionPaceTokens) patch.transitionPaceTokens = p;
     if (Object.keys(patch).length === 0) return;
-    props.onApply({ ...patch, persist: persist(), notify: notify() });
+    props.onApply({
+      ...patch,
+      ...(lowering() && immediate() ? { immediate: true } : {}),
+      persist: persist(),
+      notify: notify(),
+    });
   };
 
   const lowering = () => {
@@ -339,10 +346,26 @@ export function SettingsPanel(props: {
             <div>ephemeral — live now, reverts on restart.</div>
           </Show>
           <Show when={lowering()}>
-            <div class="text-amber-500/90">
-              lowering the budget converges gradually, not instantly — it will report
-              <span class="font-mono"> converging</span> until it settles.
-            </div>
+            <label
+              class="flex items-center gap-1 text-neutral-400 mb-1"
+              title="Skip the paced descent: the next compile plans straight at the new budget. The whole fold-down and its KV-prefix invalidation land on that one turn — the emergency lever for refusal streaks or over-budget wedges. Cancels any in-flight descent."
+            >
+              <input type="checkbox" checked={immediate()} onChange={(e) => setImmediate(e.currentTarget.checked)} />
+              drop immediately
+            </label>
+            <Show when={!immediate()}>
+              <div class="text-amber-500/90">
+                lowering the budget converges gradually, not instantly — it will report
+                <span class="font-mono"> converging</span> until it settles.
+                Check <span class="font-mono">drop immediately</span> to skip the descent.
+              </div>
+            </Show>
+            <Show when={immediate()}>
+              <div class="text-red-400/90">
+                immediate drop: the full fold-down (and its KV re-read) lands on the next
+                turn, and any in-flight descent is cancelled.
+              </div>
+            </Show>
           </Show>
         </div>
 
