@@ -67,6 +67,9 @@ export function buildFrameworkStrategy(
     headWindowTokens: strategyConfig?.headWindowTokens ?? 4000,
     recentWindowTokens: strategyConfig?.recentWindowTokens ?? 30000,
     compressionModel: strategyConfig?.compressionModel ?? model,
+    ...(strategyConfig?.compressionMaxTokens !== undefined
+      ? { compressionMaxTokens: strategyConfig.compressionMaxTokens }
+      : {}),
     autoTickOnNewMessage: true,
     maxMessageTokens: strategyConfig?.maxMessageTokens ?? 10000,
     ...(strategyType === 'frontdesk' ? { timeZone } : {}),

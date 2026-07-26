@@ -28,6 +28,10 @@ export interface RecipeStrategy {
   headWindowTokens?: number;
   recentWindowTokens?: number;
   compressionModel?: string;
+  /** Cap compression `max_tokens` at the compression model's OUTPUT ceiling.
+   *  Required for pre-4.x models (Claude 3 Opus caps at 4096) — without it the
+   *  summarizer's 16k floor is rejected and the agent never folds. */
+  compressionMaxTokens?: number;
   maxMessageTokens?: number;
   overBudgetGraceRatio?: number;
   // Compression/merge tuning passed through to the underlying
