@@ -1212,6 +1212,51 @@ export class WebUiModule implements Module {
   private previewLastAt = 0;
   private static readonly PREVIEW_COOLDOWN_MS = 3_000;
 
+  /**
+   * Replace the dry run's full rendered entries with a compact display
+   * projection.
+   *
+   * Shipping the entries verbatim cost ~110s of BLOCKED AGENT on Mythos (353
+   * entries, megabytes of content plus any inlined media) against ~8s for the
+   * numbers-only path — and select() builds those entries either way, so the
+   * extra ~100s was pure serialization of data the UI never shows in full: the
+   * pane truncates every body past 600 chars anyway.
+   *
+   * So: keep identity, size and a bounded text preview; drop content blocks and
+   * never inline media. Also removes the blob-resolution heap risk the /curve
+   * handler warns about.
+   */
+  private projectDryEntries(result: unknown): unknown {
+    const r = result as { entries?: unknown[] } & Record<string, unknown>;
+    if (!Array.isArray(r.entries)) return result;
+    const MAX_TEXT = 1_200;
+    const projected = r.entries.map((e, i) => {
+      const o = (e ?? {}) as { participant?: string; role?: string; content?: unknown };
+      let text = '';
+      let media = 0;
+      const blocks = Array.isArray(o.content) ? o.content : [];
+      for (const b of blocks) {
+        if (!b || typeof b !== 'object') { text += String(b ?? ''); continue; }
+        const t = (b as { type?: string }).type;
+        if (t === 'text') text += (b as { text?: string }).text ?? '';
+        else if (t === 'image') { media++; text += '[image]'; }
+        else if (t === 'thinking' || t === 'redacted_thinking') text += '[thinking]';
+        else if (t === 'tool_use') text += `[tool_use ${(b as { name?: string }).name ?? ''}]`;
+        else if (t === 'tool_result') text += '[tool_result]';
+      }
+      if (typeof o.content === 'string') text = o.content;
+      return {
+        i,
+        who: o.participant ?? o.role ?? '?',
+        chars: text.length,
+        media,
+        truncated: text.length > MAX_TEXT,
+        text: text.length > MAX_TEXT ? text.slice(0, MAX_TEXT) : text,
+      };
+    });
+    return { ...r, entries: projected };
+  }
+
   private handleContextPreview(url: URL): Response {
     const app = sharedServer?.app;
     if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
@@ -1326,7 +1371,7 @@ export class WebUiModule implements Module {
         },
         /** How long the agent was blocked, so the operator sees the real cost. */
         elapsedMs: Date.now() - startedAt,
-        preview: result,
+        preview: wantRender ? this.projectDryEntries(result) : result,
       });
     } catch (err) {
       return Response.json(

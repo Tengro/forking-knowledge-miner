@@ -12,7 +12,7 @@
  * actual layout that budget would produce — not an approximation.
  */
 
-import { createSignal, For, Show } from 'solid-js';
+import { For, Show } from 'solid-js';
 
 interface Seg { messages: number; tokens: number }
 interface DryStats {
@@ -29,47 +29,30 @@ export interface DryContextData {
 
 const fmt = (n: number) => n.toLocaleString();
 
-function textOf(content: unknown): string {
-  if (Array.isArray(content)) {
-    return content
-      .map((b) => {
-        if (!b || typeof b !== 'object') return String(b ?? '');
-        const t = (b as { type?: string }).type;
-        if (t === 'text') return (b as { text?: string }).text ?? '';
-        if (t === 'image') return '[image]';
-        if (t === 'thinking' || t === 'redacted_thinking') return '[thinking]';
-        if (t === 'tool_use') return `[tool_use ${(b as { name?: string }).name ?? ''}]`;
-        if (t === 'tool_result') return '[tool_result]';
-        return '';
-      })
-      .join('');
-  }
-  return String(content ?? '');
-}
-
 /** Recall pairs render as a CM prompt followed by the summary text. */
 const RECALL_MARKERS = ['what do you remember', 'recall memory', '[cm]'];
 const isRecallPrompt = (s: string) =>
   s.length < 400 && RECALL_MARKERS.some((m) => s.toLowerCase().includes(m));
 
 export function DryContext(props: { data: DryContextData | null; onClose(): void }) {
-  const [expanded, setExpanded] = createSignal<Set<number>>(new Set());
-  const toggle = (i: number) => {
-    const next = new Set(expanded());
-    next.has(i) ? next.delete(i) : next.add(i);
-    setExpanded(next);
-  };
-
   const rows = () =>
     (props.data?.entries ?? []).map((e, i) => {
-      const o = (e ?? {}) as { participant?: string; role?: string; content?: unknown };
-      const body = textOf(o.content);
+      // Server-side projection (see projectDryEntries): identity, size and a
+      // bounded text preview. Full content blocks are deliberately NOT sent —
+      // shipping them cost ~110s of blocked agent.
+      const o = (e ?? {}) as {
+        i?: number; who?: string; text?: string; chars?: number;
+        media?: number; truncated?: boolean;
+      };
+      const body = o.text ?? '';
       return {
-        i,
-        who: o.participant ?? o.role ?? '?',
+        i: o.i ?? i,
+        who: o.who ?? '?',
         body,
         recall: isRecallPrompt(body),
-        chars: body.length,
+        chars: o.chars ?? body.length,
+        media: o.media ?? 0,
+        truncated: o.truncated === true,
       };
     });
 
@@ -136,22 +119,20 @@ export function DryContext(props: { data: DryContextData | null; onClose(): void
                     {r.who}
                   </span>
                   <span class="text-[10px] text-neutral-600">{fmt(r.chars)} chars</span>
-                  <Show when={r.chars > 600}>
-                    <button
-                      type="button"
-                      class="ml-auto text-[10px] font-mono text-neutral-500 hover:text-neutral-300"
-                      onClick={() => toggle(r.i)}
-                    >
-                      {expanded().has(r.i) ? 'collapse' : 'expand'}
-                    </button>
+                  <Show when={r.media > 0}>
+                    <span class="text-[10px] text-neutral-600">{r.media} media</span>
+                  </Show>
+                  <Show when={r.truncated}>
+                    <span class="ml-auto text-[10px] font-mono text-neutral-600"
+                          title="Bodies are truncated server-side; the full text is not sent.">
+                      truncated
+                    </span>
                   </Show>
                 </div>
                 <div
                   class="text-[12px] text-neutral-300 whitespace-pre-wrap break-words leading-relaxed"
                 >
-                  {expanded().has(r.i) || r.chars <= 600
-                    ? r.body
-                    : r.body.slice(0, 600) + ' …'}
+                  {r.body}{r.truncated ? ' …' : ''}
                 </div>
               </div>
             )}

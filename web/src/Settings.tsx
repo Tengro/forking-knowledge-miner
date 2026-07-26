@@ -384,7 +384,7 @@ export function SettingsPanel(props: {
               class="px-2 py-0.5 text-[10px] rounded font-mono bg-neutral-800 hover:bg-neutral-700
                      text-neutral-200 disabled:opacity-30"
               onClick={() => void runDryRun(false)}
-              title="Compile at these settings without applying them. Does not commit anything."
+              title="Compile at these settings without applying them. Does not commit anything. Measured ~8s on a large store."
             >
               dry run
             </button>
@@ -394,7 +394,7 @@ export function SettingsPanel(props: {
               class="px-2 py-0.5 text-[10px] rounded font-mono bg-cyan-900/40 hover:bg-cyan-900/60
                      text-cyan-200 disabled:opacity-30"
               onClick={() => void runDryRun(true)}
-              title="Dry run and show the resulting context in the main pane."
+              title="Dry run, and show the resulting context in the main pane. Costs more than a plain dry run — bodies are truncated server-side to keep it close."
             >
               dry run + show context
             </button>
@@ -406,8 +406,11 @@ export function SettingsPanel(props: {
             </Show>
           </div>
           <div class="text-[10px] text-neutral-600 mb-1.5 leading-relaxed">
-            A dry run is a full compile — seconds on a large store — and it briefly pauses the
-            agent. It commits nothing: no fold resolutions, no compression queued.
+            A dry run is a <b class="text-neutral-500">full compile</b> and it runs on the agent's
+            thread — while it runs the agent does nothing else (no heartbeat, no Discord, no MCPL).
+            Measured ~8s on a large store; it commits nothing (no fold resolutions, no compression
+            queued). Runs are serialized with a short cooldown, so a second click is refused rather
+            than queueing another pause.
           </div>
 
           <Show when={!props.state!.previewAvailable}>
