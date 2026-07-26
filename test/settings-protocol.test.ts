@@ -62,3 +62,40 @@ describe('settings messages — wire validation', () => {
     expect(isClientMessage({ type: 'request-settings', agent: 7 })).toBe(false);
   });
 });
+
+describe('pin messages — wire validation', () => {
+  it('accepts a single-message raw pin', () => {
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1' })).toBe(true);
+  });
+
+  it('accepts a range, a document, a label, and level modes', () => {
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1', lastMessageId: 'm-9' })).toBe(true);
+    expect(isClientMessage({ type: 'pin-add', kind: 'document', firstMessageId: 'm-1' })).toBe(true);
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1', name: 'seed' })).toBe(true);
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1', level: 0 })).toBe(true);
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1', maxLevel: 2 })).toBe(true);
+  });
+
+  it('rejects level AND maxLevel together — different semantics, ambiguous intent', () => {
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1', level: 1, maxLevel: 2 })).toBe(false);
+  });
+
+  it('rejects bad levels and bad ids', () => {
+    for (const bad of ['1', 1.5, -1, 33, NaN, null, {}]) {
+      expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1', level: bad })).toBe(false);
+    }
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: '' })).toBe(false);
+    expect(isClientMessage({ type: 'pin-add' })).toBe(false);
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1', kind: 'bogus' })).toBe(false);
+    expect(isClientMessage({ type: 'pin-add', firstMessageId: 'm-1', lastMessageId: '' })).toBe(false);
+  });
+
+  it('validates pin-remove and request-pins', () => {
+    expect(isClientMessage({ type: 'pin-remove', pinId: 'pin-3' })).toBe(true);
+    expect(isClientMessage({ type: 'pin-remove' })).toBe(false);
+    expect(isClientMessage({ type: 'pin-remove', pinId: '' })).toBe(false);
+    expect(isClientMessage({ type: 'request-pins' })).toBe(true);
+    expect(isClientMessage({ type: 'request-pins', agent: 'mythos' })).toBe(true);
+    expect(isClientMessage({ type: 'request-pins', agent: 5 })).toBe(false);
+  });
+});

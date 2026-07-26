@@ -11,6 +11,7 @@ import { LessonsPanel, type LessonRow } from './Lessons';
 import { McplPanel, type McplServerRow } from './Mcpl';
 import { SettingsPanel, type SettingsState } from './Settings';
 import { DryContext, type DryContextData } from './DryContext';
+import { PinsPanel, type PinsState } from './Pins';
 import { FilesPanel, FileViewerModal, type Mount, type FlatEntry, type FileViewer } from './Files';
 import { ContextPanel } from './Context';
 import { ContextDocument } from './ContextDocument';
@@ -274,7 +275,7 @@ export function App() {
 
   /** Right-sidebar tab selection. The Tree is the most-used surface so it's
    *  the default; lessons / mcp / files are operator-driven panels. */
-  type SidebarTab = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'health';
+  type SidebarTab = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'pins' | 'health';
   const [sidebarTab, setSidebarTab] = createSignal<SidebarTab>('tree');
   const [mainView, setMainView] = createSignal<'chat' | 'context' | 'dry'>('chat');
   /** Rendered dry-run context awaiting display. Never applied — see DryContext. */
@@ -323,6 +324,15 @@ export function App() {
   const refreshSettings = (): void => {
     setSettingsLoaded(false);
     wire.send({ type: 'request-settings' });
+  };
+
+  /** Pins panel state — broadcast on change, like settings: pins alter the next
+   *  compile's fold plan, so operators must not hold divergent views. */
+  const [pinsState, setPinsState] = createSignal<PinsState | null>(null);
+  const [pinsLoaded, setPinsLoaded] = createSignal(false);
+  const refreshPins = (): void => {
+    setPinsLoaded(false);
+    wire.send({ type: 'request-pins' });
   };
 
   /** Workspace files panel state — mounts list + per-mount tree cache. */
@@ -894,6 +904,10 @@ export function App() {
           setSettingsLoaded(true);
           setSettingsState(state);
         },
+        setPins: (state) => {
+          setPinsLoaded(true);
+          setPinsState(state);
+        },
         setMounts: (loaded, moduleLoaded, list) => {
           setMountsLoaded(loaded);
           setWorkspaceModuleLoaded(moduleLoaded);
@@ -1201,6 +1215,7 @@ export function App() {
               if (tab === 'mcp' && !mcplLoaded()) refreshMcpl();
               if (tab === 'files' && !mountsLoaded()) refreshMounts();
               if (tab === 'settings' && !settingsLoaded()) refreshSettings();
+              if (tab === 'pins' && !pinsLoaded()) refreshPins();
             }}
           />
           <div class="flex-1 min-h-0">
@@ -1249,6 +1264,16 @@ export function App() {
                   wire.send({ type: 'settings-reset', ...(keys ? { keys } : {}), persist })}
                 onCancelTransition={() => wire.send({ type: 'settings-cancel-transition' })}
                 onDryContext={(ctx) => { setDryContext(ctx as DryContextData); setMainView('dry'); }}
+              />
+            </Show>
+            <Show when={sidebarTab() === 'pins'}>
+              <PinsPanel
+                loaded={pinsLoaded()}
+                state={pinsState()}
+                agent={pinsState()?.agent}
+                onRefresh={refreshPins}
+                onAdd={(input) => wire.send({ type: 'pin-add', ...input })}
+                onRemove={(pinId) => wire.send({ type: 'pin-remove', pinId })}
               />
             </Show>
             <Show when={sidebarTab() === 'files'}>
@@ -1323,6 +1348,8 @@ interface HandlerHooks {
   setMcpl: (configPath: string, servers: McplServerRow[]) => void;
   /** Apply a settings-state broadcast. */
   setSettings: (state: SettingsState) => void;
+  /** Apply a pins-list broadcast. */
+  setPins: (state: PinsState) => void;
   /** Apply a workspace-mounts response. */
   setMounts: (loaded: boolean, moduleLoaded: boolean, mounts: Mount[]) => void;
   /** Apply a workspace-tree response for one mount. */
@@ -1455,6 +1482,9 @@ function handleServerMessage(
       return;
     case 'settings-state':
       hooks.setSettings(msg as unknown as SettingsState);
+      return;
+    case 'pins-list':
+      hooks.setPins(msg as unknown as PinsState);
       return;
     case 'workspace-mounts':
       hooks.setMounts(true, msg.loaded, msg.mounts);
@@ -1986,7 +2016,7 @@ function CommandSuggestions(props: { draft: string; onPick: (cmd: string) => voi
   );
 }
 
-type SidebarTabId = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'health';
+type SidebarTabId = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'pins' | 'health';
 
 function SidebarTabs(props: {
   current: SidebarTabId;
@@ -1999,6 +2029,7 @@ function SidebarTabs(props: {
     { id: 'files', label: 'Files', title: 'Workspace mounts + files' },
     { id: 'context', label: 'Context', title: 'Compiled context makeup' },
     { id: 'settings', label: 'Settings', title: 'Live context budget / tail, with preview' },
+    { id: 'pins', label: 'Pins', title: 'Protected ranges — constrain what the fold plan may fold' },
     { id: 'health', label: 'Health', title: 'Runtime settings, failures, quarantine' },
   ];
   return (

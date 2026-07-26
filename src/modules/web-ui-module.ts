@@ -59,6 +59,7 @@ import {
   type CallLedgerSnapshot,
   type McplListMessage,
   type SettingsStateMessage,
+  type PinsListMessage,
   type BranchesListMessage,
   type LessonsListMessage,
 } from '../web/protocol.js';
@@ -1977,6 +1978,64 @@ export class WebUiModule implements Module {
         return;
       }
 
+      case 'request-pins': {
+        const msg = this.buildPinsList(this.resolveSettingsAgent(parsed.agent));
+        if (!msg) {
+          this.send(client, { type: 'error', message: 'pins unavailable on this build' });
+          return;
+        }
+        this.send(client, msg);
+        return;
+      }
+
+      // Pins change what the NEXT compile folds, so like settings these
+      // broadcast rather than replying to the requester only.
+      case 'pin-add': {
+        const agentName = this.resolveSettingsAgent(parsed.agent);
+        try {
+          const cm = this.pinnableCm(agentName);
+          const opts: Record<string, unknown> = {};
+          if (parsed.name !== undefined) opts.name = parsed.name;
+          if (parsed.level !== undefined) opts.level = parsed.level;
+          if (parsed.maxLevel !== undefined) opts.maxLevel = parsed.maxLevel;
+          if (parsed.kind === 'document') {
+            cm.markDocument!(parsed.firstMessageId, opts);
+          } else {
+            // A single-message pin is a range of one; the strategy takes both ends.
+            cm.pinRange!(parsed.firstMessageId, parsed.lastMessageId ?? parsed.firstMessageId, opts);
+          }
+        } catch (err) {
+          this.send(client, {
+            type: 'error',
+            message: `pin-add failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        this.broadcastPinsList(agentName);
+        return;
+      }
+
+      case 'pin-remove': {
+        const agentName = this.resolveSettingsAgent(parsed.agent);
+        try {
+          const cm = this.pinnableCm(agentName);
+          const ok = cm.unpin!(parsed.pinId);
+          if (!ok) {
+            // Not an exception: a stale panel can ask twice. Say so plainly and
+            // still re-broadcast, so the client converges on reality.
+            this.send(client, { type: 'error', message: `no such pin: ${parsed.pinId}` });
+          }
+        } catch (err) {
+          this.send(client, {
+            type: 'error',
+            message: `pin-remove failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        this.broadcastPinsList(agentName);
+        return;
+      }
+
       case 'request-settings': {
         this.sendSettingsState(client, parsed.agent);
         return;
@@ -2710,6 +2769,98 @@ export class WebUiModule implements Module {
       await (ws as { materializeMount: (name: string) => Promise<unknown> }).materializeMount('_config');
     } catch {
       // Materialization is best-effort; failures here shouldn't break the UI.
+    }
+  }
+
+  /** Duck-typed pin surface. Throws with a clear reason rather than returning a
+   *  half-usable object, so handlers can report it to the operator verbatim. */
+  private pinnableCm(agentName: string): {
+    pinRange?: (a: string, b: string, o?: unknown) => string;
+    markDocument?: (a: string, o?: unknown) => string;
+    unpin?: (id: string) => boolean;
+    listPins?: () => ReadonlyArray<Record<string, unknown>>;
+  } {
+    const app = sharedServer?.app;
+    if (!app) throw new Error('app not bound yet');
+    const agent = app.framework.getAgent(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const cm = agent.getContextManager() as unknown as {
+      pinRange?: (a: string, b: string, o?: unknown) => string;
+      markDocument?: (a: string, o?: unknown) => string;
+      unpin?: (id: string) => boolean;
+      listPins?: () => ReadonlyArray<Record<string, unknown>>;
+    };
+    if (typeof cm.listPins !== 'function' || typeof cm.pinRange !== 'function') {
+      throw new Error('the active context strategy does not support pins');
+    }
+    return cm;
+  }
+
+  /**
+   * Pin snapshot. Never throws — an unsupported strategy is a legitimate
+   * read-only state for the panel, not an error to surface.
+   *
+   * `levelHonored` matters: pin-AT-level is implemented only by the kv-stable
+   * controller. Elsewhere it degrades to raw, which is a safe superset but not
+   * what the operator asked for, so the UI needs to be able to say so.
+   */
+  private buildPinsList(agentName: string): PinsListMessage | null {
+    const app = sharedServer?.app;
+    if (!app) return null;
+    let pins: PinsListMessage['pins'] = [];
+    let supported = false;
+    try {
+      const cm = this.pinnableCm(agentName);
+      pins = (cm.listPins!() ?? []).map((p) => ({
+        id: String(p.id),
+        firstMessageId: String(p.firstMessageId),
+        lastMessageId: String(p.lastMessageId),
+        kind: p.kind === 'document' ? 'document' : 'pin',
+        ...(typeof p.name === 'string' ? { name: p.name } : {}),
+        created: typeof p.created === 'number' ? p.created : 0,
+        ...(typeof p.level === 'number' ? { level: p.level } : {}),
+        ...(typeof p.maxLevel === 'number' ? { maxLevel: p.maxLevel } : {}),
+      }));
+      supported = true;
+    } catch {
+      supported = false;
+    }
+
+    let levelHonored = false;
+    let deepestLevel: number | undefined;
+    try {
+      const strategyCfg = (app.recipe.agent as unknown as {
+        strategy?: { foldingStrategy?: string };
+      }).strategy;
+      levelHonored = strategyCfg?.foldingStrategy === 'kv-stable';
+      const agent = app.framework.getAgent(agentName);
+      const cm = agent?.getContextManager() as unknown as {
+        getSummaries?: () => Array<{ level?: number }>;
+      } | undefined;
+      const sums = cm?.getSummaries?.() ?? [];
+      for (const s of sums) {
+        if (typeof s.level === 'number' && (deepestLevel === undefined || s.level > deepestLevel)) {
+          deepestLevel = s.level;
+        }
+      }
+    } catch { /* informational only */ }
+
+    return {
+      type: 'pins-list',
+      agent: agentName,
+      pins,
+      pinsSupported: supported,
+      levelHonored,
+      ...(deepestLevel !== undefined ? { deepestLevel } : {}),
+    };
+  }
+
+  private broadcastPinsList(agentName: string): void {
+    if (!sharedServer?.app) return;
+    const msg = this.buildPinsList(agentName);
+    if (!msg) return;
+    for (const c of sharedServer.clients.values()) {
+      if (c.welcomed) this.send(c, msg);
     }
   }
 

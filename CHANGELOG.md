@@ -1,6 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Pins panel** — operator control over protected ranges, using the pin surface
+  that already existed in context-manager (`pinRange` / `markDocument` / `unpin`
+  / `listPins`). No cm or af change was needed.
+  - Three semantics kept visibly distinct rather than collapsed into one "pin",
+    because they do different things to the fold plan: **raw** (never folded),
+    **max L<sub>k</sub>** (fold no deeper than k; k=0 ≡ raw), and **at
+    L<sub>k</sub>** (pinned at exactly k — the frontier cut passes through that
+    node).
+  - `at L_k` is honored **only** by `foldingStrategy: 'kv-stable'`; elsewhere it
+    degrades to raw. The panel detects this and warns, rather than letting a
+    request silently mean something else.
+  - Ids are pickable from `/debug/context/curve` (~14ms, the cheapest debug
+    endpoint and the only one exposing per-entry store ids with a text preview),
+    so ranges are selected from the live context instead of pasted by hand.
+    Entries without a store id — merged summaries — are omitted, since a pin
+    needs a message id.
+  - New `request-pins` / `pin-add` / `pin-remove`, server frame `pins-list`,
+    broadcast on change like `settings-state`: pins alter what the next compile
+    folds, so operators must not hold divergent views. Full-auth only via
+    `observerMaySend`'s default-deny. `level` and `maxLevel` together is rejected
+    at the wire as ambiguous.
+  - Pins take effect on the next compile — no restart — and pair with dry run,
+    which is now ~1.6s rather than minutes.
+
+### Fixed
+
+- Dry-run cost text said "~8s"; measured ~1.6s after the context-manager solver
+  fixes. Corrected rather than left pessimistic.
+
 ## 0.5.4 — 2026-07-26
+
+### Corrected after release
+
+- The `0.5.4` note below claimed the entry projection fixed the 110s stall. **It
+  did not.** Re-measuring after the change showed 121,855ms — unchanged. The
+  projection cut payload (megabytes → 265KB) and removed the blob-inlining heap
+  exposure, both worth keeping, but the time was never serialization. The actual
+  cause was an O(members × groupSize) cliff in three kv-control solver loops,
+  triggered whenever a head/tail boundary falls inside a deep summary group —
+  fixed in context-manager (`1c4c436`, `7f2d5e1`; see
+  `docs/incremental-compile-problem.md` §9.3). Measured after that fix: dry run
+  **1.56s**, dry run + render **1.69s**, live compile 22.5s → 2.4s.
 
 ### Fixed
 

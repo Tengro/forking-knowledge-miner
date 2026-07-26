@@ -392,6 +392,35 @@ export interface McplListMessage {
 }
 
 /**
+ * Protected ranges (pins / documents) for one agent.
+ *
+ * BROADCAST on change: pins alter what the next compile folds, so two operators
+ * must not hold divergent views of them.
+ */
+export interface PinsListMessage {
+  type: 'pins-list';
+  agent: string;
+  pins: Array<{
+    id: string;
+    firstMessageId: string;
+    lastMessageId: string;
+    kind: 'pin' | 'document';
+    name?: string;
+    created: number;
+    /** Pinned AT exactly this fold level (0 = raw). */
+    level?: number;
+    /** Hard cap on fold depth. */
+    maxLevel?: number;
+  }>;
+  /** False when the active strategy has no pin support — panel goes read-only. */
+  pinsSupported: boolean;
+  /** False when `level` would silently degrade to raw (non-kv-stable folding). */
+  levelHonored: boolean;
+  /** Deepest fold level currently present, so the UI can bound level inputs. */
+  deepestLevel?: number;
+}
+
+/**
  * Runtime context-settings snapshot.
  *
  * BROADCAST to every welcomed client on change — unlike `mcpl-list`, these are
@@ -510,6 +539,7 @@ export type WebUiServerMessage =
   | LessonsListMessage
   | McplListMessage
   | SettingsStateMessage
+  | PinsListMessage
   | WorkspaceMountsMessage
   | WorkspaceTreeMessage
   | WorkspaceFileMessage
@@ -669,6 +699,46 @@ export interface McplSetEnvMessage {
   env: Record<string, string>;
 }
 
+/** Pull the agent's protected ranges. Response is a `pins-list` envelope. */
+export interface RequestPinsMessage {
+  type: 'request-pins';
+  agent?: string;
+}
+
+/**
+ * Create a protected range.
+ *
+ * Three distinct semantics, deliberately not collapsed into one "pin":
+ *  - neither `level` nor `maxLevel` → classic pin: forced RAW, never folded
+ *  - `maxLevel: k` → fold no deeper than L_k (`0` is equivalent to a classic pin)
+ *  - `level: k`    → pin AT exactly L_k; the frontier cut passes through that
+ *                    node, neither deeper nor shallower
+ *
+ * `kind: 'document'` marks a single message as a document instead of pinning a
+ * range, and ignores `lastMessageId`.
+ *
+ * NOTE: `level` is honored only by `foldingStrategy: 'kv-stable'`. Other
+ * strategies degrade it to raw — a safe superset, but not what was asked for.
+ * `pins-list.levelHonored` reports which case the live agent is in.
+ */
+export interface PinAddMessage {
+  type: 'pin-add';
+  agent?: string;
+  kind?: 'pin' | 'document';
+  firstMessageId: string;
+  /** Ignored for `kind: 'document'`; defaults to `firstMessageId` for a pin. */
+  lastMessageId?: string;
+  level?: number;
+  maxLevel?: number;
+  name?: string;
+}
+
+export interface PinRemoveMessage {
+  type: 'pin-remove';
+  agent?: string;
+  pinId: string;
+}
+
 /** Pull the current runtime context settings for an agent, plus which knobs are
  *  live-appliable vs restart-only. Response is a `settings-state` envelope. */
 export interface RequestSettingsMessage {
@@ -798,6 +868,9 @@ export type WebUiClientMessage =
   | McplAddMessage
   | McplRemoveMessage
   | McplSetEnvMessage
+  | RequestPinsMessage
+  | PinAddMessage
+  | PinRemoveMessage
   | RequestSettingsMessage
   | SettingsUpdateMessage
   | SettingsResetMessage
@@ -864,6 +937,27 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
       return isValidMcplId(v.id);
     case 'mcpl-set-env':
       return isValidMcplId(v.id) && isStringMap(v.env);
+    case 'request-pins':
+      return isOptionalNonEmptyString(v.agent);
+    case 'pin-add': {
+      if (!isOptionalNonEmptyString(v.agent)) return false;
+      if (!isNonEmptyString(v.firstMessageId)) return false;
+      if (v.lastMessageId !== undefined && !isNonEmptyString(v.lastMessageId)) return false;
+      if (v.kind !== undefined && v.kind !== 'pin' && v.kind !== 'document') return false;
+      if (v.name !== undefined && !isNonEmptyString(v.name)) return false;
+      // Fold levels are small non-negative integers (0 = raw). Reject strings
+      // and fractions before they reach the strategy's pin normalizer.
+      for (const k of ['level', 'maxLevel']) {
+        const x = v[k];
+        if (x === undefined) continue;
+        if (typeof x !== 'number' || !Number.isSafeInteger(x) || x < 0 || x > 32) return false;
+      }
+      // level and maxLevel are different semantics; asking for both is ambiguous.
+      if (v.level !== undefined && v.maxLevel !== undefined) return false;
+      return true;
+    }
+    case 'pin-remove':
+      return isOptionalNonEmptyString(v.agent) && isNonEmptyString(v.pinId);
     case 'request-settings':
       return isOptionalNonEmptyString(v.agent);
     case 'settings-update': {
