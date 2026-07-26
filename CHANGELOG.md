@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0 — 2026-07-26
+
 ### Added
 
 - **Context settings panel** (webui `Settings` tab) — live control of the
