@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 — 2026-07-26
+
 ### Added
 
 - **Pins panel** — operator control over protected ranges, using the pin surface
