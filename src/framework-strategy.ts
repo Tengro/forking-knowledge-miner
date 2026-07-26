@@ -34,6 +34,8 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'summarySystemPrompt',
   'summaryUserPrompt',
   'summaryContextLabel',
+  'witnessedBeforeSequence',
+  'witnessedInstruction',
 ];
 
 export function buildFrameworkStrategy(
