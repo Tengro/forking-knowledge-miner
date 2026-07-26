@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0
+
+### Changed
+
+- **context-manager ^0.6.0** — the fatal coverage invariant: a compile
+  refuses (`OverBudgetError` / `UncoveredDropError`) rather than shipping a
+  context with silently-dropped messages, and recall-pair pricing includes
+  reasoning carriers (fixes the permanent compile wedge / silent middle loss
+  on carrier-bearing stores). Default `overBudgetGraceRatio` is now 0.02.
+- **agent-framework ^0.7.0** — host-side recovery for context refusals: the
+  OverBudget drain breaker also kicks for `UncoveredDropError`, and a
+  `context-refusal` ops alert fires immediately (fleet-watch) with the
+  recovery knobs named. Plus the context-settings preview surface and the
+  workspace read cap.
+
+### Added
+
+- `compressionMaxTokens` recipe passthrough — cap compression output for
+  models with low output ceilings (2c78936).
+
 ## Unreleased
 
 ### Fixed
