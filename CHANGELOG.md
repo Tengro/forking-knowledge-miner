@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- **Health call stats are now per-call, not cumulative.** The previous version
+  rolled everything into two totals (main / compression), which hid exactly what
+  you want to see — how an individual turn behaved. Now one row per call, newest
+  first: time, origin, messages, fresh input, cached tokens, cached share, cache
+  write, output, breakpoints, duration and verdict, with refusals and errors
+  highlighted. Cumulative totals for the session remain in the Usage panel.
+
+## Unreleased
+
 ## 0.7.0 — 2026-07-26
 
 ### Added

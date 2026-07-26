@@ -142,130 +142,105 @@ export function OpsAlertStrip(props: {
 }
 
 
-/**
- * Aggregate the call ledger by origin.
- *
- * `originEstimate` is the main-vs-compression split, and the `~` is honest: it
- * is derived from stream-vs-complete (agent turns stream; compression and
- * summarizer calls use complete()), NOT from a definitive origin tag. It is a
- * reliable proxy in practice, but it is an inference.
- */
-interface CallAgg {
-  calls: number;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  cost: number;
-  hits: number;
-  errors: number;
-  refusals: number;
-  breakpoints: number;
-  lastInputs: number[];
-}
-
-const EMPTY_AGG = (): CallAgg => ({
-  calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
-  cost: 0, hits: 0, errors: 0, refusals: 0, breakpoints: 0, lastInputs: [],
-});
-
-/** Verdicts that mean the prefix was actually reused. */
-const HIT_VERDICTS = new Set(['HIT', 'hit+extend']);
-
-function aggregate(rows: LedgerRow[], origin: 'turn~' | 'aux~'): CallAgg {
-  const a = EMPTY_AGG();
-  for (const r of rows) {
-    if (r.originEstimate !== origin) continue;
-    a.calls++;
-    a.input += r.tokens.input;
-    a.output += r.tokens.output;
-    a.cacheRead += r.tokens.cacheRead;
-    a.cacheWrite += r.tokens.cacheWrite;
-    a.cost += r.cost?.total ?? 0;
-    if (HIT_VERDICTS.has(r.verdict)) a.hits++;
-    if (r.error) a.errors++;
-    if (r.stopReason === 'refusal') a.refusals++;
-    a.breakpoints += r.cache.breakpoints ?? 0;
-    a.lastInputs.push(r.tokens.input);
-  }
-  a.lastInputs = a.lastInputs.slice(-8);
-  return a;
-}
-
 const n0 = (v: number) => v.toLocaleString();
-const pct = (num: number, den: number) => (den > 0 ? `${Math.round((100 * num) / den)}%` : '—');
-
-/** Cached share of what was sent — the number that tells you whether the prefix
- *  is being reused or re-read. */
-const cachedShare = (a: CallAgg) => {
-  const sent = a.input + a.cacheRead;
-  return sent > 0 ? `${Math.round((100 * a.cacheRead) / sent)}%` : '—';
-};
 
 function CallStats(props: { rows: LedgerRow[] }) {
-  const main = () => aggregate(props.rows, 'turn~');
-  const aux = () => aggregate(props.rows, 'aux~');
+  /** Newest first — the interesting call is the one that just happened. */
+  const recent = () => [...props.rows].reverse().slice(0, 24);
 
-  const col = (label: string, a: () => CallAgg, tone: string) => (
-    <div class="flex-1 min-w-[9rem]">
-      <div class={`text-[10px] uppercase tracking-wider font-semibold mb-1 ${tone}`}>
-        {label} <span class="text-neutral-600">({a().calls})</span>
-      </div>
-      <table class="w-full font-mono text-[10px]">
-        <tbody>
-          <For each={[
-            ['fresh input', n0(a().input)],
-            ['cache read', n0(a().cacheRead)],
-            ['cache write', n0(a().cacheWrite)],
-            ['cached share', cachedShare(a())],
-            ['prefix reused', pct(a().hits, a().calls)],
-            ['output', n0(a().output)],
-            ['avg breakpoints', a().calls ? (a().breakpoints / a().calls).toFixed(1) : '—'],
-            ['cost', a().cost ? `$${a().cost.toFixed(4)}` : '—'],
-          ] as Array<[string, string]>}>
-            {([k, v]) => (
-              <tr>
-                <td class="text-neutral-500 pr-2">{k}</td>
-                <td class="text-neutral-200 text-right tabular-nums">{v}</td>
-              </tr>
-            )}
-          </For>
-          <Show when={a().errors > 0 || a().refusals > 0}>
-            <tr>
-              <td class="text-neutral-500 pr-2">errors / refusals</td>
-              <td class="text-right tabular-nums text-red-300">
-                {a().errors} / {a().refusals}
-              </td>
-            </tr>
-          </Show>
-        </tbody>
-      </table>
-      <Show when={a().lastInputs.length > 1}>
-        <div class="text-[9px] text-neutral-600 mt-1 font-mono break-all"
-             title="fresh input tokens, oldest → newest — a descent should trend down">
-          {a().lastInputs.map(n0).join(' → ')}
-        </div>
-      </Show>
-    </div>
-  );
+  const clock = (ts: string) => {
+    const d = new Date(ts);
+    return Number.isNaN(d.getTime()) ? '—' : d.toISOString().slice(11, 19);
+  };
+  /** Fraction of the prompt that was reused rather than re-read. */
+  const share = (r: LedgerRow) => {
+    const sent = r.tokens.input + r.tokens.cacheRead;
+    return sent > 0 ? Math.round((100 * r.tokens.cacheRead) / sent) : null;
+  };
 
   return (
     <div>
       <div class="text-[10px] uppercase tracking-wider text-neutral-600 mb-1">
-        recent llm calls ({props.rows.length})
+        llm calls — newest first ({props.rows.length} held)
       </div>
-      <div class="flex gap-4 flex-wrap">
-        {col('main turns', main, 'text-cyan-400')}
-        {col('compression', aux, 'text-orange-400')}
+      <div class="overflow-x-auto">
+        <table class="w-full font-mono text-[10px] whitespace-nowrap">
+          <thead>
+            <tr class="text-neutral-600 border-b border-neutral-800">
+              <th class="text-left pr-2 font-normal">time</th>
+              <th class="text-left pr-2 font-normal">origin</th>
+              <th class="text-right pr-2 font-normal">msgs</th>
+              <th class="text-right pr-2 font-normal">fresh</th>
+              <th class="text-right pr-2 font-normal">cached</th>
+              <th class="text-right pr-2 font-normal">%c</th>
+              <th class="text-right pr-2 font-normal">write</th>
+              <th class="text-right pr-2 font-normal">out</th>
+              <th class="text-right pr-2 font-normal">bp</th>
+              <th class="text-right pr-2 font-normal">ms</th>
+              <th class="text-left font-normal">verdict</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={recent()}>
+              {(r) => {
+                const main = r.originEstimate === 'turn~';
+                return (
+                  <tr class={`border-b border-neutral-900 ${
+                    r.error || r.stopReason === 'refusal' ? 'bg-red-950/30' : ''
+                  }`}>
+                    <td class="pr-2 text-neutral-500">{clock(r.timestamp)}</td>
+                    <td class={`pr-2 ${main ? 'text-cyan-400' : 'text-orange-400'}`}>
+                      {main ? 'turn' : 'compr'}
+                    </td>
+                    <td class="pr-2 text-right text-neutral-400">{r.messages}</td>
+                    <td class="pr-2 text-right text-neutral-100">{n0(r.tokens.input)}</td>
+                    <td class="pr-2 text-right text-sky-300">{n0(r.tokens.cacheRead)}</td>
+                    <td class="pr-2 text-right text-neutral-400">
+                      {share(r) === null ? '—' : `${share(r)}%`}
+                    </td>
+                    <td class="pr-2 text-right text-violet-300">
+                      {r.tokens.cacheWrite ? n0(r.tokens.cacheWrite) : '·'}
+                    </td>
+                    <td class="pr-2 text-right text-neutral-400">{n0(r.tokens.output)}</td>
+                    <td class="pr-2 text-right text-neutral-600">{r.cache.breakpoints ?? '·'}</td>
+                    <td class="pr-2 text-right text-neutral-600">{n0(r.durationMs)}</td>
+                    <td class={verdictTone(r.verdict)} title={r.cause}>
+                      {r.verdict}
+                      <Show when={r.stopReason === 'refusal'}>
+                        <span class="text-red-300"> refusal</span>
+                      </Show>
+                      <Show when={r.error}>
+                        <span class="text-red-300"> err</span>
+                      </Show>
+                    </td>
+                  </tr>
+                );
+              }}
+            </For>
+          </tbody>
+        </table>
       </div>
       <div class="text-[9px] text-neutral-600 mt-1 leading-relaxed">
-        Origin is inferred from stream-vs-complete (turns stream; compression uses
-        complete) — a reliable proxy, not a definitive tag, hence <span class="font-mono">~</span>.
-        “cached share” is cacheRead ÷ (input+cacheRead) — what fraction of the prompt
-        was reused rather than re-read.
+        <span class="text-cyan-400">turn</span> = main inference,
+        <span class="text-orange-400"> compr</span> = compression/summarizer — inferred from
+        stream-vs-complete, not a definitive tag (hence <span class="font-mono">~</span> upstream).
+        One turn may appear as a turn row plus several compr rows.
+        <span class="font-mono"> fresh</span> = tokens billed as new input;
+        <span class="font-mono"> cached</span> = read from cache;
+        <span class="font-mono"> %c</span> = cached ÷ (fresh+cached);
+        <span class="font-mono"> bp</span> = cache breakpoints.
       </div>
     </div>
   );
+}
+
+/** Verdict colouring: reuse is good, rewrites cost a full re-read. */
+function verdictTone(v: string): string {
+  if (v === 'HIT' || v === 'hit+extend') return 'text-emerald-300';
+  if (v === 'first-write') return 'text-violet-300';
+  if (v === 'uncached') return 'text-neutral-400';
+  if (v === 'ERROR' || v === 'empty') return 'text-red-300';
+  return 'text-amber-300';
 }
 
 function CompositionBlock(props: { c: ContextComposition }) {
