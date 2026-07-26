@@ -1304,6 +1304,7 @@ export function App() {
               <HealthPanel
                 health={health()}
                 error={healthErr()}
+                ledger={callLedger()?.rows}
                 onRefresh={() => void loadHealth(true)}
               />
             </Show>

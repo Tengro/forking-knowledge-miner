@@ -1118,6 +1118,28 @@ export class WebUiModule implements Module {
       } catch {
         // Health reads never throw.
       }
+      // Rendered context COMPOSITION per agent — head / raw middle / summaries
+      // by level / tail, as actually emitted by the last compile.
+      //
+      // Sourced from the strategy's own render stats, which are already
+      // computed in-process: unlike /debug/context/makeup this costs nothing
+      // and makes no count_tokens network call, so it is safe on the 15s
+      // /healthz poll. Answers "how much of what was actually sent" without
+      // recompiling.
+      try {
+        const composition: Record<string, unknown> = {};
+        for (const agent of app.framework.getAllAgents()) {
+          const name = (agent as unknown as { name: string }).name;
+          const cm = agent.getContextManager() as unknown as {
+            getRenderStats?: () => unknown;
+          };
+          const rs = cm.getRenderStats?.();
+          if (rs) composition[name] = rs;
+        }
+        (snapshot as Record<string, unknown>).contextComposition = composition;
+      } catch {
+        // Health reads never throw.
+      }
       // Per-agent runtime settings (context budget, tail, transition pace +
       // convergence state) — the same numbers `agent_settings get` returns,
       // exposed externally so the fleet hub / connectome-doctor can watch

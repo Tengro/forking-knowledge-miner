@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- **Health panel: recent LLM call stats, split main vs compression.** Aggregates
+  the call ledger the client already receives — fresh input, cache read/write,
+  **cached share** (cacheRead ÷ input+cacheRead: what fraction of the prompt was
+  reused rather than re-read), prefix-reuse rate, output, average cache
+  breakpoints, cost, and errors/refusals — separately for `turn~` (main) and
+  `aux~` (compression/summarizer). Includes the last 8 fresh-input values per
+  group, so a budget descent can be seen trending down.
+  - The `~` is honest: origin is inferred from stream-vs-complete (turns stream,
+    compression uses `complete()`), not a definitive tag. Stated in the panel.
+- **Health panel: context composition of the last compile** — head / raw middle /
+  summaries by level / tail, with shares and bars. Sourced from `/healthz`, which
+  now carries the strategy's in-process render stats: unlike
+  `/debug/context/makeup` this costs nothing and makes no `count_tokens` network
+  call, so it is safe on the 15s health poll.
+
+## Unreleased
+
 ## 0.6.1 — 2026-07-26
 
 ### Fixed

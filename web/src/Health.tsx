@@ -17,6 +17,7 @@
  */
 
 import { For, Show } from 'solid-js';
+import type { CallLedgerRow } from '@conhost/web/protocol';
 
 /** One active operator alert, keyed `${agent}:${kind}`. `count` increments on
  *  every re-fire of the same key so a repeating klaxon reads as one row. */
@@ -33,8 +34,22 @@ export interface OpsAlert {
 /** Shape of GET /healthz — framework healthSnapshot() plus the host's
  *  compressionQuarantine / runtimeSettings extensions. All fields optional
  *  and defensively read: health rendering must survive version skew. */
+/** Rendered composition of the last compile — what was actually SENT. */
+export interface ContextComposition {
+  head?: { messages: number; tokens: number };
+  tail?: { messages: number; tokens: number };
+  middleRaw?: { messages: number; tokens: number };
+  summaries?: Record<string, { count: number; tokens: number }>;
+  total?: { messages: number; tokens: number };
+}
+
+/** One provider call. Aliased to the wire type so the two cannot drift; only
+ *  the fields this panel aggregates are read. */
+export type LedgerRow = CallLedgerRow;
+
 export interface HealthSnapshot {
   at?: string;
+  contextComposition?: Record<string, ContextComposition>;
   uptimeSec?: number;
   gate?: Record<string, unknown> | null;
   pendingRequests?: number;
@@ -126,8 +141,185 @@ export function OpsAlertStrip(props: {
   );
 }
 
+
+/**
+ * Aggregate the call ledger by origin.
+ *
+ * `originEstimate` is the main-vs-compression split, and the `~` is honest: it
+ * is derived from stream-vs-complete (agent turns stream; compression and
+ * summarizer calls use complete()), NOT from a definitive origin tag. It is a
+ * reliable proxy in practice, but it is an inference.
+ */
+interface CallAgg {
+  calls: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  hits: number;
+  errors: number;
+  refusals: number;
+  breakpoints: number;
+  lastInputs: number[];
+}
+
+const EMPTY_AGG = (): CallAgg => ({
+  calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
+  cost: 0, hits: 0, errors: 0, refusals: 0, breakpoints: 0, lastInputs: [],
+});
+
+/** Verdicts that mean the prefix was actually reused. */
+const HIT_VERDICTS = new Set(['HIT', 'hit+extend']);
+
+function aggregate(rows: LedgerRow[], origin: 'turn~' | 'aux~'): CallAgg {
+  const a = EMPTY_AGG();
+  for (const r of rows) {
+    if (r.originEstimate !== origin) continue;
+    a.calls++;
+    a.input += r.tokens.input;
+    a.output += r.tokens.output;
+    a.cacheRead += r.tokens.cacheRead;
+    a.cacheWrite += r.tokens.cacheWrite;
+    a.cost += r.cost?.total ?? 0;
+    if (HIT_VERDICTS.has(r.verdict)) a.hits++;
+    if (r.error) a.errors++;
+    if (r.stopReason === 'refusal') a.refusals++;
+    a.breakpoints += r.cache.breakpoints ?? 0;
+    a.lastInputs.push(r.tokens.input);
+  }
+  a.lastInputs = a.lastInputs.slice(-8);
+  return a;
+}
+
+const n0 = (v: number) => v.toLocaleString();
+const pct = (num: number, den: number) => (den > 0 ? `${Math.round((100 * num) / den)}%` : '—');
+
+/** Cached share of what was sent — the number that tells you whether the prefix
+ *  is being reused or re-read. */
+const cachedShare = (a: CallAgg) => {
+  const sent = a.input + a.cacheRead;
+  return sent > 0 ? `${Math.round((100 * a.cacheRead) / sent)}%` : '—';
+};
+
+function CallStats(props: { rows: LedgerRow[] }) {
+  const main = () => aggregate(props.rows, 'turn~');
+  const aux = () => aggregate(props.rows, 'aux~');
+
+  const col = (label: string, a: () => CallAgg, tone: string) => (
+    <div class="flex-1 min-w-[9rem]">
+      <div class={`text-[10px] uppercase tracking-wider font-semibold mb-1 ${tone}`}>
+        {label} <span class="text-neutral-600">({a().calls})</span>
+      </div>
+      <table class="w-full font-mono text-[10px]">
+        <tbody>
+          <For each={[
+            ['fresh input', n0(a().input)],
+            ['cache read', n0(a().cacheRead)],
+            ['cache write', n0(a().cacheWrite)],
+            ['cached share', cachedShare(a())],
+            ['prefix reused', pct(a().hits, a().calls)],
+            ['output', n0(a().output)],
+            ['avg breakpoints', a().calls ? (a().breakpoints / a().calls).toFixed(1) : '—'],
+            ['cost', a().cost ? `$${a().cost.toFixed(4)}` : '—'],
+          ] as Array<[string, string]>}>
+            {([k, v]) => (
+              <tr>
+                <td class="text-neutral-500 pr-2">{k}</td>
+                <td class="text-neutral-200 text-right tabular-nums">{v}</td>
+              </tr>
+            )}
+          </For>
+          <Show when={a().errors > 0 || a().refusals > 0}>
+            <tr>
+              <td class="text-neutral-500 pr-2">errors / refusals</td>
+              <td class="text-right tabular-nums text-red-300">
+                {a().errors} / {a().refusals}
+              </td>
+            </tr>
+          </Show>
+        </tbody>
+      </table>
+      <Show when={a().lastInputs.length > 1}>
+        <div class="text-[9px] text-neutral-600 mt-1 font-mono break-all"
+             title="fresh input tokens, oldest → newest — a descent should trend down">
+          {a().lastInputs.map(n0).join(' → ')}
+        </div>
+      </Show>
+    </div>
+  );
+
+  return (
+    <div>
+      <div class="text-[10px] uppercase tracking-wider text-neutral-600 mb-1">
+        recent llm calls ({props.rows.length})
+      </div>
+      <div class="flex gap-4 flex-wrap">
+        {col('main turns', main, 'text-cyan-400')}
+        {col('compression', aux, 'text-orange-400')}
+      </div>
+      <div class="text-[9px] text-neutral-600 mt-1 leading-relaxed">
+        Origin is inferred from stream-vs-complete (turns stream; compression uses
+        complete) — a reliable proxy, not a definitive tag, hence <span class="font-mono">~</span>.
+        “cached share” is cacheRead ÷ (input+cacheRead) — what fraction of the prompt
+        was reused rather than re-read.
+      </div>
+    </div>
+  );
+}
+
+function CompositionBlock(props: { c: ContextComposition }) {
+  const rows = () => {
+    const c = props.c;
+    const out: Array<[string, number]> = [
+      ['head (verbatim)', c.head?.tokens ?? 0],
+      ['middle raw', c.middleRaw?.tokens ?? 0],
+    ];
+    for (const [lvl, v] of Object.entries(c.summaries ?? {})) {
+      out.push([`summaries ${lvl.toUpperCase()}`, v?.tokens ?? 0]);
+    }
+    out.push(['tail (verbatim)', c.tail?.tokens ?? 0]);
+    return out;
+  };
+  const total = () => props.c.total?.tokens ?? rows().reduce((s, [, v]) => s + v, 0);
+
+  return (
+    <div>
+      <div class="text-[10px] uppercase tracking-wider text-neutral-600 mb-1">
+        context composition (last compile)
+      </div>
+      <table class="w-full font-mono text-[10px]">
+        <tbody>
+          <For each={rows()}>
+            {([k, v]) => (
+              <tr>
+                <td class="text-neutral-500 pr-2">{k}</td>
+                <td class="text-neutral-200 text-right tabular-nums">{n0(v)}</td>
+                <td class="text-neutral-600 text-right pl-2 w-10">
+                  {total() > 0 ? `${Math.round((100 * v) / total())}%` : ''}
+                </td>
+                <td class="pl-2 w-1/3">
+                  <span class="inline-block h-1.5 bg-cyan-800 rounded"
+                        style={{ width: `${total() > 0 ? Math.round((100 * v) / total()) : 0}%` }} />
+                </td>
+              </tr>
+            )}
+          </For>
+          <tr class="border-t border-neutral-800">
+            <td class="text-neutral-400 pr-2">total rendered</td>
+            <td class="text-neutral-100 text-right tabular-nums">{n0(total())}</td>
+            <td colSpan={2} />
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export function HealthPanel(props: {
   health: HealthSnapshot | null;
+  /** Recent provider calls. Already on the client via the call-ledger frame. */
+  ledger?: LedgerRow[];
   /** Non-null when the last /healthz fetch failed; '403' means scope-denied. */
   error: string | null;
   onRefresh(): void;
@@ -135,6 +327,7 @@ export function HealthPanel(props: {
   const agents = () => props.health?.agents ?? [];
   const quarantine = (name: string) => props.health?.compressionQuarantine?.[name];
   const settings = (name: string) => props.health?.runtimeSettings?.[name];
+  const composition = (name: string) => props.health?.contextComposition?.[name];
 
   const statusTone = (status?: string): string => {
     switch (status) {
@@ -261,6 +454,23 @@ export function HealthPanel(props: {
                   </Show>
                 </div>
               )}
+            </Show>
+
+            {/* What was actually SENT, and how it split. Composition is
+                in-process render stats (free); call stats come from the ledger
+                the client already holds. */}
+            <Show when={composition(a.name)}>
+              {(c) => (
+                <div class="border-t border-neutral-900 pt-1.5">
+                  <CompositionBlock c={c()} />
+                </div>
+              )}
+            </Show>
+
+            <Show when={(props.ledger?.length ?? 0) > 0}>
+              <div class="border-t border-neutral-900 pt-1.5">
+                <CallStats rows={props.ledger!} />
+              </div>
             </Show>
           </section>
         )}</For>
