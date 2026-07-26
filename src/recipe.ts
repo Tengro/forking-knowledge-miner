@@ -602,6 +602,27 @@ export interface RecipeExtension {
   sourceMeta?: Record<string, unknown>;
 }
 
+/**
+ * Client-side programmatic tool calling (af `code_execution` tool, af ≥0.7.2).
+ *
+ * SECURITY: like mcpl_deploy, enabling this means trusting the agent with
+ * code execution — model-authored python runs as the host user with the
+ * agent's full tool surface injected. It is a robustness boundary (deadline,
+ * kill, respawn), not a sandbox. The agents we host already have shells;
+ * enable deliberately all the same.
+ */
+export interface RecipeCodeExecution {
+  enabled: boolean;
+  /** Python interpreter (default: python3 from PATH; needs ≥3.8). */
+  pythonPath?: string;
+  /** Per-inner-tool-call timeout, ms (default 270_000). */
+  toolCallTimeoutMs?: number;
+  /** Whole-script deadline, ms (default 600_000). */
+  scriptTimeoutMs?: number;
+  /** Idle interpreter reclaim, ms (default 300_000; 0 disables). */
+  idleReclaimMs?: number;
+}
+
 export interface Recipe {
   name: string;
   description?: string;
@@ -612,6 +633,8 @@ export interface Recipe {
   /** Deployment-specific code extensions, keyed by a human-readable name. */
   extensions?: Record<string, RecipeExtension>;
   sessionNaming?: { examples?: string[] };
+  /** Client-side programmatic tool calling (code_execution tool). */
+  codeExecution?: RecipeCodeExecution;
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,6 +1253,24 @@ export function validateRecipe(raw: unknown): Recipe {
         if (fleet[k] !== undefined && (typeof fleet[k] !== 'number' || (fleet[k] as number) < 0)) {
           throw new Error(`fleet.${k} must be a non-negative number`);
         }
+      }
+    }
+  }
+
+  if (obj.codeExecution !== undefined) {
+    if (!obj.codeExecution || typeof obj.codeExecution !== 'object' || Array.isArray(obj.codeExecution)) {
+      throw new Error('Recipe codeExecution must be an object.');
+    }
+    const ce = obj.codeExecution as Record<string, unknown>;
+    if (typeof ce.enabled !== 'boolean') {
+      throw new Error('Recipe codeExecution.enabled must be a boolean.');
+    }
+    if (ce.pythonPath !== undefined && (typeof ce.pythonPath !== 'string' || !ce.pythonPath.trim())) {
+      throw new Error('Recipe codeExecution.pythonPath must be a non-empty string.');
+    }
+    for (const k of ['toolCallTimeoutMs', 'scriptTimeoutMs', 'idleReclaimMs'] as const) {
+      if (ce[k] !== undefined && (typeof ce[k] !== 'number' || (ce[k] as number) < 0)) {
+        throw new Error(`Recipe codeExecution.${k} must be a non-negative number.`);
       }
     }
   }

@@ -448,6 +448,8 @@ agents: [agentConfig],
     mcplServers: finalServers,
     gate: gateOptions,
     timeZone,
+    // Client-side programmatic tool calling (code_execution) — recipe opt-in.
+    ...(recipe.codeExecution ? { codeExecution: recipe.codeExecution } : {}),
   });
 
   // Wire post-creation hooks
