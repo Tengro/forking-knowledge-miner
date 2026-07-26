@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Context settings panel** (webui `Settings` tab) — live control of the
+  agent's compile window, replacing the stop → edit the `framework/state`
+  Chronicle slot → start dance. Edits `contextBudgetTokens`, `tailTokens` and
+  `transitionPaceTokens`; Apply / reset-to-recipe / revert-edits, plus cancel
+  for an in-flight descent.
+  - New client messages `request-settings`, `settings-update`,
+    `settings-reset`, `settings-cancel-transition`; new server frame
+    `settings-state`. No protocol version bump (additive).
+  - `settings-state` is **broadcast** to every welcomed client, unlike
+    `mcpl-list` — these are live process values, so two operators must not see
+    divergent budgets.
+  - Mutations are full-auth only for free: `observerMaySend` denies by default,
+    so new message types are never reachable by scoped observers.
+  - `persist: false` applies ephemerally (live now, reverts on restart) for
+    operator experiments. `notify: true` optionally pushes a notice to the
+    agent; **off by default**, because the notice is new text in the very
+    context being tuned — it invalidates the KV prefix and is itself
+    classifier-visible. The agent can always pull current settings via its own
+    `agent_settings` tool instead.
+  - The panel is explicit about three things that would otherwise mislead:
+    raising the budget applies at once but **lowering starts a paced
+    convergence** (shown as `converging` / `blocked`, with the blocked reason
+    spelled out); only a few keys are hot, so `targetChunkTokens`,
+    `headWindowTokens`, `mergeThreshold`, `foldingStrategy` and friends are
+    listed under "restart only" rather than offered as controls; and preview
+    requires a context-manager with dry-run support, so an older build reports
+    "preview unavailable" instead of rendering an empty result.
+- **`GET /debug/context/preview?budget=&tail=[&agent=]`** — non-committing
+  preview of the fold plan at a hypothetical window. Persists no fold
+  resolutions, enqueues no compression, advances no transition bookkeeping
+  (the guarantee lives in context-manager's dry-run select). An infeasible
+  budget is reported as `fits: false` with per-component diagnostics rather
+  than an error — learning a budget cannot work is the reason to preview
+  instead of applying and taking the outage. Returns 501 when the resolved
+  context-manager predates dry-run support. Requires the `debug` scope.
+
+### Fixed
+
+- `/debug/context/curve` compiled against `app.recipe.agent.contextBudgetTokens`
+  — the **stale recipe** value. Runtime overrides live in the `framework/state`
+  Chronicle slot and win over the recipe, so the curve was plotted at the wrong
+  budget for any agent whose budget had ever been changed at runtime. Now reads
+  the live `getAgentRuntimeSettings`, falling back to the recipe.
+
 ## 0.4.0
 
 ### Changed

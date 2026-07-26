@@ -58,6 +58,7 @@ import {
   type TokenUsage,
   type CallLedgerSnapshot,
   type McplListMessage,
+  type SettingsStateMessage,
   type BranchesListMessage,
   type LessonsListMessage,
 } from '../web/protocol.js';
@@ -1076,6 +1077,9 @@ export class WebUiModule implements Module {
     if (url.pathname === '/debug/context/maintenance') {
       return this.handleContextMaintenance();
     }
+    if (url.pathname === '/debug/context/preview') {
+      return this.handleContextPreview(url);
+    }
     if (url.pathname === '/curve') {
       return new Response(CURVE_PAGE_HTML, {
         headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -1182,6 +1186,79 @@ export class WebUiModule implements Module {
   }
 
   /**
+   * Preview the fold plan at a HYPOTHETICAL budget / tail, without applying it.
+   *
+   *   GET /debug/context/preview?budget=<tokens>[&tail=<tokens>][&agent=<name>]
+   *
+   * Commits nothing — no fold resolutions persisted, no compression enqueued,
+   * no transition bookkeeping advanced. That guarantee lives in
+   * context-manager's `previewContext` (dry-run select); this endpoint only
+   * forwards. An infeasible budget is reported as `fits: false` with the
+   * per-component diagnostics, NOT as an error: learning that a budget can't
+   * work is the reason to preview instead of applying and taking the outage.
+   *
+   * Returns 501 when the resolved context-manager predates dry-run support, so
+   * the panel can say so instead of rendering an empty result.
+   */
+  private handleContextPreview(url: URL): Response {
+    const app = sharedServer?.app;
+    if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
+    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
+    const agent = app.framework.getAgent(agentName);
+    if (!agent) {
+      return Response.json({ error: `Agent not found: ${agentName}` }, { status: 404 });
+    }
+
+    const budgetRaw = url.searchParams.get('budget');
+    const budget = budgetRaw === null ? NaN : Number(budgetRaw);
+    if (!Number.isSafeInteger(budget) || budget <= 0) {
+      return Response.json({ error: 'budget must be a positive integer' }, { status: 400 });
+    }
+    const tailRaw = url.searchParams.get('tail');
+    const overrides: Record<string, unknown> = {};
+    if (tailRaw !== null) {
+      const tail = Number(tailRaw);
+      if (!Number.isSafeInteger(tail) || tail < 0) {
+        return Response.json({ error: 'tail must be a non-negative integer' }, { status: 400 });
+      }
+      // The strategy knob behind "tail" is recentWindowTokens.
+      overrides.recentWindowTokens = tail;
+    }
+
+    const fw = app.framework as unknown as {
+      previewContextSettings?: (n: string, b: number, o?: Record<string, unknown>) => unknown;
+    };
+    if (typeof fw.previewContextSettings !== 'function') {
+      return Response.json(
+        { error: 'preview unsupported: this agent-framework build has no previewContextSettings' },
+        { status: 501 },
+      );
+    }
+    try {
+      const result = fw.previewContextSettings(
+        agentName,
+        budget,
+        Object.keys(overrides).length > 0 ? overrides : undefined,
+      );
+      if (result === null || result === undefined) {
+        return Response.json(
+          {
+            error: 'preview unavailable: the resolved context-manager has no dry-run support, '
+              + 'or the active strategy has no fold plan (non-adaptive)',
+          },
+          { status: 501 },
+        );
+      }
+      return Response.json({ agent: agentName, budget, ...(overrides as object), preview: result });
+    } catch (err) {
+      return Response.json(
+        { error: err instanceof Error ? err.message : String(err) },
+        { status: 500 },
+      );
+    }
+  }
+
+  /**
    * Debug endpoint: return the membrane-normalized request the framework would
    * hand to the model if the agent were activated right now. Delegates to
    * `framework.previewActivation`. Auth is already enforced by the caller
@@ -1254,7 +1331,18 @@ export class WebUiModule implements Module {
     }
     try {
       const cm = (agent as unknown as { getContextManager: () => any }).getContextManager();
-      const maxTokens = app.recipe.agent.contextBudgetTokens ?? 200_000;
+      // Use the LIVE budget, not the recipe's. Runtime overrides persist in the
+      // `framework/state` Chronicle slot and win over the recipe, so reading
+      // app.recipe here plotted the wrong curve on any agent whose budget had
+      // ever been changed at runtime — which is every agent the settings panel
+      // touches. Fall back to the recipe only if the live read is unavailable.
+      let maxTokens = app.recipe.agent.contextBudgetTokens ?? 200_000;
+      try {
+        const live = (app.framework as unknown as {
+          getAgentRuntimeSettings?: (n: string) => { contextBudgetTokens?: number };
+        }).getAgentRuntimeSettings?.(agentName)?.contextBudgetTokens;
+        if (typeof live === 'number' && live > 0) maxTokens = live;
+      } catch { /* keep the recipe fallback */ }
       const reserveForResponse = app.recipe.agent.maxTokens ?? 16_384;
       const compiled = await cm.compile({ maxTokens, reserveForResponse });
 
@@ -1760,6 +1848,78 @@ export class WebUiModule implements Module {
           return;
         }
         this.sendMcplList(client);
+        return;
+      }
+
+      case 'request-settings': {
+        this.sendSettingsState(client, parsed.agent);
+        return;
+      }
+
+      // Settings mutations are live process state, so every case BROADCASTS
+      // rather than replying to the requester only (contrast sendMcplList,
+      // which is file-only). Two operators must not see divergent budgets.
+      case 'settings-update': {
+        const agentName = this.resolveSettingsAgent(parsed.agent);
+        try {
+          const patch: Record<string, number> = {};
+          if (parsed.contextBudgetTokens !== undefined) patch.contextBudgetTokens = parsed.contextBudgetTokens;
+          if (parsed.tailTokens !== undefined) patch.tailTokens = parsed.tailTokens;
+          if (parsed.transitionPaceTokens !== undefined) patch.transitionPaceTokens = parsed.transitionPaceTokens;
+          const fw = sharedServer!.app.framework as unknown as {
+            updateAgentRuntimeSettings: (n: string, p: unknown, o?: { persist?: boolean }) => unknown;
+          };
+          fw.updateAgentRuntimeSettings(agentName, patch, { persist: parsed.persist !== false });
+        } catch (err) {
+          // Expected failures land here and must reach the operator verbatim:
+          // budget ≤ max response tokens, or a strategy that cannot prepare a
+          // smaller window live. Silently swallowing them would look like the
+          // apply worked.
+          this.send(client, {
+            type: 'error',
+            message: `settings-update failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        if (parsed.notify === true) this.notifyAgentOfSettingsChange(agentName, 'update');
+        this.broadcastSettingsState(agentName);
+        return;
+      }
+
+      case 'settings-reset': {
+        const agentName = this.resolveSettingsAgent(parsed.agent);
+        try {
+          const fw = sharedServer!.app.framework as unknown as {
+            resetAgentRuntimeSettings: (n: string, k?: string[], o?: { persist?: boolean }) => unknown;
+          };
+          fw.resetAgentRuntimeSettings(agentName, parsed.keys, { persist: parsed.persist !== false });
+        } catch (err) {
+          this.send(client, {
+            type: 'error',
+            message: `settings-reset failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        if (parsed.notify === true) this.notifyAgentOfSettingsChange(agentName, 'reset');
+        this.broadcastSettingsState(agentName);
+        return;
+      }
+
+      case 'settings-cancel-transition': {
+        const agentName = this.resolveSettingsAgent(parsed.agent);
+        try {
+          const fw = sharedServer!.app.framework as unknown as {
+            cancelAgentRuntimeSettingsTransition: (n: string) => unknown;
+          };
+          fw.cancelAgentRuntimeSettingsTransition(agentName);
+        } catch (err) {
+          this.send(client, {
+            type: 'error',
+            message: `settings-cancel-transition failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        this.broadcastSettingsState(agentName);
         return;
       }
 
@@ -2423,6 +2583,125 @@ export class WebUiModule implements Module {
       await (ws as { materializeMount: (name: string) => Promise<unknown> }).materializeMount('_config');
     } catch {
       // Materialization is best-effort; failures here shouldn't break the UI.
+    }
+  }
+
+  /** Default to the recipe's primary agent when the client omits a name. */
+  private resolveSettingsAgent(name?: string): string {
+    if (name) return name;
+    const app = sharedServer?.app;
+    return app?.recipe.agent.name ?? app?.framework.getAllAgents()[0]?.name ?? 'agent';
+  }
+
+  /**
+   * Build the settings snapshot. Never throws: this feeds a panel, and a
+   * strategy that isn't hot-configurable is a legitimate state to render
+   * read-only rather than an error to surface.
+   */
+  private buildSettingsState(agentName: string): SettingsStateMessage | null {
+    const app = sharedServer?.app;
+    if (!app) return null;
+    const fw = app.framework as unknown as {
+      getAgentRuntimeSettings?: (n: string) => Record<string, unknown>;
+      getAgent?: (n: string) => unknown;
+    };
+    if (typeof fw.getAgentRuntimeSettings !== 'function') return null;
+
+    let settings: Record<string, unknown>;
+    try {
+      settings = fw.getAgentRuntimeSettings(agentName);
+    } catch {
+      return null;
+    }
+
+    // Which knobs this build can apply live, probed rather than assumed: the
+    // hot set is a property of the ACTIVE strategy, not of the host version.
+    let hotConfigurable = false;
+    let previewAvailable = false;
+    try {
+      const agent = app.framework.getAgent(agentName);
+      const cm = agent?.getContextManager() as unknown as {
+        getHotContextSettings?: () => unknown;
+        previewContext?: unknown;
+      } | undefined;
+      hotConfigurable = !!cm && typeof cm.getHotContextSettings === 'function'
+        && cm.getHotContextSettings() !== null;
+      // Older context-manager builds resolve without previewContext. Report it
+      // so the panel says "preview unavailable on this build" instead of
+      // rendering an empty chart and looking broken.
+      previewAvailable = !!cm && typeof cm.previewContext === 'function';
+    } catch { /* leave both false — read-only panel */ }
+
+    const overrides: string[] = [];
+    try {
+      const agent = app.framework.getAgent(agentName) as unknown as {
+        getRuntimeSettingsOverrides?: () => Record<string, unknown>;
+      } | undefined;
+      const ov = agent?.getRuntimeSettingsOverrides?.() ?? {};
+      for (const [k, val] of Object.entries(ov)) if (val !== undefined) overrides.push(k);
+    } catch { /* informational only */ }
+
+    return {
+      type: 'settings-state',
+      agent: agentName,
+      settings: settings as SettingsStateMessage['settings'],
+      overrides,
+      // contextBudgetTokens is applied by the Agent itself; the other three are
+      // forwarded into the strategy's hot-settings channel, so they need a
+      // hot-configurable strategy to mean anything.
+      hotKeys: hotConfigurable
+        ? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']
+        : ['contextBudgetTokens'],
+      hotConfigurable,
+      previewAvailable,
+    };
+  }
+
+  private sendSettingsState(client: ClientState, agentName?: string): void {
+    const msg = this.buildSettingsState(this.resolveSettingsAgent(agentName));
+    if (!msg) {
+      this.send(client, { type: 'error', message: 'runtime settings unavailable on this build' });
+      return;
+    }
+    this.send(client, msg);
+  }
+
+  /** Fan out to every welcomed client — settings are live process state. */
+  private broadcastSettingsState(agentName: string): void {
+    if (!sharedServer?.app) return;
+    const msg = this.buildSettingsState(agentName);
+    if (!msg) return;
+    for (const c of sharedServer.clients.values()) {
+      if (c.welcomed) this.send(c, msg);
+    }
+  }
+
+  /**
+   * Opt-in push notice to the agent that an operator changed its context
+   * settings. OFF by default at the protocol level, because this injects text
+   * into the very context being tuned: it invalidates the KV prefix and is
+   * itself classifier-visible. The zero-cost alternative the agent always has
+   * is to PULL via its `agent_settings` tool.
+   */
+  private notifyAgentOfSettingsChange(agentName: string, kind: 'update' | 'reset'): void {
+    try {
+      const app = sharedServer?.app;
+      if (!app) return;
+      const s = this.buildSettingsState(agentName);
+      const budget = s?.settings.contextBudgetTokens;
+      const tail = s?.settings.tailTokens;
+      const transition = s?.settings.transition;
+      const text = kind === 'reset'
+        ? `[operator] context settings reset to recipe defaults`
+        : `[operator] context settings changed`
+          + (budget !== undefined ? ` — budget ${budget}` : '')
+          + (tail !== undefined ? `, tail ${tail}` : '')
+          + (transition === 'converging' ? ' (converging gradually)' : '');
+      const cm = app.framework.getAgent(agentName)?.getContextManager();
+      cm?.addMessage('Context Manager', [{ type: 'text', text }], { system: true });
+    } catch (err) {
+      // A failed notice must never fail the apply that already succeeded.
+      console.warn('[settings] notify failed (change still applied):', err);
     }
   }
 

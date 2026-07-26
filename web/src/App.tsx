@@ -9,6 +9,7 @@ import { StreamPanel, formatStreamEvent, type StreamLine } from './Stream';
 import { UsagePanel } from './Usage';
 import { LessonsPanel, type LessonRow } from './Lessons';
 import { McplPanel, type McplServerRow } from './Mcpl';
+import { SettingsPanel, type SettingsState } from './Settings';
 import { FilesPanel, FileViewerModal, type Mount, type FlatEntry, type FileViewer } from './Files';
 import { ContextPanel } from './Context';
 import { ContextDocument } from './ContextDocument';
@@ -272,7 +273,7 @@ export function App() {
 
   /** Right-sidebar tab selection. The Tree is the most-used surface so it's
    *  the default; lessons / mcp / files are operator-driven panels. */
-  type SidebarTab = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'health';
+  type SidebarTab = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'health';
   const [sidebarTab, setSidebarTab] = createSignal<SidebarTab>('tree');
   const [mainView, setMainView] = createSignal<'chat' | 'context'>('chat');
 
@@ -309,6 +310,16 @@ export function App() {
   const refreshMcpl = (): void => {
     setMcplLoaded(false);
     wire.send({ type: 'request-mcpl' });
+  };
+
+  /** Context-settings panel state. The server BROADCASTS `settings-state` after
+   *  every mutation (unlike mcpl-list, which is requester-only), because these
+   *  are live process values — two operators must not see divergent budgets. */
+  const [settingsState, setSettingsState] = createSignal<SettingsState | null>(null);
+  const [settingsLoaded, setSettingsLoaded] = createSignal(false);
+  const refreshSettings = (): void => {
+    setSettingsLoaded(false);
+    wire.send({ type: 'request-settings' });
   };
 
   /** Workspace files panel state — mounts list + per-mount tree cache. */
@@ -876,6 +887,10 @@ export function App() {
           setMcplConfigPath(configPath);
           setMcplServers(servers);
         },
+        setSettings: (state) => {
+          setSettingsLoaded(true);
+          setSettingsState(state);
+        },
         setMounts: (loaded, moduleLoaded, list) => {
           setMountsLoaded(loaded);
           setWorkspaceModuleLoaded(moduleLoaded);
@@ -1174,6 +1189,7 @@ export function App() {
               if (tab === 'lessons' && !lessonsLoaded()) refreshLessons();
               if (tab === 'mcp' && !mcplLoaded()) refreshMcpl();
               if (tab === 'files' && !mountsLoaded()) refreshMounts();
+              if (tab === 'settings' && !settingsLoaded()) refreshSettings();
             }}
           />
           <div class="flex-1 min-h-0">
@@ -1210,6 +1226,17 @@ export function App() {
                 onAdd={(input) => wire.send({ type: 'mcpl-add', ...input })}
                 onRemove={(id) => wire.send({ type: 'mcpl-remove', id })}
                 onSetEnv={(id, env) => wire.send({ type: 'mcpl-set-env', id, env })}
+              />
+            </Show>
+            <Show when={sidebarTab() === 'settings'}>
+              <SettingsPanel
+                loaded={settingsLoaded()}
+                state={settingsState()}
+                onRefresh={refreshSettings}
+                onApply={(patch) => wire.send({ type: 'settings-update', ...patch })}
+                onReset={(keys, persist) =>
+                  wire.send({ type: 'settings-reset', ...(keys ? { keys } : {}), persist })}
+                onCancelTransition={() => wire.send({ type: 'settings-cancel-transition' })}
               />
             </Show>
             <Show when={sidebarTab() === 'files'}>
@@ -1282,6 +1309,8 @@ interface HandlerHooks {
   setLessons: (loaded: boolean, moduleLoaded: boolean, lessons: LessonRow[]) => void;
   /** Apply an mcpl-list response from the server. */
   setMcpl: (configPath: string, servers: McplServerRow[]) => void;
+  /** Apply a settings-state broadcast. */
+  setSettings: (state: SettingsState) => void;
   /** Apply a workspace-mounts response. */
   setMounts: (loaded: boolean, moduleLoaded: boolean, mounts: Mount[]) => void;
   /** Apply a workspace-tree response for one mount. */
@@ -1411,6 +1440,9 @@ function handleServerMessage(
       return;
     case 'mcpl-list':
       hooks.setMcpl(msg.configPath, msg.servers);
+      return;
+    case 'settings-state':
+      hooks.setSettings(msg as unknown as SettingsState);
       return;
     case 'workspace-mounts':
       hooks.setMounts(true, msg.loaded, msg.mounts);
@@ -1942,7 +1974,7 @@ function CommandSuggestions(props: { draft: string; onPick: (cmd: string) => voi
   );
 }
 
-type SidebarTabId = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'health';
+type SidebarTabId = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'health';
 
 function SidebarTabs(props: {
   current: SidebarTabId;
@@ -1954,6 +1986,7 @@ function SidebarTabs(props: {
     { id: 'mcp', label: 'MCP', title: 'MCPL servers' },
     { id: 'files', label: 'Files', title: 'Workspace mounts + files' },
     { id: 'context', label: 'Context', title: 'Compiled context makeup' },
+    { id: 'settings', label: 'Settings', title: 'Live context budget / tail, with preview' },
     { id: 'health', label: 'Health', title: 'Runtime settings, failures, quarantine' },
   ];
   return (

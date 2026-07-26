@@ -391,6 +391,41 @@ export interface McplListMessage {
   }>;
 }
 
+/**
+ * Runtime context-settings snapshot.
+ *
+ * BROADCAST to every welcomed client on change — unlike `mcpl-list`, these are
+ * live process state, not a config file, so two operators must not see
+ * divergent values.
+ */
+export interface SettingsStateMessage {
+  type: 'settings-state';
+  agent: string;
+  /** Live values. `transition` is 'converging' while a paced descent runs. */
+  settings: {
+    contextBudgetTokens: number;
+    tailTokens?: number;
+    transitionPaceTokens?: number;
+    sameRoundThinkTextPolicy?: string;
+    sameRoundThinkTextPolicySource?: string;
+    transition: 'stable' | 'converging' | 'blocked';
+    /** Why a descent is stuck: pace below floor, or protected context too big. */
+    transitionReason?: string;
+  };
+  /** Keys currently overridden away from the recipe (i.e. persisted). */
+  overrides: string[];
+  /** Which keys this build can apply live. Everything else needs a restart —
+   *  the UI must show that split rather than implying all knobs are hot. */
+  hotKeys: string[];
+  /** False when the strategy is not hot-configurable at all (e.g. passthrough):
+   *  the panel should go read-only rather than offer controls that will throw. */
+  hotConfigurable: boolean;
+  /** True when this build's context-manager exposes dry-run preview. Older
+   *  context-manager versions resolve without it, and the panel must say
+   *  "preview unavailable" rather than silently showing nothing. */
+  previewAvailable: boolean;
+}
+
 /** A page of older history — response to `request-history`, routed only to
  *  the requesting client and correlated by `corrId`. */
 export interface HistoryPageMessage {
@@ -474,6 +509,7 @@ export type WebUiServerMessage =
   | QuitConfirmRequiredMessage
   | LessonsListMessage
   | McplListMessage
+  | SettingsStateMessage
   | WorkspaceMountsMessage
   | WorkspaceTreeMessage
   | WorkspaceFileMessage
@@ -633,6 +669,58 @@ export interface McplSetEnvMessage {
   env: Record<string, string>;
 }
 
+/** Pull the current runtime context settings for an agent, plus which knobs are
+ *  live-appliable vs restart-only. Response is a `settings-state` envelope. */
+export interface RequestSettingsMessage {
+  type: 'request-settings';
+  /** Agent name; defaults to the recipe's primary agent. */
+  agent?: string;
+}
+
+/**
+ * Apply runtime context settings live.
+ *
+ * Semantics that the UI must not misrepresent:
+ *  - RAISING contextBudgetTokens applies immediately.
+ *  - LOWERING it starts a PACED convergence (`transition: 'converging'`)
+ *    rather than folding everything at once; it can be cancelled.
+ *  - Only these keys are hot. Chunk size, head window, merge threshold and
+ *    friends are recipe-and-restart only.
+ *
+ * `persist: false` makes the change ephemeral — live now, gone on restart —
+ * which is the mode for operator experiments. Default persists.
+ *
+ * `notify: true` pushes a notice into the agent's context. OFF by default and
+ * deliberately so: the notice is new text in the very context being tuned, so
+ * it invalidates the KV prefix and can itself trip a refusal classifier. The
+ * agent can always PULL current settings via its own `agent_settings` tool.
+ */
+export interface SettingsUpdateMessage {
+  type: 'settings-update';
+  agent?: string;
+  contextBudgetTokens?: number;
+  tailTokens?: number;
+  transitionPaceTokens?: number;
+  persist?: boolean;
+  notify?: boolean;
+}
+
+/** Revert named settings to their recipe values (all four when omitted). */
+export interface SettingsResetMessage {
+  type: 'settings-reset';
+  agent?: string;
+  keys?: string[];
+  persist?: boolean;
+  notify?: boolean;
+}
+
+/** Abandon an in-flight paced descent, holding the current frontier. */
+export interface SettingsCancelTransitionMessage {
+  type: 'settings-cancel-transition';
+  agent?: string;
+  persist?: boolean;
+}
+
 /** Pull the list of workspace mounts. Response is `workspace-mounts`.
  *  Optional `scope` selects a fleet child instead of the parent. */
 export interface RequestWorkspaceMountsMessage {
@@ -706,6 +794,10 @@ export type WebUiClientMessage =
   | McplAddMessage
   | McplRemoveMessage
   | McplSetEnvMessage
+  | RequestSettingsMessage
+  | SettingsUpdateMessage
+  | SettingsResetMessage
+  | SettingsCancelTransitionMessage
   | RequestWorkspaceMountsMessage
   | RequestWorkspaceTreeMessage
   | RequestWorkspaceFileMessage
@@ -768,6 +860,30 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
       return isValidMcplId(v.id);
     case 'mcpl-set-env':
       return isValidMcplId(v.id) && isStringMap(v.env);
+    case 'request-settings':
+      return isOptionalNonEmptyString(v.agent);
+    case 'settings-update': {
+      if (!isOptionalNonEmptyString(v.agent)) return false;
+      if (!isOptionalBool(v.persist) || !isOptionalBool(v.notify)) return false;
+      // Positive-integer-or-absent for each knob. The semantic gate (budget must
+      // exceed max response tokens; tail/pace need a hot-configurable strategy)
+      // lives in Agent.validateRuntimeSettingsPatch — this only guarantees the
+      // shape so that gate gets numbers instead of strings.
+      for (const k of ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens']) {
+        if (!isOptionalPositiveInt(v[k])) return false;
+      }
+      // Require at least one actual knob: an empty patch would throw downstream.
+      return v.contextBudgetTokens !== undefined
+        || v.tailTokens !== undefined
+        || v.transitionPaceTokens !== undefined;
+    }
+    case 'settings-reset':
+      return isOptionalNonEmptyString(v.agent)
+        && isOptionalBool(v.persist)
+        && isOptionalBool(v.notify)
+        && isOptionalStringArray(v.keys);
+    case 'settings-cancel-transition':
+      return isOptionalNonEmptyString(v.agent) && isOptionalBool(v.persist);
     case 'request-workspace-mounts':
       return v.scope === undefined || typeof v.scope === 'string';
     case 'request-workspace-tree':
@@ -821,4 +937,18 @@ function isOptionalStringArray(v: unknown): v is string[] | undefined {
   if (v === undefined) return true;
   if (!Array.isArray(v)) return false;
   return v.every((x) => typeof x === 'string');
+}
+
+function isOptionalNonEmptyString(v: unknown): v is string | undefined {
+  return v === undefined || isNonEmptyString(v);
+}
+
+function isOptionalBool(v: unknown): v is boolean | undefined {
+  return v === undefined || typeof v === 'boolean';
+}
+
+/** Token counts: safe positive integers only. Rejects strings, NaN, Infinity,
+ *  fractions and negatives before they reach the settings validator. */
+function isOptionalPositiveInt(v: unknown): v is number | undefined {
+  return v === undefined || (typeof v === 'number' && Number.isSafeInteger(v) && v > 0);
 }
