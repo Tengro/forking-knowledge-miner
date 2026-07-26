@@ -25,6 +25,7 @@ import {
   OpenRouterAdapter,
 } from '@animalabs/membrane';
 import { LoggingAnthropicAdapter } from './logging-adapter.js';
+import { LoggingProviderAdapter } from './logging-provider-wrapper.js';
 import { LoggingBedrockAdapter } from './logging-bedrock-adapter.js';
 import { CodexSubscriptionAdapter } from './codex-subscription-adapter.js';
 import { CallLedger } from './call-ledger.js';
@@ -835,11 +836,22 @@ async function main() {
     ? new LoggingBedrockAdapter({}, llmLogPath)
     : undefined;
   const adapter = provider === 'openai-responses'
-    ? new OpenAIResponsesAPIAdapter({
-        apiKey: config.openaiApiKey!,
-        baseURL: process.env.OPENAI_BASE_URL || undefined,
-      })
-    : bedrockAdapter ?? openrouterAdapter ?? codexAdapter ?? new LoggingAnthropicAdapter(
+    ? new LoggingProviderAdapter(
+        new OpenAIResponsesAPIAdapter({
+          apiKey: config.openaiApiKey!,
+          baseURL: process.env.OPENAI_BASE_URL || undefined,
+        }),
+        llmLogPath,
+      )
+    // Codex/openrouter/openai adapters get the provider-agnostic logging
+    // decorator (llm-calls.jsonl); anthropic and bedrock keep their
+    // purpose-built logging classes below. The bare `codexAdapter` /
+    // `openrouterAdapter` instances stay un-wrapped for auth commands and
+    // dispose() — only the membrane sees the wrapper.
+    : bedrockAdapter
+      ?? (openrouterAdapter ? new LoggingProviderAdapter(openrouterAdapter, llmLogPath) : undefined)
+      ?? (codexAdapter ? new LoggingProviderAdapter(codexAdapter, llmLogPath) : undefined)
+      ?? new LoggingAnthropicAdapter(
         {
           // Anthropic OAuth wins over API-key auth when both are present.
           // Subscription tokens additionally require this beta header.

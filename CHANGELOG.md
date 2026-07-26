@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.5.1
+
+### Added
+
+- **llm-calls logging for every provider**: `LoggingProviderAdapter`, a
+  provider-agnostic decorator over any `ProviderAdapter`, wraps the
+  openai-codex, openrouter, and openai-responses transports — which
+  previously had NO wire visibility (found post-deploy on Mica: zero
+  llm-calls files, requests undiagnosable). Full raw request + response
+  summary + usage + timing + error per call, size-guarded against
+  pathological payloads. Anthropic/Bedrock keep their purpose-built
+  logging classes.
+
 ## 0.5.0 — 2026-07-26
 
 ### Added
