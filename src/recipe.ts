@@ -85,6 +85,13 @@ export interface RecipeStrategy {
   summarySystemPrompt?: string;
   summaryUserPrompt?: string;
   summaryContextLabel?: string;
+  /** As-of perspective pin: chunks wholly below this message sequence are
+   *  compressed as inherited/witnessed record, not first-person memory.
+   *  For residents continued from a shared log they joined partway through. */
+  witnessedBeforeSequence?: number;
+  /** Override wording for the witnessed-record instruction ({targetTokens}
+   *  substituted). */
+  witnessedInstruction?: string;
 }
 
 export interface RecipeAgent {
