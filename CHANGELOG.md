@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.4 — 2026-07-26
+
+### Fixed
+
+- **`dry run + show context` was a 110-second agent stall.** Measured 110,348ms
+  against ~8s for the numbers-only dry run. `select()` builds the rendered
+  entries either way, so the extra ~102s was pure serialization of 353 full
+  entries — content the pane never showed, since it truncated every body past
+  600 chars. The server now projects to `{i, who, chars, media, truncated,
+  text}` with text capped at 1,200 chars; content blocks never leave the
+  process and media is counted rather than inlined, which also removes the
+  blob-resolution heap exposure `/curve` warns about.
+- The cost disclosure was understated by ~20× and in the dangerous direction
+  ("seconds… briefly pauses the agent"). It now states that the compile runs on
+  the agent's thread and the agent does nothing else meanwhile, quotes the
+  measured cost, and notes runs are serialized so a second click is refused
+  rather than queueing another pause.
+
 ## Unreleased
 
 ## 0.5.3 — 2026-07-26
