@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.1 — 2026-07-26
+
 ### Fixed
 
 - **Pin id picker sourced the wrong ids.** It read `/debug/context/curve`, which
