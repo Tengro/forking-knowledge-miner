@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.3 — 2026-07-26
+
 ### Added
 
 - **Dry-run buttons, and the resulting context in the main pane.** Settings now
