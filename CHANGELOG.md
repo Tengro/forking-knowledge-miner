@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.2 — 2026-07-26
+
 ### Fixed
 
 - **Settings preview reported unreachable budgets as fitting.** context-manager's
