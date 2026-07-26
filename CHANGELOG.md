@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.0 — 2026-07-26
+
 ### Added
 
 - **Health panel: recent LLM call stats, split main vs compression.** Aggregates
