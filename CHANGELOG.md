@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.1 — 2026-07-26
+
 ### Changed
 
 - **Health call stats are now per-call, not cumulative.** The previous version
