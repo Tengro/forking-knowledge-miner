@@ -15,7 +15,7 @@
  *     that looks like "nothing would change".
  */
 
-import { createSignal, Show, For, onCleanup } from 'solid-js';
+import { createSignal, Show, For } from 'solid-js';
 
 export interface SettingsSnapshot {
   contextBudgetTokens: number;
@@ -101,6 +101,8 @@ export function SettingsPanel(props: {
   }): void;
   onReset(keys: string[] | undefined, persist: boolean): void;
   onCancelTransition(): void;
+  /** Hand a rendered dry context to the main pane for display. */
+  onDryContext?(ctx: { entries: unknown[]; stats?: unknown; label: string }): void;
 }) {
   const [budget, setBudget] = createSignal<string>('');
   const [tail, setTail] = createSignal<string>('');
@@ -113,8 +115,7 @@ export function SettingsPanel(props: {
   const [previewErr, setPreviewErr] = createSignal<string | null>(null);
   const [previewing, setPreviewing] = createSignal(false);
 
-  let debounce: number | undefined;
-  onCleanup(() => { if (debounce) window.clearTimeout(debounce); });
+  const [elapsed, setElapsed] = createSignal<number | null>(null);
 
   const s = () => props.state?.settings;
   const isHot = (k: string) => props.state?.hotKeys.includes(k) ?? false;
@@ -134,38 +135,55 @@ export function SettingsPanel(props: {
     return Number.isSafeInteger(n) && n > 0 ? n : undefined;
   };
 
-  /** Debounced: an operator dragging a value should not fire a compile per keystroke.
-   *  The request itself is non-committing, but it is still real CPU on a live agent. */
-  const runPreview = () => {
-    if (!props.state?.previewAvailable) return;
+  /**
+   * Explicit dry run. NOT wired to input events on purpose.
+   *
+   * A dry run is a real compile: seconds on a large store, and the compile is
+   * synchronous, so it briefly blocks the agent's event loop — no heartbeat, no
+   * Discord, no MCPL for the duration. An earlier version of this panel fired it
+   * on every keystroke (debounced), which stacked agent stalls and made the UI
+   * look hung. The operator asks for it now.
+   *
+   * `render` also fetches the resulting context for the main pane.
+   */
+  const runDryRun = async (render: boolean) => {
+    if (!props.state?.previewAvailable || previewing()) return;
     const b = num(budget());
-    if (b === undefined) { setPreview(null); setPreviewErr(null); return; }
-    if (debounce) window.clearTimeout(debounce);
-    debounce = window.setTimeout(async () => {
-      setPreviewing(true);
-      setPreviewErr(null);
-      try {
-        const qs = new URLSearchParams({ budget: String(b), agent: props.state!.agent });
-        const t = num(tail());
-        if (t !== undefined) qs.set('tail', String(t));
-        const res = await fetch(`/debug/context/preview?${qs}`, { credentials: 'same-origin' });
-        const body = await res.json();
-        if (!res.ok) {
-          setPreview(null);
-          setAcct(null);
-          setPreviewErr(body?.error ?? `HTTP ${res.status}`);
-          return;
-        }
-        setPreview(body.preview as PreviewResult);
-        setAcct((body.accounting ?? null) as PreviewAccounting | null);
-      } catch (e) {
+    if (b === undefined) { setPreviewErr('budget must be a positive integer'); return; }
+    setPreviewing(true);
+    setPreviewErr(null);
+    setElapsed(null);
+    try {
+      const qs = new URLSearchParams({ budget: String(b), agent: props.state!.agent });
+      const t = num(tail());
+      if (t !== undefined) qs.set('tail', String(t));
+      if (render) qs.set('render', '1');
+      const res = await fetch(`/debug/context/preview?${qs}`, { credentials: 'same-origin' });
+      const body = await res.json();
+      if (!res.ok) {
         setPreview(null);
         setAcct(null);
-        setPreviewErr(e instanceof Error ? e.message : String(e));
-      } finally {
-        setPreviewing(false);
+        // 429 is the single-flight / cooldown guard, not a failure.
+        setPreviewErr(body?.error ?? `HTTP ${res.status}`);
+        return;
       }
-    }, 350) as unknown as number;
+      setPreview(body.preview as PreviewResult);
+      setAcct((body.accounting ?? null) as PreviewAccounting | null);
+      setElapsed(typeof body.elapsedMs === 'number' ? body.elapsedMs : null);
+      if (render && body.preview?.entries) {
+        props.onDryContext?.({
+          entries: body.preview.entries,
+          stats: body.preview.stats,
+          label: `budget ${b.toLocaleString()}${t !== undefined ? `, tail ${t.toLocaleString()}` : ''}`,
+        });
+      }
+    } catch (e) {
+      setPreview(null);
+      setAcct(null);
+      setPreviewErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPreviewing(false);
+    }
   };
 
   const apply = () => {
@@ -297,7 +315,7 @@ export function SettingsPanel(props: {
                   disabled={!isHot(key)}
                   value={get()}
                   placeholder={isHot(key) ? 'tokens' : 'restart only'}
-                  onInput={(e) => { set(e.currentTarget.value); runPreview(); }}
+                  onInput={(e) => set(e.currentTarget.value)}
                   class="flex-1 bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5
                          font-mono text-[11px] text-neutral-100 disabled:opacity-40"
                 />
@@ -356,13 +374,40 @@ export function SettingsPanel(props: {
 
         {/* ---- preview ---- */}
         <div class="border-t border-neutral-800 pt-2">
-          <div class="flex items-center gap-2 mb-1">
+          <div class="flex items-center gap-2 mb-1 flex-wrap">
             <span class="text-neutral-500 uppercase tracking-wider text-[10px] font-semibold">
-              preview
+              dry run
             </span>
+            <button
+              type="button"
+              disabled={previewing() || !props.state!.previewAvailable}
+              class="px-2 py-0.5 text-[10px] rounded font-mono bg-neutral-800 hover:bg-neutral-700
+                     text-neutral-200 disabled:opacity-30"
+              onClick={() => void runDryRun(false)}
+              title="Compile at these settings without applying them. Does not commit anything."
+            >
+              dry run
+            </button>
+            <button
+              type="button"
+              disabled={previewing() || !props.state!.previewAvailable}
+              class="px-2 py-0.5 text-[10px] rounded font-mono bg-cyan-900/40 hover:bg-cyan-900/60
+                     text-cyan-200 disabled:opacity-30"
+              onClick={() => void runDryRun(true)}
+              title="Dry run and show the resulting context in the main pane."
+            >
+              dry run + show context
+            </button>
             <Show when={previewing()}>
-              <span class="text-neutral-600 text-[10px]">computing…</span>
+              <span class="text-amber-400/90 text-[10px]">running — agent paused…</span>
             </Show>
+            <Show when={!previewing() && elapsed() !== null}>
+              <span class="text-neutral-600 text-[10px]">{(elapsed()! / 1000).toFixed(1)}s</span>
+            </Show>
+          </div>
+          <div class="text-[10px] text-neutral-600 mb-1.5 leading-relaxed">
+            A dry run is a full compile — seconds on a large store — and it briefly pauses the
+            agent. It commits nothing: no fold resolutions, no compression queued.
           </div>
 
           <Show when={!props.state!.previewAvailable}>
@@ -432,7 +477,7 @@ export function SettingsPanel(props: {
                       ['head (verbatim)', p().headTokens],
                       ['tail (verbatim)', p().tailTokens],
                       ['middle (foldable)', p().middleTokens],
-                      ['middle chunks', p().middleChunkCount],
+                      ['middle messages (picker units)', p().middleChunkCount],
                       ['deepest fold level', `L${p().deepestLevel}`],
                       ['folds applied', p().appliedCount],
                     ] as Array<[string, unknown]>}>

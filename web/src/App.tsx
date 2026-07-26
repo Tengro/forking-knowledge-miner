@@ -10,6 +10,7 @@ import { UsagePanel } from './Usage';
 import { LessonsPanel, type LessonRow } from './Lessons';
 import { McplPanel, type McplServerRow } from './Mcpl';
 import { SettingsPanel, type SettingsState } from './Settings';
+import { DryContext, type DryContextData } from './DryContext';
 import { FilesPanel, FileViewerModal, type Mount, type FlatEntry, type FileViewer } from './Files';
 import { ContextPanel } from './Context';
 import { ContextDocument } from './ContextDocument';
@@ -275,7 +276,9 @@ export function App() {
    *  the default; lessons / mcp / files are operator-driven panels. */
   type SidebarTab = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'health';
   const [sidebarTab, setSidebarTab] = createSignal<SidebarTab>('tree');
-  const [mainView, setMainView] = createSignal<'chat' | 'context'>('chat');
+  const [mainView, setMainView] = createSignal<'chat' | 'context' | 'dry'>('chat');
+  /** Rendered dry-run context awaiting display. Never applied — see DryContext. */
+  const [dryContext, setDryContext] = createSignal<DryContextData | null>(null);
 
   /** Scope shared by Lessons / Files / Recipe panels. 'local' means the
    *  parent process; otherwise the fleet child's name. The scope is shared
@@ -1075,13 +1078,19 @@ export function App() {
           <div class="flex border-b border-neutral-800 bg-neutral-900/40 text-[11px] font-mono">
             <button type="button" class={`px-3 py-1.5 ${mainView() === 'chat' ? 'text-neutral-100 bg-neutral-900 border-b border-cyan-700' : 'text-neutral-500 hover:text-neutral-300'}`} onClick={() => setMainView('chat')}>Chat</button>
             <button type="button" class={`px-3 py-1.5 ${mainView() === 'context' ? 'text-neutral-100 bg-neutral-900 border-b border-cyan-700' : 'text-neutral-500 hover:text-neutral-300'}`} onClick={() => setMainView('context')}>Context</button>
+            <Show when={dryContext()}>
+              <button type="button" class={`px-3 py-1.5 ${mainView() === 'dry' ? 'text-amber-200 bg-neutral-900 border-b border-amber-600' : 'text-amber-500/70 hover:text-amber-300'}`} onClick={() => setMainView('dry')}>Dry run</button>
+            </Show>
           </div>
           <div
             ref={scrollPane}
             class="flex-1 overflow-y-auto px-4 py-3 space-y-3"
             onScroll={onScrollPane}
           >
-            <Show when={mainView() === 'context'} fallback={<>
+            <Show when={mainView() === 'dry'}>
+              <DryContext data={dryContext()} onClose={() => { setDryContext(null); setMainView('chat'); }} />
+            </Show>
+            <Show when={mainView() === 'context'} fallback={<Show when={mainView() === 'chat'}>
             <Show when={(historyInfo()?.startIndex ?? 0) > 0}>
               <button
                 type="button"
@@ -1102,7 +1111,7 @@ export function App() {
             <For each={messages}>{(m) => (
               <MessageView msg={m} results={toolResults()} toolUseIds={toolUseIds()} />
             )}</For>
-            </>}>
+            </Show>}>
               <ContextDocument agent={panelScope() === 'local' ? undefined : panelScope()} />
             </Show>
           </div>
@@ -1179,7 +1188,9 @@ export function App() {
             onClose={closePanel}
           />
         </Show>
-        <aside class="w-72 border-l border-neutral-800 bg-neutral-950 shrink-0 flex flex-col">
+        {/* Was w-72 (288px): the context/settings panels have dense numeric
+            tables that did not fit. Widen, and give large displays more. */}
+        <aside class="w-96 xl:w-[30rem] border-l border-neutral-800 bg-neutral-950 shrink-0 flex flex-col">
           <SidebarTabs
             current={sidebarTab()}
             onSelect={(tab) => {
@@ -1237,6 +1248,7 @@ export function App() {
                 onReset={(keys, persist) =>
                   wire.send({ type: 'settings-reset', ...(keys ? { keys } : {}), persist })}
                 onCancelTransition={() => wire.send({ type: 'settings-cancel-transition' })}
+                onDryContext={(ctx) => { setDryContext(ctx as DryContextData); setMainView('dry'); }}
               />
             </Show>
             <Show when={sidebarTab() === 'files'}>

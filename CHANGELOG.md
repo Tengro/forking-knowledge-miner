@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Added
+
+- **Dry-run buttons, and the resulting context in the main pane.** Settings now
+  has explicit `dry run` and `dry run + show context` buttons; the latter
+  renders the context those settings WOULD produce in a new main-pane view,
+  behind an unmissable "dry run — not applied" banner. Entries come from
+  context-manager's dry-run select, so it is the actual layout, not an estimate.
+- Dry runs report how long they took, and the panel states the cost up front: a
+  full compile, seconds on a large store, briefly pausing the agent.
+
+### Fixed
+
+- **Preview no longer fires on every keystroke.** It was debounced-on-input, but
+  a dry run is a real compile and `select()` is synchronous — so each one blocks
+  the agent's event loop (no heartbeat, no Discord, no MCPL). Typing a budget
+  stacked those stalls and made the UI look hung. It is now operator-initiated
+  only, with server-side single-flight and a 3s cooldown that returns 429 rather
+  than queueing more agent pauses.
+- `middleChunkCount` was labelled "middle chunks" but the adaptive picker's unit
+  is the MESSAGE (14,057 for a store with 800 chunks). Relabelled "middle
+  messages (picker units)".
+- The sidebar was `w-72` (288px) and clipped the dense numeric tables; now
+  `w-96`, wider still on xl displays.
+
 ## 0.5.2 — 2026-07-26
 
 ### Fixed

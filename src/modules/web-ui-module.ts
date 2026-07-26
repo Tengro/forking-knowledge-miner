@@ -1200,6 +1200,18 @@ export class WebUiModule implements Module {
    * Returns 501 when the resolved context-manager predates dry-run support, so
    * the panel can say so instead of rendering an empty result.
    */
+  /**
+   * Single-flight + cooldown for preview.
+   *
+   * A preview is a real compile: ~8s on a large store, and `select()` is
+   * synchronous so it BLOCKS the agent's event loop for that whole time (no
+   * heartbeat, no Discord, no MCPL). Overlapping or rapid-fire previews
+   * therefore don't just queue — they stack agent stalls. Reject instead.
+   */
+  private previewInFlight = false;
+  private previewLastAt = 0;
+  private static readonly PREVIEW_COOLDOWN_MS = 3_000;
+
   private handleContextPreview(url: URL): Response {
     const app = sharedServer?.app;
     if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
@@ -1225,8 +1237,33 @@ export class WebUiModule implements Module {
       overrides.recentWindowTokens = tail;
     }
 
+    // `render=1` additionally returns the rendered dry context for display.
+    const wantRender = (() => {
+      const v = url.searchParams.get('render');
+      return v !== null && v !== '0' && v !== 'false';
+    })();
+
+    if (this.previewInFlight) {
+      return Response.json(
+        { error: 'a preview is already running — it blocks the agent, so they are serialized' },
+        { status: 429 },
+      );
+    }
+    const sinceLast = Date.now() - this.previewLastAt;
+    if (sinceLast < WebUiModule.PREVIEW_COOLDOWN_MS) {
+      return Response.json(
+        {
+          error: `preview cooling down — ${Math.ceil((WebUiModule.PREVIEW_COOLDOWN_MS - sinceLast) / 1000)}s left. `
+            + 'Each run is a full compile and briefly pauses the agent.',
+        },
+        { status: 429 },
+      );
+    }
+
     const fw = app.framework as unknown as {
-      previewContextSettings?: (n: string, b: number, o?: Record<string, unknown>) => unknown;
+      previewContextSettings?: (
+        n: string, b: number, o?: Record<string, unknown>, x?: { render?: boolean },
+      ) => unknown;
     };
     if (typeof fw.previewContextSettings !== 'function') {
       return Response.json(
@@ -1234,11 +1271,14 @@ export class WebUiModule implements Module {
         { status: 501 },
       );
     }
+    this.previewInFlight = true;
+    const startedAt = Date.now();
     try {
       const result = fw.previewContextSettings(
         agentName,
         budget,
         Object.keys(overrides).length > 0 ? overrides : undefined,
+        wantRender ? { render: true } : undefined,
       );
       if (result === null || result === undefined) {
         return Response.json(
@@ -1284,6 +1324,8 @@ export class WebUiModule implements Module {
           /** Exhausted AND over the request => this budget is UNREACHABLE. */
           unreachable: r.exhausted === true && !fitsRequested,
         },
+        /** How long the agent was blocked, so the operator sees the real cost. */
+        elapsedMs: Date.now() - startedAt,
         preview: result,
       });
     } catch (err) {
@@ -1291,6 +1333,9 @@ export class WebUiModule implements Module {
         { error: err instanceof Error ? err.message : String(err) },
         { status: 500 },
       );
+    } finally {
+      this.previewInFlight = false;
+      this.previewLastAt = Date.now();
     }
   }
 
