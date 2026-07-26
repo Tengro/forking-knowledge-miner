@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Settings preview reported unreachable budgets as fitting.** context-manager's
+  `PreviewResult.budgetTokens` is the *rejection* budget —
+  `(requested - reserve) * (1 + overBudgetGraceRatio)` — and its `fits` means
+  "would not throw `OverBudgetError`", not "fits the budget you asked for". On
+  Mythos (`overBudgetGraceRatio: 0.35`) those differ by a third: previewing
+  250k reported `fits: true` at 273,828 tokens, a budget the picker had in fact
+  exhausted trying to reach. The endpoint now returns an `accounting` block
+  separating `fitsRequested` / `withinGrace` / `unreachable`, and the panel
+  renders three distinct verdicts (fits / over-requested-but-graced /
+  would-hard-fail) plus the full budget derivation.
+
 ## 0.5.1
 
 ### Added

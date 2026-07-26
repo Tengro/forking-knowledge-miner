@@ -1249,7 +1249,43 @@ export class WebUiModule implements Module {
           { status: 501 },
         );
       }
-      return Response.json({ agent: agentName, budget, ...(overrides as object), preview: result });
+      // Honest budget accounting. context-manager's `budgetTokens` is the
+      // REJECTION budget: (requested - reserve) * (1 + overBudgetGraceRatio),
+      // i.e. the threshold above which a compile throws. Its `fits` therefore
+      // means "would not hard-fail", NOT "fits the budget you asked for".
+      //
+      // On a recipe with overBudgetGraceRatio 0.35 those differ by a third, so
+      // reporting cm's `fits` verbatim told operators that a budget they
+      // cannot actually reach was fine. Split the two questions apart and let
+      // the panel say which one it means.
+      const r = result as { finalTokens?: number; budgetTokens?: number; exhausted?: boolean };
+      const reserve = app.recipe.agent.maxTokens ?? 16_384;
+      const effectiveBudget = Math.max(0, budget - reserve);
+      const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
+      const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudget;
+      const withinGrace = Number.isFinite(finalTokens) && typeof r.budgetTokens === 'number'
+        ? finalTokens <= r.budgetTokens
+        : undefined;
+      return Response.json({
+        agent: agentName,
+        budget,
+        ...(overrides as object),
+        accounting: {
+          requestedBudgetTokens: budget,
+          reserveForResponseTokens: reserve,
+          /** What the picker actually targets. */
+          effectiveBudgetTokens: effectiveBudget,
+          /** Hard-fail ceiling — requested minus reserve, plus grace. */
+          rejectionBudgetTokens: r.budgetTokens,
+          /** Fits the budget the operator asked for. */
+          fitsRequested,
+          /** Merely tolerated by the grace margin — over budget, but no throw. */
+          withinGrace,
+          /** Exhausted AND over the request => this budget is UNREACHABLE. */
+          unreachable: r.exhausted === true && !fitsRequested,
+        },
+        preview: result,
+      });
     } catch (err) {
       return Response.json(
         { error: err instanceof Error ? err.message : String(err) },

@@ -36,6 +36,24 @@ export interface SettingsState {
   previewAvailable: boolean;
 }
 
+/**
+ * Honest budget accounting from the server.
+ *
+ * `preview.fits` from context-manager means "would not throw OverBudgetError",
+ * which on a recipe with a grace ratio is NOT the same as "fits the budget you
+ * typed". These three flags keep the questions separate.
+ */
+interface PreviewAccounting {
+  requestedBudgetTokens: number;
+  reserveForResponseTokens: number;
+  effectiveBudgetTokens: number;
+  rejectionBudgetTokens?: number;
+  fitsRequested: boolean;
+  withinGrace?: boolean;
+  /** Picker exhausted AND still over the request — this budget cannot be reached. */
+  unreachable: boolean;
+}
+
 interface PreviewResult {
   finalTokens: number;
   budgetTokens: number;
@@ -91,6 +109,7 @@ export function SettingsPanel(props: {
   const [notify, setNotify] = createSignal(false);
 
   const [preview, setPreview] = createSignal<PreviewResult | null>(null);
+  const [acct, setAcct] = createSignal<PreviewAccounting | null>(null);
   const [previewErr, setPreviewErr] = createSignal<string | null>(null);
   const [previewing, setPreviewing] = createSignal(false);
 
@@ -133,12 +152,15 @@ export function SettingsPanel(props: {
         const body = await res.json();
         if (!res.ok) {
           setPreview(null);
+          setAcct(null);
           setPreviewErr(body?.error ?? `HTTP ${res.status}`);
           return;
         }
         setPreview(body.preview as PreviewResult);
+        setAcct((body.accounting ?? null) as PreviewAccounting | null);
       } catch (e) {
         setPreview(null);
+        setAcct(null);
         setPreviewErr(e instanceof Error ? e.message : String(e));
       } finally {
         setPreviewing(false);
@@ -357,20 +379,45 @@ export function SettingsPanel(props: {
           <Show when={preview()}>
             {(p) => (
               <div>
+                {/* Three distinct verdicts. Collapsing "fits your budget" into
+                    "wouldn't throw" is how a 35%-grace recipe reports an
+                    unreachable budget as fine — so they are kept apart. */}
                 <div
                   class={`px-2 py-1 rounded mb-1.5 text-[11px] border ${
-                    p().fits
+                    acct()?.fitsRequested
                       ? 'bg-emerald-950/40 border-emerald-800 text-emerald-300'
-                      : 'bg-red-950/40 border-red-800 text-red-300'
+                      : acct()?.withinGrace
+                        ? 'bg-amber-950/40 border-amber-800 text-amber-200'
+                        : 'bg-red-950/40 border-red-800 text-red-300'
                   }`}
                 >
-                  {p().fits
-                    ? `fits — ${p().finalTokens.toLocaleString()} of ${p().budgetTokens.toLocaleString()} tok`
-                    : `DOES NOT FIT — ${p().finalTokens.toLocaleString()} tok vs ${p().budgetTokens.toLocaleString()} budget`}
-                  <Show when={!p().fits && p().exhausted}>
+                  <Show when={acct()?.fitsRequested}>
+                    <div>
+                      fits — {p().finalTokens.toLocaleString()} of{' '}
+                      {acct()!.effectiveBudgetTokens.toLocaleString()} usable tok
+                    </div>
+                  </Show>
+                  <Show when={!acct()?.fitsRequested && acct()?.withinGrace}>
+                    <div>
+                      OVER REQUESTED BUDGET — {p().finalTokens.toLocaleString()} tok vs{' '}
+                      {acct()!.effectiveBudgetTokens.toLocaleString()} usable
+                    </div>
                     <div class="text-[10px] opacity-90 mt-0.5">
-                      picker exhausted: nothing further can be folded. Applying this would
-                      hard-fail the compile.
+                      it would not hard-fail, but only because the grace margin absorbs the
+                      overshoot (ceiling {acct()!.rejectionBudgetTokens?.toLocaleString()}).
+                      The context would run above your target indefinitely.
+                    </div>
+                  </Show>
+                  <Show when={acct() && !acct()!.fitsRequested && acct()!.withinGrace === false}>
+                    <div>
+                      WOULD HARD-FAIL — {p().finalTokens.toLocaleString()} tok exceeds even the
+                      grace ceiling {acct()!.rejectionBudgetTokens?.toLocaleString()}
+                    </div>
+                  </Show>
+                  <Show when={acct()?.unreachable}>
+                    <div class="text-[10px] opacity-90 mt-0.5">
+                      <b>unreachable:</b> the picker exhausted — nothing further can be folded,
+                      so this budget cannot be reached no matter how long you wait.
                     </div>
                   </Show>
                 </div>
@@ -378,6 +425,10 @@ export function SettingsPanel(props: {
                 <table class="w-full font-mono text-[10px]">
                   <tbody>
                     <For each={[
+                      ['requested budget', acct()?.requestedBudgetTokens],
+                      ['− reserve for response', acct()?.reserveForResponseTokens],
+                      ['= usable for context', acct()?.effectiveBudgetTokens],
+                      ['grace ceiling (hard fail above)', acct()?.rejectionBudgetTokens],
                       ['head (verbatim)', p().headTokens],
                       ['tail (verbatim)', p().tailTokens],
                       ['middle (foldable)', p().middleTokens],
@@ -389,7 +440,11 @@ export function SettingsPanel(props: {
                         <tr>
                           <td class="text-neutral-500 pr-2">{k}</td>
                           <td class="text-neutral-300 text-right tabular-nums">
-                            {typeof v === 'number' ? v.toLocaleString() : String(v)}
+                            {typeof v === 'number'
+                              ? v.toLocaleString()
+                              : v === undefined || v === null
+                                ? '–'
+                                : String(v)}
                           </td>
                         </tr>
                       )}
