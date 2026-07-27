@@ -232,6 +232,13 @@ function rawChannelId(mcplId: string): string {
   return ix === -1 ? mcplId : mcplId.slice(ix + 1);
 }
 
+/** Channel-bound inference traces carry `channelId` at runtime, but the
+ *  framework's TraceEvent union doesn't declare it — read it through a cast. */
+function traceChannelId(event: unknown): string | undefined {
+  const v = (event as { channelId?: unknown }).channelId;
+  return typeof v === 'string' ? v : undefined;
+}
+
 const collapseWs = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
 export class TtsRelayModule implements Module {
@@ -338,18 +345,41 @@ export class TtsRelayModule implements Module {
   }
 
   private onTraceEvent(event: TraceEvent): void {
+    // `mcpl:speech-routed` is a custom trace type emitted by the speech
+    // router, not part of the framework's TraceEvent union — the typed
+    // switch below could never narrow to it. Handle it up front via the
+    // standard custom-trace cast.
+    if ((event as { type: string }).type === 'mcpl:speech-routed') {
+      // Remember what landed where, so an interruption can find its edit
+      // target: (channelId, messageId, text) per posted segment.
+      const e = event as unknown as {
+        channelId: string; messageId?: string; text: string; timestamp: number;
+      };
+      this.routed.push({
+        rawChannelId: rawChannelId(e.channelId),
+        mcplChannelId: e.channelId,
+        messageId: e.messageId,
+        text: e.text,
+        at: e.timestamp,
+      });
+      if (this.routed.length > ROUTED_RING_MAX) {
+        this.routed.splice(0, this.routed.length - ROUTED_RING_MAX);
+      }
+      return;
+    }
+
     switch (event.type) {
       case 'inference:started': {
         // A context-budget restart re-emits inference:started mid-turn; the
         // existing activation (announced or not) simply carries on.
         const st = this.activation(event.agentName);
-        this.adoptChannel(st, event.agentName, event.channelId);
+        this.adoptChannel(st, event.agentName, traceChannelId(event));
         break;
       }
 
       case 'inference:tokens': {
         const st = this.activation(event.agentName);
-        this.adoptChannel(st, event.agentName, event.channelId);
+        this.adoptChannel(st, event.agentName, traceChannelId(event));
         if (!st.rawChannelId) break; // no locus — nothing to voice into
         st.blocks.set(event.blockIndex, (st.blocks.get(event.blockIndex) ?? '') + event.content);
         this.client?.emit('chunk', {
@@ -367,7 +397,7 @@ export class TtsRelayModule implements Module {
 
       case 'inference:content_block': {
         const st = this.activation(event.agentName);
-        this.adoptChannel(st, event.agentName, event.channelId);
+        this.adoptChannel(st, event.agentName, traceChannelId(event));
         if (!st.rawChannelId) break;
         const base = {
           channelId: st.rawChannelId,
@@ -398,21 +428,6 @@ export class TtsRelayModule implements Module {
         this.endActivation(event.agentName, 'error');
         break;
 
-      case 'mcpl:speech-routed': {
-        // Remember what landed where, so an interruption can find its edit
-        // target: (channelId, messageId, text) per posted segment.
-        this.routed.push({
-          rawChannelId: rawChannelId(event.channelId),
-          mcplChannelId: event.channelId,
-          messageId: event.messageId,
-          text: event.text,
-          at: event.timestamp,
-        });
-        if (this.routed.length > ROUTED_RING_MAX) {
-          this.routed.splice(0, this.routed.length - ROUTED_RING_MAX);
-        }
-        break;
-      }
 
       default:
         break;
