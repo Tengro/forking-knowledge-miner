@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.7.2 — 2026-07-27
+
+### Added
+
+- **`LLM_CALLS_FULL_PAYLOADS` env flag** — retain the raw request on every
+  llm-call log entry, not only on refusal/error. Debugging aid; off by
+  default (the logs grow gigabytes fast with it on).
+
 ## 0.7.1 — 2026-07-26
 
 ### Changed
