@@ -47,6 +47,64 @@ export function fmtTokens(n: number): string {
   return String(n);
 }
 
+/** Format elapsed seconds for humans: 48s / 5m48s / 1h02m. */
+export function fmtElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const min = Math.floor(seconds / 60);
+  if (min < 60) return `${min}m${String(seconds % 60).padStart(2, '0')}s`;
+  return `${Math.floor(min / 60)}h${String(min % 60).padStart(2, '0')}m`;
+}
+
+/**
+ * How close a context is to its budget. Drives status-bar color escalation:
+ * the operator's real question is not "how many tokens" but "how close to
+ * compression/trouble" — a bare number can't answer that.
+ */
+export function ctxSeverity(ctx: number, budget?: number): 'ok' | 'warn' | 'high' {
+  if (!budget || budget <= 0 || ctx <= 0) return 'ok';
+  const frac = ctx / budget;
+  return frac >= 0.9 ? 'high' : frac >= 0.75 ? 'warn' : 'ok';
+}
+
+/** Alert kinds that always win the status-bar label, in priority order. */
+const ALERT_KIND_PRIORITY = ['compression-quarantine', 'inference-exhausted'];
+
+/**
+ * Which alert kind the status bar should name when several are active.
+ * Priority kinds (quarantine, hard-down) win; otherwise the most recent
+ * (= last inserted, since upserts keep their original Map position but new
+ * kinds append).
+ */
+export function pickTopAlert(kinds: string[]): string | null {
+  if (kinds.length === 0) return null;
+  for (const p of ALERT_KIND_PRIORITY) {
+    if (kinds.includes(p)) return p;
+  }
+  return kinds[kinds.length - 1] ?? null;
+}
+
+/**
+ * Viewport slice for a cursor-driven line list: which [start, end) range of
+ * `len` lines fits in `avail` rows while keeping `cursor` visible. Callers
+ * render a `┈ N above ┈` marker when start > 0 and `┈ N below ┈` when
+ * end < len — the marker rows are budgeted for here, which is why the body
+ * grows by one at either edge (that marker doesn't render).
+ */
+export function sliceViewport(len: number, cursor: number, avail: number): { start: number; end: number } {
+  if (len <= avail) return { start: 0, end: len };
+  const body = Math.max(1, avail - 2);
+  const start = Math.max(0, Math.min(cursor - Math.floor(body / 2), len - body));
+  const end = start + body;
+  if (start === 0) return { start, end: Math.min(len, Math.max(1, avail - 1)) };
+  if (end >= len) return { start: Math.max(0, len - Math.max(1, avail - 1)), end: len };
+  return { start, end };
+}
+
+/** Local wall-clock HH:MM, for event-line timestamps. */
+function hhmm(now = new Date()): string {
+  return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+}
+
 /**
  * What a submission at the armed /quit prompt means. Pure so the semantics
  * are pinned by tests: the default for arbitrary input is CANCEL — the
@@ -120,6 +178,10 @@ interface OpsAlertEntry {
 interface TuiState {
   status: string;
   tool: string | null;
+  /** When the currently-running root-agent tool started (epoch ms). Lets the
+   *  status bar show a running elapsed on slow tools — the "is it stuck?"
+   *  answer without switching views. */
+  toolStartedAt: number | null;
   subagents: ActiveSubagent[];
   /**
    * chat       — conversation + stream
@@ -223,6 +285,7 @@ export async function runTui(app: AppContext): Promise<void> {
   const state: TuiState = {
     status: 'idle',
     tool: null,
+    toolStartedAt: null,
     subagents: [],
     viewMode: 'chat',
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -245,7 +308,7 @@ export async function runTui(app: AppContext): Promise<void> {
     if (kind.endsWith('-clear')) {
       const baseKey = `${agent}:${kind.slice(0, -'-clear'.length)}`;
       if (opsAlerts.delete(baseKey)) {
-        addLine(`✓ [${agent}] ${kind}: ${message}`, CYAN);
+        addEvent(`✓ [${agent}] ${kind}: ${message}`, CYAN);
         updateStatus();
       }
       return;
@@ -254,7 +317,7 @@ export async function runTui(app: AppContext): Promise<void> {
     const existing = opsAlerts.get(key);
     opsAlerts.set(key, { kind, agent, message, count: (existing?.count ?? 0) + 1 });
     const times = existing ? ` (×${existing.count + 1})` : '';
-    addLine(`⚠ [${agent}] ${kind}${times}: ${message}`, RED);
+    addEvent(`⚠ [${agent}] ${kind}${times}: ${message}`, RED);
     updateStatus();
   }
 
@@ -502,12 +565,50 @@ export async function runTui(app: AppContext): Promise<void> {
     pruneScrollback();
   }
 
+  /** addLine with an HH:MM prefix — for *event* lines (alerts, tool batches,
+   *  subagent results, branch switches…): scrollback read an hour later is
+   *  useless without knowing WHEN things happened. Streamed prose and
+   *  immediate-feedback hints stay unstamped. */
+  function addEvent(text: string, color: string = WHITE) {
+    addLine(`${hhmm()} ${text}`, color);
+  }
+
+  /**
+   * Live context budget for an agent. Runtime overrides (persisted in the
+   * `framework/state` slot) win over the recipe — same seam the web module's
+   * /curve endpoint uses; reading only the recipe plots the wrong gauge on
+   * any agent whose budget was ever changed at runtime.
+   */
+  function getAgentBudget(name: string): number | undefined {
+    try {
+      const live = (app.framework as unknown as {
+        getAgentRuntimeSettings?: (n: string) => { contextBudgetTokens?: number } | undefined;
+      }).getAgentRuntimeSettings?.(name)?.contextBudgetTokens;
+      if (typeof live === 'number' && live > 0) return live;
+    } catch { /* fall through to recipe */ }
+    return name === rootAgentName ? app.recipe?.agent?.contextBudgetTokens : undefined;
+  }
+
   function updateStatus() {
-    statusLeft.content = formatStatusLeft(state, SPINNER[spinnerFrame], streamOutputTokens, opsAlerts.size);
+    const topAlert = pickTopAlert([...opsAlerts.values()].map(a => a.kind));
+    let left = formatStatusLeft(state, SPINNER[spinnerFrame], streamOutputTokens, opsAlerts.size, topAlert);
     // An active ops alert repaints the whole left segment — a one-cell glyph
     // in default gray is exactly the kind of signal that gets scrolled past.
     statusLeft.fg = opsAlerts.size > 0 ? RED : GRAY;
-    statusRight.content = formatTokens(state.tokens, verboseChat, state.ctxTokens) + formatMemStats(getRootCM());
+
+    const budget = getAgentBudget(rootAgentName);
+    const right = formatTokens(state.tokens, verboseChat, state.ctxTokens, budget) + formatMemStats(getRootCM());
+    // Same escalation as the ctx gauge itself: the right segment goes yellow
+    // at 75% of budget, red at 90% — visible even when the numbers aren't read.
+    const sev = ctxSeverity(state.ctxTokens, budget);
+    statusRight.fg = sev === 'high' ? RED : sev === 'warn' ? YELLOW : DIM_GRAY;
+    statusRight.content = right;
+
+    // Width budget: long tool names + peek target + alerts must lose to the
+    // tokens/mem segment, not shove it off the row.
+    const maxLeft = Math.max(12, renderer.terminalWidth - right.length - 4);
+    if (left.length > maxLeft) left = left.slice(0, maxLeft - 1) + '…';
+    statusLeft.content = left;
   }
 
   /** Best-effort handle to the root agent's ContextManager, for stats queries. */
@@ -522,6 +623,23 @@ export async function runTui(app: AppContext): Promise<void> {
   }
 
   let currentStreamBlockType: StreamBlockType = 'text';
+
+  // Terse mode (Ctrl+V off) collapses live thinking into a single counting
+  // line instead of streaming the full monologue — the toggle's label always
+  // promised "showing agent thoughts" but thinking streamed regardless.
+  let thinkingCollapsed = false;
+  let thinkingCollapsedChars = 0;
+
+  /** Freeze a collapsed thinking line at its final size when the stream
+   *  leaves the thinking lane (or ends). */
+  function finalizeCollapsedThinking() {
+    if (!thinkingCollapsed) return;
+    if (currentStreamText && currentStreamBlockType === 'thinking') {
+      currentStreamText.content = `${THINKING_PREFIX}(thought, ~${fmtTokens(Math.ceil(thinkingCollapsedChars / 4))} tok)`;
+    }
+    thinkingCollapsed = false;
+    thinkingCollapsedChars = 0;
+  }
 
   function beginStream() {
     currentStreamBuffer = '';
@@ -545,6 +663,7 @@ export async function runTui(app: AppContext): Promise<void> {
    */
   function switchStreamBlock(blockType: StreamBlockType) {
     if (currentStreamBlockType === blockType && currentStreamText) return;
+    if (blockType !== 'thinking') finalizeCollapsedThinking();
     // Tool blocks (tool_call / tool_result) aren't rendered as a stream lane
     // here — they're surfaced via the tool:* trace events instead. We still
     // need to update currentStreamBlockType so that when tokens swing back to
@@ -558,7 +677,11 @@ export async function runTui(app: AppContext): Promise<void> {
     currentStreamBuffer = '';
     currentStreamBlockType = blockType;
     if (blockType === 'thinking') {
-      currentStreamBuffer = THINKING_PREFIX;
+      if (!verboseChat) {
+        thinkingCollapsed = true;
+        thinkingCollapsedChars = 0;
+      }
+      currentStreamBuffer = thinkingCollapsed ? `${THINKING_PREFIX}thinking…` : THINKING_PREFIX;
       currentStreamText = new TextRenderable(renderer, {
         id: `stream-thinking-${++messageCounter}`,
         content: currentStreamBuffer,
@@ -576,27 +699,42 @@ export async function runTui(app: AppContext): Promise<void> {
   }
 
   function streamToken(text: string) {
-    if (currentStreamText) {
-      currentStreamBuffer += text;
-      currentStreamText.content = currentStreamBuffer;
+    if (!currentStreamText) return;
+    if (thinkingCollapsed && currentStreamBlockType === 'thinking') {
+      // Count instead of print: liveness without the wall of text.
+      thinkingCollapsedChars += text.length;
+      currentStreamText.content = `${THINKING_PREFIX}thinking… ~${fmtTokens(Math.ceil(thinkingCollapsedChars / 4))} tok`;
+      return;
     }
+    currentStreamBuffer += text;
+    currentStreamText.content = currentStreamBuffer;
   }
 
   function endStream() {
+    finalizeCollapsedThinking();
     streaming = false;
     currentStreamText = null;
     currentStreamBuffer = '';
     currentStreamBlockType = 'text';
   }
 
+  /** Replay at most this many messages on startup/branch-switch. A long
+   *  session replayed in full floods scrollback with thousands of lines
+   *  (thinking included) before the user can type; the full history is one
+   *  /curve or web-UI visit away. */
+  const HISTORY_REPLAY_MAX = 50;
+
   function loadSessionHistory() {
     const agent = app.framework.getAgent(rootAgentName);
     if (!agent) return;
     const cm = agent.getContextManager();
-    const messages = cm.getAllMessages();
-    if (messages.length === 0) return;
+    const all = cm.getAllMessages();
+    if (all.length === 0) return;
+    const messages = all.length > HISTORY_REPLAY_MAX ? all.slice(-HISTORY_REPLAY_MAX) : all;
 
-    addLine(`── session history (${messages.length} messages) ──`, DIM_GRAY);
+    addLine(messages.length < all.length
+      ? `── session history (last ${messages.length} of ${all.length} messages — full history in the web UI) ──`
+      : `── session history (${messages.length} messages) ──`, DIM_GRAY);
 
     for (const msg of messages) {
       const toolNames: string[] = [];
@@ -611,7 +749,10 @@ export async function runTui(app: AppContext): Promise<void> {
         } else if (block.type === 'thinking') {
           const t = (block as { thinking?: string }).thinking;
           if (t && t.trim()) {
-            addLine(`${THINKING_PREFIX}${t}`, THINKING_DIM);
+            // Replayed thinking is context, not content — one truncated line
+            // per block keeps the flavor without re-flooding scrollback.
+            const line = t.trim().replace(/\s+/g, ' ');
+            addLine(`${THINKING_PREFIX}${line.length > 120 ? line.slice(0, 117) + '…' : line}`, THINKING_DIM);
           }
         } else if (block.type === 'tool_use') {
           toolNames.push((block as { name: string }).name);
@@ -637,6 +778,8 @@ export async function runTui(app: AppContext): Promise<void> {
     streaming = false;
     currentStreamText = null;
     currentStreamBuffer = '';
+    thinkingCollapsed = false;
+    thinkingCollapsedChars = 0;
 
     // Clear conversation display (destroy frees the native text buffers)
     const children = [...scrollBox.getChildren()];
@@ -681,6 +824,10 @@ export async function runTui(app: AppContext): Promise<void> {
    *  child (a manual collapse afterward sticks). */
   const seenFleetHeaders = new Set<string>();
   let fleetCursor = 0;
+  /** Line index (within the tree-lines array) of the cursor's header row —
+   *  set during renderNode, consumed by the viewport slice so the cursor can
+   *  never walk below the fold into rows the terminal isn't showing. */
+  let fleetCursorLine = 0;
   /** Ordered list of node IDs in current rendering (for cursor navigation). */
   let visibleNodeIds: string[] = [];
   /** Maps node ID → FleetNode for the currently-rendered tree, so keypress
@@ -919,12 +1066,12 @@ export async function runTui(app: AppContext): Promise<void> {
         // Postmortem 2026-05-28 P1 #4: 'cancelled' is a third terminal state
         // (zombie reclaim, user cancel). Show it distinctly so the operator
         // can tell which subagents ended on a benign cancel vs. a fault.
-        statusTag = sa.status === 'completed' ? `done ${elapsed}s`
-          : sa.status === 'cancelled' ? `cancelled ${elapsed}s`
-          : `failed ${elapsed}s`;
+        statusTag = sa.status === 'completed' ? `done ${fmtElapsed(elapsed)}`
+          : sa.status === 'cancelled' ? `cancelled ${fmtElapsed(elapsed)}`
+          : `failed ${fmtElapsed(elapsed)}`;
       } else {
         const phase = subagentPhase.get(sa.name) ?? 'sending';
-        statusTag = `${phase} ${elapsed}s`;
+        statusTag = `${phase} ${fmtElapsed(elapsed)}`;
       }
     } else if (node.kind === 'fleet-child') {
       const fc = fleetMod?.getChildren().get(node.fleetChildName!);
@@ -935,15 +1082,15 @@ export async function runTui(app: AppContext): Promise<void> {
         // any agent is busy, surface that phase instead so the header
         // reflects what's actually happening.
         const active = rollupActivePhase(treeAggregator?.getChildNodes(node.fleetChildName!) ?? []);
-        statusTag = active ? `${active} ${elapsed}s` : `ready ${elapsed}s`;
+        statusTag = active ? `${active} ${fmtElapsed(elapsed)}` : `ready ${fmtElapsed(elapsed)}`;
       } else {
-        statusTag = fc ? `${fc.status} ${elapsed}s` : 'unknown';
+        statusTag = fc ? `${fc.status} ${fmtElapsed(elapsed)}` : 'unknown';
       }
     } else {
       // fleet-child-agent
       const rn = node.reducerNode!;
       const elapsed = rn.startedAt ? Math.floor(((rn.completedAt ?? Date.now()) - rn.startedAt) / 1000) : 0;
-      statusTag = `${rn.phase} ${elapsed}s`;
+      statusTag = `${rn.phase} ${fmtElapsed(elapsed)}`;
     }
 
     // Context size: local maps for researcher/subagent, reducer node for fleet-child-agent.
@@ -954,7 +1101,15 @@ export async function runTui(app: AppContext): Promise<void> {
     } else if (node.kind !== 'fleet-child') {
       ctxTokens = agentContextTokens.get(node.fullName) ?? agentContextTokens.get(node.name);
     }
-    const ctxStr = ctxTokens ? ` ${fmtK(ctxTokens)}ctx` : '';
+    // Local agents get the gauge form (142k/180k) — their budget is readable
+    // from this process. Fleet-child agents live in another process whose
+    // budgets we don't see over the IPC; a bare number is the honest display.
+    const ctxBudget = ctxTokens && node.kind !== 'fleet-child-agent' && node.kind !== 'fleet-child'
+      ? getAgentBudget(node.fullName)
+      : undefined;
+    const ctxStr = ctxTokens
+      ? (ctxBudget ? ` ${fmtK(ctxTokens)}/${fmtK(ctxBudget)}ctx` : ` ${fmtK(ctxTokens)}ctx`)
+      : '';
 
     // Compression stats (researcher only — we can access the strategy)
     let compStr = '';
@@ -977,6 +1132,7 @@ export async function runTui(app: AppContext): Promise<void> {
 
     // Header line (this is a navigable node)
     const isCursor = visibleNodeIds.length === fleetCursor;
+    if (isCursor) fleetCursorLine = lines.length;
     const cursor = isCursor ? '→' : ' ';
     visibleNodeIds.push(node.name);
     visibleNodes.set(node.name, node);
@@ -1081,30 +1237,97 @@ export async function runTui(app: AppContext): Promise<void> {
       if (state.viewMode === 'fleet') updateFleetView();
     }, 6000);
     // Also record it in scrollback so it survives after the notice fades.
-    addLine(`  ${text}`, RED);
+    addEvent(`  ${text}`, RED);
     if (state.viewMode === 'fleet') updateFleetView();
+  }
+
+  /** One-line fleet totals: local subagent states, fleet-child processes,
+   *  session cost. The at-a-glance row the ops view opens with. */
+  function fleetSummaryLine(): string {
+    let running = 0, done = 0, failed = 0, cancelled = 0;
+    for (const sa of state.subagents) {
+      if (sa.status === 'running') running++;
+      else if (sa.status === 'completed') done++;
+      else if (sa.status === 'cancelled') cancelled++;
+      else failed++;
+    }
+    // Fleet-child agents: count from the reducers, using the same phase
+    // classification the tree paints with. 'idle' is neither running nor
+    // done (a child's root agent idles between rounds), so it's not counted.
+    if (treeAggregator && fleetMod) {
+      for (const childName of fleetMod.getChildren().keys()) {
+        for (const rn of treeAggregator.getChildNodes(childName)) {
+          if (rn.status === 'failed') failed++;
+          else if (rn.phase === 'done') done++;
+          else if (rn.phase === 'cancelled') cancelled++;
+          else if (PHASE_PRIORITY[rn.phase as SubagentPhase] !== undefined) running++;
+        }
+      }
+    }
+    const parts: string[] = [];
+    const counts: string[] = [];
+    if (running > 0) counts.push(`${running} running`);
+    if (done > 0) counts.push(`${done} done`);
+    if (failed > 0) counts.push(`${failed} failed`);
+    if (cancelled > 0) counts.push(`${cancelled} cancelled`);
+    parts.push(counts.length > 0 ? `agents: ${counts.join(' · ')}` : 'agents: none');
+    if (fleetMod) {
+      const children = [...fleetMod.getChildren().values()];
+      if (children.length > 0) {
+        const up = children.filter(c => c.status === 'ready' || c.status === 'starting').length;
+        const crashed = children.filter(c => c.status === 'crashed').length;
+        parts.push(`children: ${up}/${children.length} up${crashed > 0 ? ` (${crashed} crashed)` : ''}`);
+      }
+    }
+    if (state.tokens.cost && state.tokens.cost.total > 0) {
+      parts.push(`Σ $${state.tokens.cost.total.toFixed(state.tokens.cost.total < 1 ? 3 : 2)}`);
+    }
+    return `  ${parts.join('   ')}`;
   }
 
   function updateFleetView() {
     const tree = buildFleetTree();
     visibleNodeIds = [];
     visibleNodes.clear();
+    fleetCursorLine = 0;
 
-    const lines: FleetLine[] = [];
-    lines.push({ text: '─── Agent Fleet ─── ↑↓:nav  ⏎/→:fold  p:peek  Del:stop  r:restart  Esc:chat ───', color: GRAY });
+    // Header block — pinned above the scrolling tree region.
+    const header: FleetLine[] = [];
+    header.push({ text: '─── Agent Fleet ─── ↑↓:nav  ⏎/→:fold  p:peek  Del:stop  r:restart  Esc:chat ───', color: GRAY });
     if (fleetNotice) {
-      lines.push({ text: `  ⚠ ${fleetNotice}`, color: RED });
+      header.push({ text: `  ⚠ ${fleetNotice}`, color: RED });
     }
-    lines.push({ text: '', color: GRAY });
+    // Active ops alerts, in full — the status bar only has room for a count,
+    // and the firing lines are somewhere back in chat scrollback. This is the
+    // ops view; the ringing klaxons belong at the top of it.
+    const alerts = [...opsAlerts.values()];
+    for (const a of alerts.slice(0, 3)) {
+      const msg = a.message.length > 70 ? a.message.slice(0, 67) + '…' : a.message;
+      header.push({ text: `  ⚠ [${a.agent}] ${a.kind}${a.count > 1 ? ` ×${a.count}` : ''} — ${msg}`, color: RED });
+    }
+    if (alerts.length > 3) {
+      header.push({ text: `  ⚠ … and ${alerts.length - 3} more`, color: RED });
+    }
+    header.push({ text: fleetSummaryLine(), color: GRAY });
+    header.push({ text: '', color: GRAY });
 
-    renderNode(tree, 0, lines);
+    const treeLines: FleetLine[] = [];
+    renderNode(tree, 0, treeLines);
 
     // Clamp cursor
     if (fleetCursor >= visibleNodeIds.length) fleetCursor = visibleNodeIds.length - 1;
     if (fleetCursor < 0) fleetCursor = 0;
 
-    lines.push({ text: '', color: GRAY });
-    lines.push({ text: '                                    Tab: chat', color: DIM_GRAY });
+    // Viewport: the tree region gets whatever rows the header leaves of the
+    // fleetBox (terminalHeight - 3: status bar, input row, paddingTop). Without
+    // this, a real fleet outgrows the terminal and the cursor walks below the
+    // fold — navigating (and Del:stopping) rows the operator cannot see.
+    const avail = Math.max(5, renderer.terminalHeight - 3 - header.length);
+    const { start, end } = sliceViewport(treeLines.length, fleetCursorLine, avail);
+    const lines: FleetLine[] = [...header];
+    if (start > 0) lines.push({ text: `  ┈ ${start} lines above ┈`, color: DIM_GRAY });
+    lines.push(...treeLines.slice(start, end));
+    if (end < treeLines.length) lines.push({ text: `  ┈ ${treeLines.length - end} lines below ┈`, color: DIM_GRAY });
 
     // Rebuild fleetBox children: clear old, add new per-line renderables
     clearFleetBox();
@@ -1152,7 +1375,7 @@ export async function runTui(app: AppContext): Promise<void> {
           : rn.phase === 'idle' || rn.phase === 'done' || rn.phase === 'cancelled' ? DIM_GRAY
           : PHASE_COLOR[rn.phase as SubagentPhase] ?? CYAN;
         const ctx = rn.tokens.input > 0 ? `  ${fmtK(rn.tokens.input)}ctx` : '';
-        lines.push({ text: `  ${rn.phase}  ${elapsed}s  ${rn.toolCallsCount} tool calls${ctx}`, color: phaseColor });
+        lines.push({ text: `  ${rn.phase}  ${fmtElapsed(elapsed)}  ${rn.toolCallsCount} tool calls${ctx}`, color: phaseColor });
         if (rn.task) {
           const task = rn.task.length > 70 ? rn.task.slice(0, 67) + '...' : rn.task;
           lines.push({ text: `  task: ${task}`, color: GRAY });
@@ -1165,9 +1388,7 @@ export async function runTui(app: AppContext): Promise<void> {
       }
     } else if (child) {
       const elapsed = Math.floor((Date.now() - child.startedAt) / 1000);
-      const min = Math.floor(elapsed / 60);
-      const sec = elapsed % 60;
-      const timeStr = min > 0 ? `${min}m${sec}s` : `${sec}s`;
+      const timeStr = fmtElapsed(elapsed);
       const statusColor =
         child.status === 'ready' ? CYAN :
         child.status === 'starting' ? YELLOW :
@@ -1400,9 +1621,7 @@ export async function runTui(app: AppContext): Promise<void> {
       // their final runtime, not a clock that keeps counting after done.
       const endTime = sa.completedAt ?? Date.now();
       const elapsed = Math.floor((endTime - sa.startedAt) / 1000);
-      const min = Math.floor(elapsed / 60);
-      const sec = elapsed % 60;
-      const timeStr = min > 0 ? `${min}m${sec}s` : `${sec}s`;
+      const timeStr = fmtElapsed(elapsed);
       const statusColor = sa.status === 'running' ? CYAN : sa.status === 'failed' ? RED : DIM_GRAY;
       lines.push({ text: `  ${sa.status}  ${timeStr}  ${sa.toolCallsCount} tool calls`, color: statusColor });
 
@@ -1557,12 +1776,13 @@ export async function runTui(app: AppContext): Promise<void> {
         if (agent === rootAgentName) {
           state.status = 'idle';
           state.tool = null;
+          state.toolStartedAt = null;
           if (backgrounded) {
             // Researcher returned from background — show accumulated output as a message
             if (backgroundBuffer.trim()) {
               addLine(backgroundBuffer, WHITE);
             }
-            addLine('  (researcher returned from background)', CYAN);
+            addEvent('  (researcher returned from background)', CYAN);
             backgrounded = false;
             backgroundBuffer = '';
           }
@@ -1600,14 +1820,14 @@ export async function runTui(app: AppContext): Promise<void> {
             backgroundBuffer = '';
           }
           if (streaming) endStream();
-          addLine(`Error: ${event.error}`, RED);
+          addEvent(`Error: ${event.error}`, RED);
           updateStatus();
         } else {
           if (agent) {
             const short = shortAgentName(agent);
             subagentPhase.set(short, 'failed');
           }
-          addLine(`[${agent}] Error: ${event.error}`, DIM_GRAY);
+          addEvent(`[${agent}] Error: ${event.error}`, DIM_GRAY);
         }
         break;
       }
@@ -1638,7 +1858,7 @@ export async function runTui(app: AppContext): Promise<void> {
           state.status = backgrounded ? 'background' : 'tools';
           state.tool = names;
           if (streaming) endStream();
-          if (!backgrounded) addLine(`[tools] ${names}`, YELLOW);
+          if (!backgrounded) addEvent(`[tools] ${names}`, YELLOW);
         } else {
           const short = shortAgentName(agent ?? '');
           addLine(`  [${short}] ${names}`, DIM_GRAY);
@@ -1670,7 +1890,7 @@ export async function runTui(app: AppContext): Promise<void> {
           const summary = (pe.metadata.eventSummary as string) ?? '';
           const snippet = summary.length > 60 ? summary.slice(0, 57) + '...' : summary;
           const label = subs.join(', ');
-          addLine(`\u2691 wake triggered: ${label} \u2014 "${snippet}"`, YELLOW);
+          addEvent(`\u2691 wake triggered: ${label} \u2014 "${snippet}"`, YELLOW);
         }
         break;
       }
@@ -1679,6 +1899,7 @@ export async function runTui(app: AppContext): Promise<void> {
         const tool = event.tool as string;
         if (agent === rootAgentName) {
           state.tool = tool;
+          state.toolStartedAt = Date.now();
           updateStatus();
         }
         // Show file operations in chat
@@ -1705,17 +1926,30 @@ export async function runTui(app: AppContext): Promise<void> {
         break;
       }
 
-      case 'tool:completed':
+      case 'tool:completed': {
+        // Root-agent tools used to be fire-and-forget: after "[tools] x, y"
+        // only failures ever printed, so success and stuck looked identical.
+        // Verbose shows every completion; terse only the slow ones (≥2s).
+        if (agent === rootAgentName) {
+          state.toolStartedAt = null;
+          const tool = event.tool as string;
+          const durMs = typeof event.durationMs === 'number' ? event.durationMs : undefined;
+          if (verboseChat || (durMs !== undefined && durMs >= 2000)) {
+            addLine(`  ✓ ${tool}${durMs !== undefined ? ` (${(durMs / 1000).toFixed(1)}s)` : ''}`, DIM_GRAY);
+          }
+        }
         break;
+      }
 
       case 'tool:failed': {
         const tool = event.tool as string;
         const error = event.error as string;
         if (agent === rootAgentName) {
-          addLine(`[tool error] ${tool}: ${error}`, RED);
+          state.toolStartedAt = null;
+          addEvent(`[tool error] ${tool}: ${error}`, RED);
         } else if (agent) {
           const short = shortAgentName(agent);
-          addLine(`  [${short}] tool error: ${tool}: ${error}`, RED);
+          addEvent(`  [${short}] tool error: ${tool}: ${error}`, RED);
         }
         break;
       }
@@ -1727,13 +1961,15 @@ export async function runTui(app: AppContext): Promise<void> {
         const source = event.source as string;
 
         if (branchEvent === 'switched') {
-          addLine(`Branch switched: ${previous ?? '?'} → ${branch} (via ${source})`, CYAN);
           resetBranchState(app.branchState);
+          // Announce AFTER the refresh — refreshFromStore clears the
+          // scrollbox, so a line printed first was destroyed unread.
           refreshFromStore();
+          addEvent(`Branch switched: ${previous ?? '?'} → ${branch} (via ${source})`, CYAN);
         } else if (branchEvent === 'created') {
-          addLine(`Branch created: ${branch} (via ${source})`, CYAN);
+          addEvent(`Branch created: ${branch} (via ${source})`, CYAN);
         } else if (branchEvent === 'deleted') {
-          addLine(`Branch deleted: ${branch} (via ${source})`, CYAN);
+          addEvent(`Branch deleted: ${branch} (via ${source})`, CYAN);
         }
         updateStatus();
         break;
@@ -1832,6 +2068,22 @@ export async function runTui(app: AppContext): Promise<void> {
         // Token streams would spam the log; the line-merge needed to show them
         // nicely is in peek-proc's dedicated renderer, not this formatter.
         return null;
+      }
+      case 'inference:content_block':
+      case 'inference:usage':
+      case 'usage:updated':
+        // High-frequency bookkeeping events — a `· type` dot line per block/
+        // round is pure noise between the lines that carry meaning.
+        return null;
+      case 'ops:alert': {
+        // The single most important thing a child can say must not fall
+        // through to the dim default-dot rendering.
+        const kind = typeof get('kind') === 'string' ? get('kind') as string : 'unknown';
+        const msg = typeof get('message') === 'string' ? get('message') as string : '';
+        const who = typeof get('agentName') === 'string' ? ` [${get('agentName') as string}]` : '';
+        return kind.endsWith('-clear')
+          ? { text: `✓${who} ${kind}: ${msg}`, color: CYAN }
+          : { text: `⚠${who} ${kind}: ${msg}`, color: RED };
       }
       case 'tool:started': return { text: `  ⟳ ${get('tool') as string}`, color: YELLOW };
       case 'tool:completed': return { text: `  ✓ ${get('tool') as string} (${get('durationMs') ?? '?'}ms)`, color: CYAN };
@@ -1940,7 +2192,7 @@ export async function runTui(app: AppContext): Promise<void> {
           // of the summary; terse shows a shorter, dimmer line.
           const limit = verboseChat ? 200 : 100;
           const chatTruncated = summary.length > limit ? summary.slice(0, limit - 3) + '...' : summary;
-          addLine(`  ◀ [${name}] ${chatTruncated}`, verboseChat ? CYAN : DIM_GRAY);
+          addEvent(`  ◀ [${name}] ${chatTruncated}`, verboseChat ? CYAN : DIM_GRAY);
           break;
         }
       }
@@ -2001,10 +2253,12 @@ export async function runTui(app: AppContext): Promise<void> {
       for (const sa of state.subagents) {
         subscribeSubagentStream(sa.name);
       }
-      updateStatus();
       if (state.viewMode === 'fleet') updateFleetView();
       else if (state.viewMode === 'peek') updatePeekView();
     }
+    // Unconditional: the spinner and the slow-tool elapsed readout repaint on
+    // this tick even when no subagent module is loaded.
+    updateStatus();
     if (fleetMod) {
       // Pick up fleet children that were launched after TUI init so the
       // aggregator can request describe + start folding their event stream.
@@ -2395,7 +2649,7 @@ export async function runTui(app: AppContext): Promise<void> {
           addLine(`  (unknown child: ${route.childName})`, RED);
           return;
         }
-        addLine(`You → @${route.childName}: ${route.content}`, CYAN);
+        addEvent(`You → @${route.childName}: ${route.content}`, CYAN);
         fleetMod.handleToolCall({
           id: `tui-route-${Date.now()}`,
           name: 'send',
@@ -2407,7 +2661,7 @@ export async function runTui(app: AppContext): Promise<void> {
         });
         return;
       }
-      addLine(`You: ${raw}`, GREEN);
+      addEvent(`You: ${raw}`, GREEN);
       const agent = app.framework.getAgent(rootAgentName);
       const agentBusy = agent && (agent.state.status === 'streaming' || agent.state.status === 'inferring' || agent.state.status === 'waiting_for_tools');
       state.status = agentBusy ? 'queued' : 'thinking';
@@ -2465,10 +2719,16 @@ function formatStatusLeft(
   spinnerChar?: string,
   outputTokens?: number,
   alertCount = 0,
+  topAlertKind: string | null = null,
 ): string {
   const sColor = state.status === 'idle' ? '✓' : state.status === 'error' ? '✗' : state.status === 'background' ? '↓' : state.status === 'queued' ? '⏳' : '…';
   let bar = `[${sColor} ${state.status}`;
-  if (alertCount > 0) bar += ` | ⚠ ${alertCount} alert${alertCount === 1 ? '' : 's'}`;
+  if (alertCount > 0) {
+    // Name the worst active alert — "⚠ 2 alerts" forces a trip back through
+    // scrollback to learn WHICH klaxon is ringing.
+    const kind = topAlertKind && topAlertKind.length > 26 ? topAlertKind.slice(0, 25) + '…' : topAlertKind;
+    bar += ` | ⚠ ${alertCount}${kind ? ` · ${kind}` : ''}`;
+  }
   if (spinnerChar !== undefined && state.status !== 'idle' && state.status !== 'error' && state.status !== 'background') {
     bar += ` ${spinnerChar}`;
     if (state.status === 'thinking' && outputTokens !== undefined && outputTokens > 0) {
@@ -2481,6 +2741,12 @@ function formatStatusLeft(
     // right status segment (tokens/cost/mem) clean off the row.
     const tool = state.tool.length > 40 ? state.tool.slice(0, 37) + '…' : state.tool;
     bar += ` | ${tool}`;
+    // Slow tool running: show elapsed so "still executing" and "stuck" stop
+    // looking identical. Repainted by the 500ms poll tick.
+    if (state.toolStartedAt) {
+      const secs = Math.floor((Date.now() - state.toolStartedAt) / 1000);
+      if (secs >= 5) bar += ` ${fmtElapsed(secs)}`;
+    }
   }
   const running = state.subagents.filter(s => s.status === 'running').length;
   if (running > 0) {
@@ -2501,12 +2767,17 @@ function formatStatusLeft(
   return bar;
 }
 
-function formatTokens(tokens: TokenUsage, verbose: boolean, ctxTokens = 0): string {
+function formatTokens(tokens: TokenUsage, verbose: boolean, ctxTokens = 0, ctxBudget?: number): string {
   const parts: string[] = [];
 
   // Current context size first, session totals (Σ) after — two different
-  // quantities, two labels.
-  if (ctxTokens > 0) parts.push(`ctx:${fmtTokens(ctxTokens)}`);
+  // quantities, two labels. With a known budget the readout is a gauge
+  // (142k/180k), not a trivia number.
+  if (ctxTokens > 0) {
+    parts.push(ctxBudget && ctxBudget > 0
+      ? `ctx:${fmtTokens(ctxTokens)}/${fmtTokens(ctxBudget)}`
+      : `ctx:${fmtTokens(ctxTokens)}`);
+  }
 
   const total = tokens.input + tokens.output;
   if (total > 0) {
