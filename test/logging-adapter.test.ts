@@ -100,6 +100,39 @@ describe('LoggingAnthropicAdapter request logging', () => {
     expect(internals.refusalRawRequest(refusal, rawRequest)).toBe(rawRequest);
   });
 
+  test('LLM_CALLS_FULL_PAYLOADS=1 retains the raw request on every call', () => {
+    const prev = process.env.LLM_CALLS_FULL_PAYLOADS;
+    process.env.LLM_CALLS_FULL_PAYLOADS = '1';
+    try {
+      const full = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null');
+      const fi = full as unknown as typeof internals;
+      const rawRequest = { messages: ['forensic context'] };
+      const success = { raw: { stop_reason: 'end_turn' } } as unknown as ProviderResponse;
+      const refusal = { raw: { stop_reason: 'refusal' } } as unknown as ProviderResponse;
+      expect(fi.refusalRawRequest(success, rawRequest)).toBe(rawRequest);
+      expect(fi.refusalRawRequest(refusal, rawRequest)).toBe(rawRequest);
+    } finally {
+      if (prev === undefined) delete process.env.LLM_CALLS_FULL_PAYLOADS;
+      else process.env.LLM_CALLS_FULL_PAYLOADS = prev;
+    }
+  });
+
+  test('LLM_CALLS_FULL_PAYLOADS off-values keep refusal-only behavior', () => {
+    const prev = process.env.LLM_CALLS_FULL_PAYLOADS;
+    try {
+      for (const off of ['', '0', 'false', 'FALSE']) {
+        process.env.LLM_CALLS_FULL_PAYLOADS = off;
+        const a = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null');
+        const ai = a as unknown as typeof internals;
+        const success = { raw: { stop_reason: 'end_turn' } } as unknown as ProviderResponse;
+        expect(ai.refusalRawRequest(success, { m: 1 })).toBeUndefined();
+      }
+    } finally {
+      if (prev === undefined) delete process.env.LLM_CALLS_FULL_PAYLOADS;
+      else process.env.LLM_CALLS_FULL_PAYLOADS = prev;
+    }
+  });
+
   test('forwards authoritative billing buckets from the provider response', () => {
     const calls: ProviderCallRecord[] = [];
     const observed = new LoggingAnthropicAdapter(

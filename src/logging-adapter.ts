@@ -43,6 +43,11 @@ export type ProviderCallObserver = (record: ProviderCallRecord) => void;
  *  system-prompt-append uses). */
 const OAUTH_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+/** Truthy env-flag parse: unset/''/'0'/'false' (any case) are off. */
+function envFlag(value: string | undefined): boolean {
+  return value !== undefined && value !== '' && value !== '0' && value.toLowerCase() !== 'false';
+}
+
 export class LoggingAnthropicAdapter extends AnthropicAdapter {
   private readonly logPath: string;
   private readonly getReasoning?: ReasoningGetter;
@@ -50,6 +55,14 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   /** True when authenticated with an OAuth/Bearer token instead of an API
    *  key; requests then need the identity block prepended (see above). */
   private readonly oauthMode: boolean;
+  /** LLM_CALLS_FULL_PAYLOADS=1: retain the full raw request on EVERY call,
+   *  not just refusals/errors. Purpose: pass/refusal contrast corpora — a
+   *  refusal's payload is only interpretable next to the passing payloads
+   *  around it (classifier-forensics finding, 2026-07-27: verdicts are a
+   *  near-deterministic function of the payload, so adjacent pairs isolate
+   *  the differentiator). Costs disk, not memory (the raw request is already
+   *  captured per-call for the summary); pair with llm-calls rotation. */
+  private readonly fullPayloads: boolean = envFlag(process.env.LLM_CALLS_FULL_PAYLOADS);
 
   constructor(
     config: ConstructorParameters<typeof AnthropicAdapter>[0],
@@ -206,6 +219,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   }
 
   private refusalRawRequest(response: ProviderResponse, rawRequest: unknown): unknown {
+    if (this.fullPayloads) return rawRequest;
     const raw = (response as { raw?: { stop_reason?: string } }).raw;
     return raw?.stop_reason === 'refusal' ? rawRequest : undefined;
   }
