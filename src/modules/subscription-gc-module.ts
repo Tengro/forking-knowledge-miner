@@ -336,11 +336,22 @@ export class SubscriptionGcModule implements Module {
       // Cross the threshold → close and clear the counter.
       delete this.state.counters[channelId];
       this.persistNow();
+      // An agent-set NUMERIC budget for this channel is an explicit idle
+      // lease — the agent consented to auto-close at that budget, so the
+      // registry may close even an explicitly-opened channel. The global
+      // default is not consent; the registry refuses machine closes of
+      // explicit opens under it (issue #5).
+      const hasExplicitLease = typeof this.state.overrides[channelId] === 'number';
       const result = await this.ctx
         ?.callTool({
           id: `gc-unsub-${this.callSeq++}`,
           name: 'channel_close',
-          input: { channelId, serverId: this.serverId },
+          input: {
+            channelId,
+            serverId: this.serverId,
+            source: 'subscription-gc',
+            overrideExplicitOpen: hasExplicitLease,
+          },
         })
         .catch((err: unknown) => ({
           success: false,
@@ -349,6 +360,28 @@ export class SubscriptionGcModule implements Module {
         }));
 
       if (result && result.success) {
+        // Operator-side receipt (privacy-minimal: ids and thresholds, no
+        // content) — a GC close changes durable listening state and must
+        // not look spontaneous from outside the transcript. Duck-typed
+        // (same pattern as index.ts's notifyOps wiring): a framework
+        // without ModuleContext.notifyOps just skips the receipt.
+        const notifyOps = (this.ctx as unknown as {
+          notifyOps?: (kind: string, agent: string, message: string, data?: Record<string, unknown>) => void;
+        } | null)?.notifyOps;
+        notifyOps?.(
+          'subscription-gc-close',
+          this.ctx?.getAgents()[0]?.name ?? 'unknown',
+          `subscription-gc auto-closed channel ${channelId} (over ${limit} ambient chars ` +
+          `since last activation${hasExplicitLease ? ', agent-set budget' : ', default budget'}). ` +
+          `Restore: channel_open ${channelId}, or agent_settings channel_idle_limits.`,
+          {
+            channelId,
+            limitChars: limit,
+            decisionSource: 'subscription-gc',
+            lease: hasExplicitLease ? 'agent-set' : 'default',
+            restore: `channel_open ${channelId}`,
+          },
+        );
         return {
           addMessages: [
             {
@@ -367,6 +400,17 @@ export class SubscriptionGcModule implements Module {
           ],
         };
       }
+
+      // The registry refused because the channel was explicitly opened and
+      // we hold no lease: stand down quietly — the janitor doesn't argue
+      // with stated intent. The counter stays cleared, so the next refusal
+      // is at least a full budget away; if the channel's provenance later
+      // changes (reopened by policy), GC self-heals.
+      const refusal = (result as { data?: { refusal?: string } } | undefined)?.data?.refusal;
+      if (refusal === 'explicit-open') {
+        return {};
+      }
+
       // Close failed — keep the channel counted so we retry on the next
       // ambient message rather than silently giving up.
       this.state.counters[channelId] = next;
