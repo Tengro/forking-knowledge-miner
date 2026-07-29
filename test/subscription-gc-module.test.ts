@@ -306,7 +306,7 @@ describe('close provenance + explicit-open protection (issue #5)', () => {
     await m.stop();
   });
 
-  test('an agent-set numeric budget is an explicit lease: overrideExplicitOpen true', async () => {
+  test('a configured numeric budget is an explicit lease: overrideExplicitOpen true', async () => {
     const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
     const { ctx, toolCalls } = mockCtx();
     await m.start(ctx);
@@ -356,10 +356,21 @@ describe('close provenance + explicit-open protection (issue #5)', () => {
     const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
     const { ctx } = mockCtx();
     const receipts: Array<{ kind: string; agent: string; message: string; data?: Record<string, unknown> }> = [];
+    // The mock is deliberately `this`-sensitive, like the real
+    // ModuleContextImpl.notifyOps (which reads this.registry): a detached
+    // `const f = ctx.notifyOps; f(...)` throws here instead of passing —
+    // the exact bug class Sol caught in the first revision.
     Object.assign(ctx as object, {
       getAgents: () => [{ name: 'mythos' }],
-      notifyOps: (kind: string, agent: string, message: string, data?: Record<string, unknown>) => {
-        receipts.push({ kind, agent, message, data });
+      _receipts: receipts,
+      notifyOps(
+        this: { _receipts: typeof receipts },
+        kind: string,
+        agent: string,
+        message: string,
+        data?: Record<string, unknown>,
+      ) {
+        this._receipts.push({ kind, agent, message, data });
       },
     });
     await m.start(ctx);
@@ -376,6 +387,41 @@ describe('close provenance + explicit-open protection (issue #5)', () => {
     });
     // Privacy-minimal: the receipt names ids and thresholds, never content.
     expect(receipts[0].message).not.toContain('abcdef');
+
+    await m.stop();
+  });
+
+  test('a configured-budget close reports lease configured-budget, claiming no actor', async () => {
+    const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
+    const { ctx } = mockCtx();
+    const receipts: Array<{ message: string; data?: Record<string, unknown> }> = [];
+    Object.assign(ctx as object, {
+      getAgents: () => [{ name: 'mythos' }],
+      _receipts: receipts,
+      notifyOps(
+        this: { _receipts: typeof receipts },
+        _kind: string,
+        _agent: string,
+        message: string,
+        data?: Record<string, unknown>,
+      ) {
+        this._receipts.push({ message, data });
+      },
+    });
+    await m.start(ctx);
+
+    await m.handleToolCall({
+      id: 't1',
+      name: 'set_channel_idle_limit',
+      input: { channelId: 'discord:g1:c1', limit: 8 },
+    });
+    await m.onProcess(ambient('c1', 'abcdefghij'), PS); // 10 > 8
+    expect(receipts.length).toBe(1);
+    // The override state records no actor (agent, operator, or imported are
+    // all possible) — the receipt must not claim 'agent-set'.
+    expect(receipts[0].data?.lease).toBe('configured-budget');
+    expect(receipts[0].message).toContain('configured per-channel budget');
+    expect(receipts[0].message).not.toContain('agent-set');
 
     await m.stop();
   });

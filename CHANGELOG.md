@@ -8,11 +8,14 @@
   opens** (Discord issue #5, the Mythos "channel settings keep resetting"
   mechanism). GC closes are now recorded as `subscription-gc`, never
   `agent-tool`; a channel the resident/operator explicitly opened is no
-  longer auto-closed under the *default* budget — an agent-set per-channel
-  budget in `agent_settings.channel_idle_limits` counts as an explicit
-  idle lease and still closes at that budget. Pins and policy-opened
-  channels behave as before. Requires agent-framework with machine-close
-  provenance; against an older framework GC behaves as it did.
+  longer auto-closed under the *default* budget — a configured per-channel
+  numeric budget in `agent_settings.channel_idle_limits` counts as an
+  explicit idle lease and still closes at that budget. (The override state
+  records no actor — agent, operator, or imported are all possible — so
+  receipts say `configured-budget`, claiming no more than the state
+  proves.) Pins and policy-opened channels behave as before. Requires
+  agent-framework with machine-close provenance; against an older
+  framework GC behaves as it did.
 - **GC closes emit an operator-side ops receipt** (`subscription-gc-close`
   via the framework ops channel: failures.log + `ops:alert` trace +
   webhook) naming channel, threshold, decision source, and the restore
