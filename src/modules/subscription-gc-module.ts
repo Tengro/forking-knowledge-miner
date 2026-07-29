@@ -336,11 +336,25 @@ export class SubscriptionGcModule implements Module {
       // Cross the threshold → close and clear the counter.
       delete this.state.counters[channelId];
       this.persistNow();
+      // A CONFIGURED numeric budget for this channel is an explicit idle
+      // lease: someone chose a close-at-N budget for this specific channel,
+      // so the registry may close even an explicitly-opened one. The state
+      // does not record WHO configured it (agent via agent_settings,
+      // operator, or imported before these semantics existed), so nothing
+      // downstream may claim "agent-set" — receipts say 'configured-budget',
+      // actor unknown. The global default is not consent of any kind; the
+      // registry refuses machine closes of explicit opens under it (#5).
+      const hasConfiguredLease = typeof this.state.overrides[channelId] === 'number';
       const result = await this.ctx
         ?.callTool({
           id: `gc-unsub-${this.callSeq++}`,
           name: 'channel_close',
-          input: { channelId, serverId: this.serverId },
+          input: {
+            channelId,
+            serverId: this.serverId,
+            source: 'subscription-gc',
+            overrideExplicitOpen: hasConfiguredLease,
+          },
         })
         .catch((err: unknown) => ({
           success: false,
@@ -349,6 +363,34 @@ export class SubscriptionGcModule implements Module {
         }));
 
       if (result && result.success) {
+        // Operator-side receipt (privacy-minimal: ids and thresholds, no
+        // content) — a GC close changes durable listening state and must
+        // not look spontaneous from outside the transcript. Duck-typed
+        // against a framework that may not have ModuleContext.notifyOps yet
+        // (skipped there), and invoked THROUGH the context object: the real
+        // ModuleContextImpl.notifyOps reads `this`, so a detached
+        // `const f = ctx.notifyOps; f(...)` throws in production while
+        // passing against arrow-function mocks.
+        const opsCtx = this.ctx as unknown as {
+          notifyOps?: (kind: string, agent: string, message: string, data?: Record<string, unknown>) => void;
+        } | null;
+        opsCtx?.notifyOps?.(
+          'subscription-gc-close',
+          this.ctx?.getAgents()[0]?.name ?? 'unknown',
+          `subscription-gc auto-closed channel ${channelId} (over ${limit} ambient chars ` +
+          `since last activation${hasConfiguredLease ? ', configured per-channel budget' : ', default budget'}). ` +
+          `Restore: channel_open ${channelId}, or agent_settings channel_idle_limits.`,
+          {
+            channelId,
+            limitChars: limit,
+            decisionSource: 'subscription-gc',
+            // 'configured-budget' deliberately does NOT claim an actor: the
+            // override state records no provenance (agent, operator, or
+            // imported are all possible).
+            lease: hasConfiguredLease ? 'configured-budget' : 'default',
+            restore: `channel_open ${channelId}`,
+          },
+        );
         return {
           addMessages: [
             {
@@ -367,6 +409,17 @@ export class SubscriptionGcModule implements Module {
           ],
         };
       }
+
+      // The registry refused because the channel was explicitly opened and
+      // we hold no lease: stand down quietly — the janitor doesn't argue
+      // with stated intent. The counter stays cleared, so the next refusal
+      // is at least a full budget away; if the channel's provenance later
+      // changes (reopened by policy), GC self-heals.
+      const refusal = (result as { data?: { refusal?: string } } | undefined)?.data?.refusal;
+      if (refusal === 'explicit-open') {
+        return {};
+      }
+
       // Close failed — keep the channel counted so we retry on the next
       // ambient message rather than silently giving up.
       this.state.counters[channelId] = next;
