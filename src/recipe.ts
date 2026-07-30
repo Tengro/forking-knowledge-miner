@@ -191,6 +191,12 @@ export interface RecipeMcpServer {
   transport?: 'stdio' | 'websocket';
   /** Bearer token for WebSocket auth (appended as ?token= query param). */
   token?: string;
+  /**
+   * Name of a host-managed access grant (archipelago audience, e.g.
+   * "eidoverse"). Requires the `identity` module. The host resolves fresh
+   * credentials per dial; neither the recipe nor the agent holds one.
+   */
+  access?: string;
   toolPrefix?: string;
   enabledFeatureSets?: string[];
   disabledFeatureSets?: string[];

@@ -348,13 +348,15 @@ async function createFramework(
   // one-time and token refresh is rare, so it costs no tool slots (see
   // identity-module.ts header). Keypair lives at the dataDir level — an
   // identity belongs to the deployment, not the session.
+  let identityModule: IdentityModule | null = null;
   if (modules.identity !== undefined && modules.identity !== false) {
     const idCfg = typeof modules.identity === 'object' ? modules.identity : {};
-    moduleInstances.push(new IdentityModule({
+    identityModule = new IdentityModule({
       keyPath: process.env.IDENTITY_KEY_FILE || resolve(config.dataDir, 'identity-key.pem'),
       home: idCfg.home ?? process.env.IDENTITY_HOME ?? 'id.animalabs.ai',
       ...(idCfg.audience ? { defaultAudience: idCfg.audience } : {}),
-    }));
+    });
+    moduleInstances.push(identityModule);
   }
 
   // Web admin UI — opt-in per recipe
@@ -438,6 +440,7 @@ async function createFramework(
       if (recipeEntry.url !== undefined) merged.url = recipeEntry.url;
       if (recipeEntry.transport !== undefined) merged.transport = recipeEntry.transport;
       if (recipeEntry.token !== undefined) merged.token = recipeEntry.token;
+      if (recipeEntry.access !== undefined) merged.access = recipeEntry.access;
       allServers.push(merged as { id: string; command?: string; url?: string; [k: string]: unknown });
     } else if (recipeEntry.command || recipeEntry.url) {
       // Recipe-defined server (not in the file config). Spread ALL recipe fields
@@ -449,12 +452,30 @@ async function createFramework(
   // Apply the agent overlay (mcpl-servers.agent.json): servers the agent
   // deployed for itself load unconditionally (no recipe opt-in), and
   // tombstones suppress recipe/file servers the agent unloaded.
-  const finalServers = applyAgentOverlay(allServers, DEFAULT_AGENT_OVERLAY_PATH).map((server) => ({
-    ...server,
-    // Stdio MCPL children inherit a single agent-facing wall clock. Protocol
-    // timestamps remain UTC; only their rendered text uses this setting.
-    env: { ...(server.env ?? {}), AGENT_TIMEZONE: timeZone },
-  }));
+  const finalServers = applyAgentOverlay(allServers, DEFAULT_AGENT_OVERLAY_PATH).map((server) => {
+    const withEnv: { id: string; command?: string; url?: string; [k: string]: unknown } = {
+      ...server,
+      // Stdio MCPL children inherit a single agent-facing wall clock. Protocol
+      // timestamps remain UTC; only their rendered text uses this setting.
+      env: { ...(server.env ?? {}), AGENT_TIMEZONE: timeZone },
+    };
+    // `access` is a declarative name (recipe/file/overlay); the credential
+    // provider it implies is attached HERE, at load time — fresh credential
+    // per dial via the identity module, never serialized, never in model
+    // context (see identity-module.ts header).
+    if (typeof withEnv.access === 'string' && withEnv.access) {
+      if (identityModule) {
+        const identity = identityModule;
+        const audience = withEnv.access as string;
+        withEnv.tokenProvider = () => identity.getFreshToken(audience);
+      } else {
+        console.error(
+          `[mcpl] server "${server.id}": access "${withEnv.access}" declared but the recipe has no identity module — connecting without credentials`,
+        );
+      }
+    }
+    return withEnv;
+  });
 
   // No server augmentation needed — gate is wired via FrameworkConfig.gate
 
@@ -536,6 +557,7 @@ agents: [agentConfig],
 
   if (mcplAdminModule) {
     mcplAdminModule.setFramework(framework);
+    if (identityModule) mcplAdminModule.setIdentity(identityModule);
   }
 
   if (workspaceModule) {

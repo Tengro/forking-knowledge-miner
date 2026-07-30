@@ -88,6 +88,15 @@ export class McplAdminModule implements Module {
     this.framework = framework;
   }
 
+  /** Optional identity plumbing (index.ts wires it when the recipe enables
+   *  the identity module): lets deployed servers name an `access` grant that
+   *  the host turns into a per-dial credential provider. The agent names the
+   *  access; credentials never surface. */
+  private identity: { getFreshToken(audience?: string): Promise<string> } | null = null;
+  setIdentity(identity: { getFreshToken(audience?: string): Promise<string> } | null): void {
+    this.identity = identity;
+  }
+
   async start(_ctx: ModuleContext): Promise<void> {}
 
   async stop(): Promise<void> {
@@ -129,7 +138,8 @@ export class McplAdminModule implements Module {
             args: { type: 'array', items: { type: 'string' }, description: 'Arguments for the command.' },
             env: { type: 'object', description: 'Environment variables for the spawned process.' },
             url: { type: 'string', description: 'WebSocket URL (websocket transport). Mutually exclusive with command.' },
-            token: { type: 'string', description: 'Bearer token for WebSocket auth.' },
+            token: { type: 'string', description: 'Bearer token for WebSocket auth (only when the operator hands you one — prefer `access`).' },
+            access: { type: 'string', description: 'Name of a host-managed access grant (e.g. "eidoverse"): the host attaches your standing credentials to the connection automatically. Nothing for you to obtain or handle.' },
             toolPrefix: { type: 'string', description: 'Tool namespace prefix. Default: mcpl--<id>.' },
             reconnect: { type: 'boolean', description: 'Auto-reconnect on transport failure (default false). Note: does NOT respawn a crashed child — use mcpl_restart for that.' },
             enabledFeatureSets: { type: 'array', items: { type: 'string' } },
@@ -269,6 +279,15 @@ export class McplAdminModule implements Module {
     if (Array.isArray(input.args)) entry.args = input.args.map(String);
     if (input.env && typeof input.env === 'object') entry.env = input.env as Record<string, string>;
     if (typeof input.token === 'string') entry.token = input.token;
+    if (typeof input.access === 'string' && input.access.trim()) {
+      if (!this.identity) {
+        return fail(
+          '`access` names a host-managed access grant, but this deployment has no identity ' +
+          'configured — ask your operator to enable it (recipe `identity`), or supply a `token`.',
+        );
+      }
+      entry.access = input.access.trim();
+    }
     if (typeof input.toolPrefix === 'string') entry.toolPrefix = input.toolPrefix;
     if (typeof input.reconnect === 'boolean') entry.reconnect = input.reconnect;
     if (Array.isArray(input.enabledFeatureSets)) entry.enabledFeatureSets = input.enabledFeatureSets.map(String);
@@ -284,6 +303,13 @@ export class McplAdminModule implements Module {
 
     const config = resolveOverlayEntry(id, entry, this.overlayPath) as unknown as McplServerConfig;
     config.env = { ...(config.env ?? {}), AGENT_TIMEZONE: this.timeZone };
+    if (entry.access && this.identity) {
+      const identity = this.identity;
+      const audience = entry.access;
+      // Fresh credential on every dial, resolved host-side; the overlay
+      // stores only the access NAME. See identity-module.ts header.
+      config.tokenProvider = () => identity.getFreshToken(audience);
+    }
 
     const alreadyLoaded = framework.listMcplServers().some(s => s.id === id);
     try {

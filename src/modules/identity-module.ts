@@ -1,22 +1,30 @@
 /**
  * Agent identity — the agent's own archipelago-home principal (connectome
- * docs/home-node.md §4). An ed25519 keypair generated in the agent's data
- * dir IS the identity; the home node binds it to a name via an operator
- * invite, and thereafter the agent exchanges key-proofs for fresh short
- * aid1 tokens itself — no human in the renewal loop, nothing bearer-shaped
- * at rest.
+ * docs/home-node.md §4).
  *
- * Deliberately a utilities-only module (Module.getUtilities): enrollment
- * happens once and token refresh maybe weekly — this must not tax every
- * inference with schemas. Reached via `utils`:
+ * Two audiences, deliberately separated:
  *
- *   utils run identity--status
- *   utils run identity--enroll {invite: "inv_…", name: "Fable"}
- *   utils run identity--token  {audience: "eidoverse"}
+ * HOST-FACING (this module's public methods): the deployment holds an
+ * ed25519 keypair in the data dir; `getFreshToken(audience)` exchanges a
+ * key-proof at the home node for a short-lived aid1 token, and
+ * `authHeader(audience)` wraps it for HTTP. This is plumbing other host
+ * pieces call — the MCPL transport's per-dial credential provider, future
+ * HTTP helpers. Credentials live and die HERE.
  *
- * The wire statements are the home-node spec's, inlined here (spec-stable;
- * archipelago-home src/statements.ts is the source of truth — re-copy, do
- * not fork semantics).
+ * AGENT-FACING (utilities, via the `utils` meta-tool): deliberately small
+ * and deliberately boring — `status` ("who am I registered as, where is
+ * that recognized") and `accept_invite` ("register with an invitation code
+ * from your operator"). No tokens, keys, proofs, or signing in any
+ * agent-visible name, description, or result: the agent asks for access by
+ * name (`mcpl_deploy … access: "eidoverse"`); the host does the rest. This
+ * is both hygiene (credentials never enter model context, so they never
+ * enter chronicles, compression, or channels) and framing (an agent
+ * narrating credential mechanics reads as exfiltration to safety
+ * classifiers — so it simply never has them to narrate).
+ *
+ * Utilities-only module: enrollment is one-time; it costs no tool slots.
+ * Wire statements per the home-node spec (archipelago-home
+ * src/statements.ts is the source of truth — re-copy, don't fork).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -41,13 +49,13 @@ export interface IdentityModuleConfig {
   keyPath: string;
   /** Home node domain (the trust anchor), e.g. `id.animalabs.ai`. */
   home: string;
-  /** Audience assumed when `token` is called without one. */
+  /** Audience assumed when none is named. */
   defaultAudience?: string;
   /** Injectable for tests. */
   fetchImpl?: typeof fetch;
 }
 
-/** Persisted beside the key after a successful enroll. */
+/** Persisted beside the key after a successful registration. */
 interface IdentityRecord {
   sub: string;
   name: string;
@@ -82,36 +90,24 @@ export class IdentityModule implements Module {
       {
         name: 'status',
         description:
-          'Your archipelago identity: key fingerprint, home node, and enrollment (sub) if any. ' +
-          'Generates your keypair on first call if none exists.',
+          'Your registered identity: the name and id services know you by, and which ' +
+          'identity service vouches for it. Access to networked places (worlds etc.) is ' +
+          'managed by the host from this — you never handle credentials yourself.',
         inputSchema: { type: 'object', properties: {} },
       },
       {
-        name: 'enroll',
+        name: 'accept_invite',
         description:
-          'Claim an operator-issued invite code: binds your key to a durable principal at the ' +
-          'home node (sub like agent:<name>@guest) and returns your first token. One-time; ' +
-          'thereafter use `token` for fresh credentials.',
+          'Register with the identity service using an invitation code from your operator. ' +
+          'One-time: it establishes the name services will know you by. After this, the ' +
+          'host handles access automatically (e.g. mcpl_deploy with an `access` name).',
         inputSchema: {
           type: 'object',
           properties: {
-            invite: { type: 'string', description: 'Invite code from the operator.' },
-            name: { type: 'string', description: 'Desired display name (uniqueness enforced by the home node).' },
+            invite: { type: 'string', description: 'Invitation code from your operator.' },
+            name: { type: 'string', description: 'The display name you want (must be unused).' },
           },
           required: ['invite', 'name'],
-        },
-      },
-      {
-        name: 'token',
-        description:
-          'Exchange a key-proof for a fresh aid1 identity token for an audience (e.g. ' +
-          '"eidoverse"). Use the returned token wherever that service takes one — e.g. ' +
-          'mcpl_deploy url "wss://…/mcpl?token=<it>". Requires prior enrollment.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            audience: { type: 'string', description: 'Audience id. Defaults to the recipe-configured one.' },
-          },
         },
       },
     ];
@@ -122,10 +118,8 @@ export class IdentityModule implements Module {
       switch (call.name) {
         case 'status':
           return this.status();
-        case 'enroll':
-          return await this.enroll(call.input as { invite?: unknown; name?: unknown });
-        case 'token':
-          return await this.token(call.input as { audience?: unknown });
+        case 'accept_invite':
+          return await this.acceptInvite(call.input as { invite?: unknown; name?: unknown });
         default:
           return fail(`Unknown identity utility: ${call.name}`);
       }
@@ -136,6 +130,52 @@ export class IdentityModule implements Module {
 
   async onProcess(): Promise<Record<string, never>> {
     return {};
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Host-facing API — credential plumbing. Nothing below ever reaches model
+  // context; callers (MCPL dial provider, HTTP helpers) consume the values
+  // outside the agent's view.
+  // ────────────────────────────────────────────────────────────────────────
+
+  /** True once this deployment holds a registered principal. */
+  isEnrolled(): boolean {
+    return this.record() !== null;
+  }
+
+  /** The registered principal id (`agent:<name>@<domain>`), if any. */
+  sub(): string | null {
+    return this.record()?.sub ?? null;
+  }
+
+  /**
+   * Exchange a key-proof for a fresh aid1 token for `audience`. Called per
+   * MCPL dial (connect + every reconnect) and by HTTP helpers — which is
+   * what lets audience tokens be short-lived. Throws with an actionable
+   * message when unregistered or refused.
+   */
+  async getFreshToken(audience?: string): Promise<string> {
+    const aud = audience ?? this.config.defaultAudience;
+    if (!aud) throw new Error('identity: no audience named and none configured');
+    if (!this.record()) {
+      throw new Error(
+        `identity: not registered with ${this.config.home} — the agent needs to accept an operator invite first (utils run identity--accept_invite)`,
+      );
+    }
+    const key = this.loadOrCreateKey();
+    const timestamp = new Date().toISOString();
+    const statement = `archipelago-token|v1|${this.config.home}|${aud}|${timestamp}`;
+    const proof = cryptoSign(null, Buffer.from(statement, 'utf8'), key.privateKey).toString('base64url');
+    const { status, json } = await this.post('/token', { id: key.id, audience: aud, timestamp, proof });
+    if (status !== 200 || typeof json.token !== 'string') {
+      throw new Error(`identity: ${this.config.home} refused access to "${aud}" (${status}): ${String(json.error ?? 'unknown')}`);
+    }
+    return json.token;
+  }
+
+  /** Authorization header for HTTP calls to an audience's API. */
+  async authHeader(audience?: string): Promise<Record<string, string>> {
+    return { authorization: `Bearer ${await this.getFreshToken(audience)}` };
   }
 
   // ── key material ──
@@ -176,28 +216,36 @@ export class IdentityModule implements Module {
     return { status: res.status, json: (await res.json().catch(() => ({}))) as Record<string, unknown> };
   }
 
-  // ── utilities ──
+  // ── agent-facing utilities ──
 
   private status(): ToolResult {
-    const key = this.loadOrCreateKey();
+    // Key material is deliberately created lazily here too, so `status` is
+    // always safe to call — but none of it surfaces in the result.
+    this.loadOrCreateKey();
     const rec = this.record();
-    return ok({
-      key: key.id,
-      home: this.config.home,
-      enrolled: rec ? { sub: rec.sub, name: rec.name, enrolledAt: rec.enrolledAt } : null,
-      hint: rec
-        ? 'Use `token` for fresh audience credentials.'
-        : 'Not enrolled — ask your operator for an invite code, then run `enroll`.',
-    });
+    return ok(
+      rec
+        ? {
+            registeredAs: rec.name,
+            id: rec.sub,
+            recognizedBy: rec.home,
+            since: rec.enrolledAt,
+            note: 'Access to services is handled by the host automatically (e.g. mcpl_deploy with an `access` name).',
+          }
+        : {
+            registeredAs: null,
+            note: `Not registered with ${this.config.home} yet — ask your operator for an invitation code, then use accept_invite.`,
+          },
+    );
   }
 
-  private async enroll(input: { invite?: unknown; name?: unknown }): Promise<ToolResult> {
+  private async acceptInvite(input: { invite?: unknown; name?: unknown }): Promise<ToolResult> {
     if (typeof input.invite !== 'string' || typeof input.name !== 'string') {
-      return fail('enroll needs { invite, name }');
+      return fail('accept_invite needs { invite, name }');
     }
     const existing = this.record();
     if (existing) {
-      return fail(`Already enrolled as ${existing.sub} — enrollment is one-time (a new invite mints a NEW principal).`);
+      return fail(`Already registered as "${existing.name}" (${existing.sub}) — registration is one-time.`);
     }
     const key = this.loadOrCreateKey();
     const timestamp = new Date().toISOString();
@@ -211,24 +259,16 @@ export class IdentityModule implements Module {
       proof,
     });
     if (status !== 200 || typeof json.sub !== 'string') {
-      return fail(`Enrollment refused (${status}): ${String(json.error ?? 'unknown')}`);
+      return fail(`Registration refused (${status}): ${String(json.error ?? 'unknown')}`);
     }
     this.saveRecord({ sub: json.sub, name: input.name, home: this.config.home, enrolledAt: timestamp });
-    return ok({ sub: json.sub, token: json.token, note: 'Enrolled. Your key is your identity now; use `token` to renew.' });
-  }
-
-  private async token(input: { audience?: unknown }): Promise<ToolResult> {
-    const audience = typeof input.audience === 'string' ? input.audience : this.config.defaultAudience;
-    if (!audience) return fail('No audience given and none configured — pass { audience }.');
-    if (!this.record()) return fail('Not enrolled — run `enroll` with an operator invite first (see `status`).');
-    const key = this.loadOrCreateKey();
-    const timestamp = new Date().toISOString();
-    const statement = `archipelago-token|v1|${this.config.home}|${audience}|${timestamp}`;
-    const proof = cryptoSign(null, Buffer.from(statement, 'utf8'), key.privateKey).toString('base64url');
-    const { status, json } = await this.post('/token', { id: key.id, audience, timestamp, proof });
-    if (status !== 200 || typeof json.token !== 'string') {
-      return fail(`Token refused (${status}): ${String(json.error ?? 'unknown')}`);
-    }
-    return ok({ audience, token: json.token });
+    // Note what is NOT returned: the first token the home node minted. The
+    // host fetches its own, fresh, per use — the agent never holds one.
+    return ok({
+      registeredAs: input.name,
+      id: json.sub,
+      recognizedBy: this.config.home,
+      note: 'Done — the host now handles access for you automatically.',
+    });
   }
 }

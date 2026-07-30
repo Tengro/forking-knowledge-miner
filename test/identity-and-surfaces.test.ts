@@ -1,11 +1,16 @@
 // Identity module (archipelago-home client) + the tools↔utilities surface
 // flags on mcpl-admin and observers. See docs/home-node.md §4 and the af
 // utils meta-tool (Module.getUtilities).
+//
+// Design under test: the AGENT surface is credential-free (status /
+// accept_invite, no tokens in any result); credentials exist only on the
+// HOST-facing API (getFreshToken/authHeader) that the MCPL dial provider
+// and HTTP helpers consume outside model context.
 import { describe, it, expect } from 'bun:test';
 import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateKeyPairSync, createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
 
 import { IdentityModule } from '../src/modules/identity-module.ts';
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.ts';
@@ -25,21 +30,27 @@ function fakeHome(routes: Record<string, (body: any) => { status: number; json: 
 }
 
 describe('identity module', () => {
-  it('is utilities-only and status mints a 0600 keypair on first use', async () => {
+  it('is utilities-only, and the agent surface never mentions or returns credentials', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ident-'));
     const mod = new IdentityModule({ keyPath: join(dir, 'identity-key.pem'), home: 'id.test' });
     expect(mod.getTools()).toEqual([]);
-    expect(mod.getUtilities().map((u) => u.name)).toEqual(['status', 'enroll', 'token']);
+    expect(mod.getUtilities().map((u) => u.name)).toEqual(['status', 'accept_invite']);
+    // Framing check: no crypto/credential vocabulary in agent-visible text.
+    const visible = JSON.stringify(mod.getUtilities()).toLowerCase();
+    for (const scary of ['token', 'key', 'sign', 'proof', 'ed25519', 'mint', 'bearer']) {
+      expect(visible).not.toContain(scary);
+    }
 
     const res = await mod.handleToolCall(call('status', {}));
     expect(res.success).toBe(true);
-    const data = res.data as { key: string; enrolled: unknown };
-    expect(data.key.startsWith('ed25519:')).toBe(true);
-    expect(data.enrolled).toBe(null);
+    const data = res.data as { registeredAs: unknown; note: string };
+    expect(data.registeredAs).toBe(null);
+    expect(data.note).toContain('invitation code');
+    expect(JSON.stringify(res.data)).not.toContain('ed25519'); // key exists on disk, not in results
     expect(existsSync(join(dir, 'identity-key.pem'))).toBe(true);
   });
 
-  it('enroll signs the spec statement, persists the record, and is one-time', async () => {
+  it('accept_invite registers, echoes NO credential, and is one-time', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ident-'));
     let seen: any = null;
     const mod = new IdentityModule({
@@ -48,15 +59,17 @@ describe('identity module', () => {
       fetchImpl: fakeHome({
         '/enroll': (body) => {
           seen = body;
-          return { status: 200, json: { sub: 'agent:ferro@guest', token: 'aid1.x.y' } };
+          return { status: 200, json: { sub: 'agent:ferro@guest', token: 'aid1.SECRET.x' } };
         },
       }),
     });
-    const res = await mod.handleToolCall(call('enroll', { invite: 'inv_1', name: 'Ferro' }));
+    const res = await mod.handleToolCall(call('accept_invite', { invite: 'inv_1', name: 'Ferro' }));
     expect(res.success).toBe(true);
-    expect((res.data as any).sub).toBe('agent:ferro@guest');
+    expect((res.data as any).id).toBe('agent:ferro@guest');
+    // The home node's response token must NOT reach the agent.
+    expect(JSON.stringify(res.data)).not.toContain('aid1.');
 
-    // proof verifies against the module's own key over the exact spec statement
+    // Wire-level: the signed statement is the spec's, verifiable by the module's own key.
     const raw = Buffer.from(seen.id.slice('ed25519:'.length), 'base64url');
     const key = createPublicKey({
       key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), raw]),
@@ -68,13 +81,14 @@ describe('identity module', () => {
     const rec = JSON.parse(readFileSync(join(dir, 'k.json'), 'utf8'));
     expect(rec.sub).toBe('agent:ferro@guest');
 
-    const again = await mod.handleToolCall(call('enroll', { invite: 'inv_2', name: 'Ferro2' }));
+    const again = await mod.handleToolCall(call('accept_invite', { invite: 'inv_2', name: 'Ferro2' }));
     expect(again.success).toBe(false);
-    expect(again.error).toContain('Already enrolled');
+    expect(again.error).toContain('Already registered');
   });
 
-  it('token requires enrollment, then exchanges a key-proof', async () => {
+  it('host-facing getFreshToken: requires registration, then exchanges per call', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    let mints = 0;
     const mod = new IdentityModule({
       keyPath: join(dir, 'k.pem'),
       home: 'id.test',
@@ -82,27 +96,43 @@ describe('identity module', () => {
       fetchImpl: fakeHome({
         '/enroll': () => ({ status: 200, json: { sub: 'agent:a@guest', token: 't0' } }),
         '/token': (body) => body.audience === 'eidoverse'
-          ? { status: 200, json: { token: 'aid1.fresh.tok' } }
+          ? { status: 200, json: { token: `aid1.fresh.${++mints}` } }
           : { status: 400, json: { error: 'unknown audience' } },
       }),
     });
-    const early = await mod.handleToolCall(call('token', {}));
-    expect(early.success).toBe(false);
-    expect(early.error).toContain('Not enrolled');
+    await expect(mod.getFreshToken()).rejects.toThrow(/not registered/);
 
-    await mod.handleToolCall(call('enroll', { invite: 'i', name: 'A' }));
-    const res = await mod.handleToolCall(call('token', {}));
-    expect(res.success).toBe(true);
-    expect((res.data as any).token).toBe('aid1.fresh.tok');
-
-    const refused = await mod.handleToolCall(call('token', { audience: 'nope' }));
-    expect(refused.success).toBe(false);
-    expect(refused.error).toContain('unknown audience');
+    await mod.handleToolCall(call('accept_invite', { invite: 'i', name: 'A' }));
+    expect(await mod.getFreshToken()).toBe('aid1.fresh.1');
+    expect(await mod.getFreshToken('eidoverse')).toBe('aid1.fresh.2'); // fresh per call — dial-time rotation
+    expect((await mod.authHeader()).authorization).toBe('Bearer aid1.fresh.3');
+    await expect(mod.getFreshToken('nope')).rejects.toThrow(/unknown audience/);
+    expect(mod.isEnrolled()).toBe(true);
+    expect(mod.sub()).toBe('agent:a@guest');
   });
 });
 
-describe('surface flags', () => {
-  it('mcpl-admin: default keeps four first-class tools; utilities parks them', () => {
+describe('mcpl-admin access grants', () => {
+  it('deploy with `access` requires identity wiring, and stores the NAME not a credential', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcpl-'));
+    const mod = new McplAdminModule({ overlayPath: join(dir, 'overlay.json') });
+    // stub framework so the deploy reaches the access check
+    mod.setFramework({
+      listMcplServers: () => [],
+      connectMcplServer: async () => {},
+      restartMcplServer: async () => {},
+      disconnectMcplServer: async () => {},
+    } as any);
+
+    // no identity wired → clear bounce
+    const refused = await mod.handleToolCall(call('mcpl_deploy', {
+      id: 'worlds', url: 'wss://example.test/mcpl', access: 'eidoverse',
+    }) as any);
+    expect(refused.success).toBe(false);
+    expect(refused.error).toContain('identity');
+  });
+
+  it('surface flags: default keeps four first-class tools; utilities parks them', () => {
     const asTools = new McplAdminModule({});
     expect(asTools.getTools().length).toBe(4);
     expect(asTools.getUtilities().length).toBe(0);
@@ -113,8 +143,10 @@ describe('surface flags', () => {
       ['mcpl_deploy', 'mcpl_list', 'mcpl_restart', 'mcpl_unload'],
     );
   });
+});
 
-  it('observers: same flag, same definitions either way', () => {
+describe('observers surface flag', () => {
+  it('same definitions on either surface', () => {
     const dir = mkdtempSync(join(tmpdir(), 'obs-'));
     const asTools = new ObserversModule({ path: join(dir, 'observers.json') });
     const asUtils = new ObserversModule({ path: join(dir, 'observers.json'), surface: 'utilities' });
