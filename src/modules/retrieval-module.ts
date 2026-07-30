@@ -154,7 +154,11 @@ export class RetrievalModule implements Module {
 
       const injections: ContextInjection[] = [{
         namespace: 'retrieval',
-        position: 'system',
+        // 'afterUser', NOT 'system': retrieval content changes with recent
+        // context (contextHash above), so injecting it into the system prompt
+        // churns the very front of the KV cache and invalidates the entire
+        // prefix every turn. Tail injection keeps the stable prefix cached.
+        position: 'afterUser',
         content: [{ type: 'text', text: `## Retrieved Knowledge\n${text}` }],
       }];
 
