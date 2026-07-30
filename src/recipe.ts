@@ -71,16 +71,19 @@ export interface RecipeStrategy {
   /** kv-stable: quality-gap override threshold (§13.4). Default 0.35. */
   kvStableQualityGapRatio?: number;
   compressionSlackRatio?: number;
+  /** Adaptive-resolution fold planner. The host defaults this to 'kv-stable'
+   *  (cache-stable compile plans; see buildFrameworkStrategy) — set explicitly
+   *  only to opt into the legacy planners. */
   foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
   speculativeProduction?: boolean;
   /** L1 production holdback: keep the newest N closed chunks out of the
    *  speculative compression queue (default 1); demand still overrides. */
   l1HoldbackChunks?: number;
-  // Self-voice / compression framing. When the agent's name differs from
-  // 'Claude' (the strategy default for summaryParticipant), these MUST be set
-  // (especially summaryParticipant: <agent.name>) — otherwise self-recollections
-  // are stored under a stranger's participant and surface in the compiled prompt
-  // as another voice speaking in first person about the agent.
+  // Self-voice / compression framing. The host defaults summaryParticipant to
+  // `agent.name` (buildFrameworkStrategy), so self-recollections speak as the
+  // agent itself. Set explicitly only to voice summaries as someone else —
+  // a mismatched participant surfaces in the compiled prompt as another voice
+  // speaking in first person about the agent.
   summaryParticipant?: string;
   summarySystemPrompt?: string;
   summaryUserPrompt?: string;
@@ -382,8 +385,22 @@ export interface RecipeWorkspaceMount {
 }
 
 export interface RecipeModules {
+  /**
+   * Subagent forking (spawn/fork parallel agents). OPT-IN — defaults to off
+   * and is not part of the standard recipe.
+   */
   subagents?: boolean | { defaultModel?: string; defaultMaxTokens?: number };
+  /**
+   * Lesson library (persistent knowledge store + lesson tools). OPT-IN —
+   * defaults to off and is not part of the standard recipe.
+   */
   lessons?: boolean;
+  /**
+   * Lesson retrieval-injection (requires `lessons`). OPT-IN — defaults to off
+   * and is deliberately not part of the standard recipe: it injects
+   * context-dependent content into every compile and spends two Haiku calls
+   * per turn. Enable only for agents that actually curate a lesson library.
+   */
   retrieval?: boolean | { model?: string; maxInjected?: number };
   wake?: boolean | import('@animalabs/agent-framework').GateConfig;
   workspace?: boolean | { mounts: RecipeWorkspaceMount[]; configMount?: boolean };
@@ -673,13 +690,13 @@ export const DEFAULT_RECIPE: Recipe = {
       'You are a helpful assistant. You have access to tools provided by connected MCP servers.',
       'Use them to help the user with their tasks.',
       '',
-      'You can fork subagents for parallel work, create persistent notes, and write files to `products/` as outputs of your work.',
+      'You can create persistent notes and write files to `products/` as outputs of your work.',
     ].join('\n'),
   },
   modules: {
-    subagents: true,
-    lessons: true,
-    retrieval: true,
+    // subagents + lessons + retrieval deliberately omitted — all opt-in only
+    // (retrieval additionally adds per-turn context churn + Haiku costs);
+    // see the RecipeModules field docs.
     wake: true,
     workspace: true,
   },

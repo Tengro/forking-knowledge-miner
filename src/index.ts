@@ -170,9 +170,10 @@ async function createFramework(
   // adapter can read its state for cross-cutting concerns like reasoning).
   const moduleInstances: Module[] = [new TuiModule(), new TimeModule(timeZone), settingsModule];
 
-  // Subagents
+  // Subagents. OPT-IN — not part of the standard recipe; enable explicitly
+  // via modules.subagents when an agent should fork parallel workers.
   let subagentModule: SubagentModule | null = null;
-  if (modules.subagents !== false) {
+  if (modules.subagents) {
     const subagentConfig = typeof modules.subagents === 'object' ? modules.subagents : {};
     subagentModule = new SubagentModule({
       parentAgentName: agentName,
@@ -182,9 +183,10 @@ async function createFramework(
     moduleInstances.push(subagentModule);
   }
 
-  // Lessons
+  // Lessons. OPT-IN — not part of the standard recipe; enable explicitly via
+  // modules.lessons for agents that curate a lesson library.
   let lessonsModule: LessonsModule | null = null;
-  if (modules.lessons !== false) {
+  if (modules.lessons) {
     const globalLessonsPath = resolve(join(storePath, '..', '..', 'lessons.json'));
     lessonsModule = new LessonsModule({ globalPath: globalLessonsPath });
     moduleInstances.push(lessonsModule);
@@ -220,8 +222,11 @@ async function createFramework(
     moduleInstances.push(new FleetModule(fleetModuleConfig));
   }
 
-  // Retrieval (requires lessons)
-  if (modules.retrieval !== false && lessonsModule) {
+  // Retrieval (requires lessons). OPT-IN — not part of the standard recipe:
+  // it injects context-dependent content into every compile (plus two Haiku
+  // calls per turn), which adds per-turn context churn. Enable explicitly via
+  // modules.retrieval only when an agent actually curates a lesson library.
+  if (modules.retrieval && lessonsModule) {
     const retrievalConfig = typeof modules.retrieval === 'object' ? modules.retrieval : {};
     moduleInstances.push(new RetrievalModule({
       membrane,
