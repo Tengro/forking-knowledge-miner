@@ -404,8 +404,23 @@ export interface RecipeModules {
    *
    * SECURITY: `mcpl_deploy` spawns arbitrary commands as the host user —
    * enabling this module means trusting the agent with code execution.
+   *
+   * `{ surface: 'utilities' }` keeps the module but parks its four tools
+   * behind the framework's single `utils` meta-tool (mcpl management is
+   * rare; it needn't cost four schemas on every inference). `true` keeps
+   * the historical first-class surface.
    */
-  mcplAdmin?: boolean;
+  mcplAdmin?: boolean | { surface?: 'tools' | 'utilities' };
+
+  /**
+   * The agent's own archipelago-home identity (connectome docs/home-node.md):
+   * an ed25519 keypair in the data dir, enrolled at the home node via an
+   * operator invite, exchanged for fresh aid1 audience tokens on demand.
+   * Utilities-only (`utils run identity--status/enroll/token`) — costs no
+   * tool slots. `home` defaults to id.animalabs.ai; `audience` is the
+   * default for `token` calls.
+   */
+  identity?: boolean | { home?: string; audience?: string };
   /**
    * Cross-process child fleet.  When true (shorthand), FleetModule is attached
    * with no pre-configured children.  When an object, declares children the
@@ -485,6 +500,13 @@ export interface RecipeModules {
 export interface RecipeWebUi {
   port?: number;
   host?: string;
+  /**
+   * Where the observer grant tools (observers--get/grant/revoke) surface:
+   * 'tools' (default, historical) or 'utilities' (behind the `utils`
+   * meta-tool — grant edits are rare). Consent semantics unchanged: the
+   * agent holds the pen either way.
+   */
+  observersSurface?: 'tools' | 'utilities';
   /**
    * Basic-Auth credentials. Required whenever the bind host is non-loopback
    * (which is the default). `${VAR}`-substitutable from .env.

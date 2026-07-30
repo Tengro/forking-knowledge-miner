@@ -46,6 +46,7 @@ import { SubscriptionGcModule } from './modules/subscription-gc-module.js';
 import { ChannelModeModule } from './modules/channel-mode-module.js';
 import { WebUiModule } from './modules/web-ui-module.js';
 import { ObserversModule } from './modules/observers-module.js';
+import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
 import { TtsRelayModule } from './modules/tts-relay-module.js';
 import { loadMcplServers, applyAgentOverlay, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
@@ -332,9 +333,23 @@ async function createFramework(
   // MCPL self-administration — opt-in per recipe (grants the agent the
   // ability to spawn arbitrary commands via mcpl_deploy; see recipe.ts).
   let mcplAdminModule: McplAdminModule | null = null;
-  if (modules.mcplAdmin === true) {
-    mcplAdminModule = new McplAdminModule({ timeZone });
+  if (modules.mcplAdmin === true || typeof modules.mcplAdmin === 'object') {
+    const surface = typeof modules.mcplAdmin === 'object' ? modules.mcplAdmin.surface : undefined;
+    mcplAdminModule = new McplAdminModule({ timeZone, ...(surface ? { surface } : {}) });
     moduleInstances.push(mcplAdminModule);
+  }
+
+  // Archipelago identity — opt-in per recipe. Utilities-only: enrollment is
+  // one-time and token refresh is rare, so it costs no tool slots (see
+  // identity-module.ts header). Keypair lives at the dataDir level — an
+  // identity belongs to the deployment, not the session.
+  if (modules.identity !== undefined && modules.identity !== false) {
+    const idCfg = typeof modules.identity === 'object' ? modules.identity : {};
+    moduleInstances.push(new IdentityModule({
+      keyPath: process.env.IDENTITY_KEY_FILE || resolve(config.dataDir, 'identity-key.pem'),
+      home: idCfg.home ?? process.env.IDENTITY_HOME ?? 'id.animalabs.ai',
+      ...(idCfg.audience ? { defaultAudience: idCfg.audience } : {}),
+    }));
   }
 
   // Web admin UI — opt-in per recipe
@@ -356,7 +371,10 @@ async function createFramework(
       ...(callLedger ? { callLedger } : {}),
     });
     moduleInstances.push(webUiModule);
-    moduleInstances.push(new ObserversModule({ path: observersPath }));
+    moduleInstances.push(new ObserversModule({
+      path: observersPath,
+      ...(webuiConfig.observersSurface ? { surface: webuiConfig.observersSurface } : {}),
+    }));
   }
 
   // TTS relay tap — opt-in per recipe. Pure trace-bus consumer: mirrors the

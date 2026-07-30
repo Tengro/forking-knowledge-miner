@@ -51,6 +51,11 @@ export interface McplAdminModuleConfig {
   overlayPath?: string;
   /** Path to the human-owned server config file (read-only here). */
   configPath?: string;
+  /** Where these operations surface to the model: 'tools' (default — four
+   *  first-class slots, exactly the historical behavior) or 'utilities'
+   *  (behind the framework's single `utils` meta-tool: mcpl management is a
+   *  rare operation and needn't tax every inference with four schemas). */
+  surface?: 'tools' | 'utilities';
 }
 
 function ok(text: string): ToolResult {
@@ -69,10 +74,13 @@ export class McplAdminModule implements Module {
   private configPath: string;
   private timeZone: string;
 
+  private surface: 'tools' | 'utilities';
+
   constructor(config?: McplAdminModuleConfig) {
     this.overlayPath = config?.overlayPath ?? DEFAULT_AGENT_OVERLAY_PATH;
     this.configPath = config?.configPath ?? DEFAULT_CONFIG_PATH;
     this.timeZone = resolveTimeZone(config?.timeZone);
+    this.surface = config?.surface ?? 'tools';
   }
 
   /** Post-creation wiring (called from index.ts, mirrors ActivityModule.setFramework). */
@@ -87,6 +95,16 @@ export class McplAdminModule implements Module {
   }
 
   getTools(): ToolDefinition[] {
+    return this.surface === 'tools' ? this.definitions() : [];
+  }
+
+  /** Same definitions, same handler — the surface flag only decides whether
+   *  they cost four slots or ride the `utils` meta-tool. */
+  getUtilities(): ToolDefinition[] {
+    return this.surface === 'utilities' ? this.definitions() : [];
+  }
+
+  private definitions(): ToolDefinition[] {
     return [
       {
         name: 'mcpl_list',
