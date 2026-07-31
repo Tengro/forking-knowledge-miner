@@ -63,7 +63,7 @@ import {
   parseRecipeArg,
 } from './recipe.js';
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
-import { buildFrameworkAgentConfig } from './framework-agent-config.js';
+import { buildFrameworkAgentConfig, resolvePromptCaching } from './framework-agent-config.js';
 import { buildFrameworkStrategy } from './framework-strategy.js';
 import { loadExtensions } from './extensions.js';
 
@@ -147,6 +147,11 @@ async function resolveRecipe(): Promise<Recipe> {
 // Framework factory
 // ---------------------------------------------------------------------------
 
+function resolveModel(recipe: Recipe): string {
+  return config.model || recipe.agent.model ||
+    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+}
+
 async function createFramework(
   membrane: Membrane,
   storePath: string,
@@ -155,8 +160,7 @@ async function createFramework(
   settingsModule: SettingsModule,
   callLedger: CallLedger | null,
 ): Promise<AgentFramework> {
-  const model = config.model || recipe.agent.model ||
-    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+  const model = resolveModel(recipe);
   const modules = recipe.modules ?? {};
   const timeZone = resolveTimeZone(recipe.agent.timezone);
 
@@ -877,8 +881,11 @@ async function main() {
   // vars (AWS_REGION defaults us-west-2) and maps standard Claude model IDs
   // to Bedrock IDs (explicit map + `anthropic.<id>-v1:0` fallback). Uses the
   // Anthropic-native message shape, so NativeFormatter applies unchanged.
-  // No CallLedger: prompt caching is rejected outright by legacy Bedrock
-  // models (tested 2026-07-21). Wrapped for llm-calls.jsonl visibility.
+  // Prompt caching is model-gated (bedrockModelSupportsPromptCaching):
+  // 3.5 Sonnet 1022 and newer cache normally; 0620/Opus 3 reject
+  // cache_control outright (tested 2026-07-21). Still no CallLedger —
+  // it's anthropic-transport-only for now; cache metrics are visible in
+  // llm-calls.jsonl via the logging wrapper.
   const bedrockAdapter = provider === 'bedrock'
     ? new LoggingBedrockAdapter({}, llmLogPath)
     : undefined;
@@ -960,10 +967,14 @@ async function main() {
       : recipe.agent.formatter === 'anthropic-xml'
         ? new AnthropicXmlFormatter()
         : new NativeFormatter(),
-    // Bedrock legacy Claude models 400 on any cache_control block
-    // ("your request did not allow prompt caching") — suppress the
-    // historical promptCaching=true default on that transport.
-    ...(provider === 'bedrock' ? { defaultPromptCaching: false } : {}),
+    // Bedrock: caching is model-gated, not suppressed transport-wide —
+    // only the legacy ids that predate Bedrock caching support 400 on
+    // cache_control (see bedrockModelSupportsPromptCaching). This default
+    // covers internal callers (autobio compression, executeMerge) that
+    // don't carry the per-agent promptCaching flag.
+    ...(provider === 'bedrock' && resolvePromptCaching(recipe, resolveModel(recipe)) === false
+      ? { defaultPromptCaching: false }
+      : {}),
     // Anchor the assistant role for internal callers that don't set
     // request.assistantParticipant themselves (autobio compression,
     // executeMerge). Mismatch here flips stored assistant turns to

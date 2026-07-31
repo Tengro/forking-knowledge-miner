@@ -124,8 +124,18 @@ export interface RecipeAgent {
    *  ContextManager default (100k) applies. Raise for large-context models. */
   contextBudgetTokens?: number;
   /** Prompt-cache TTL ('5m' | '1h') forwarded to the provider. Defaults to
-   *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads. */
+   *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads.
+   *  Not forwarded on bedrock — that transport only has the default 5m
+   *  cache and rejects the ttl field. */
   cacheTtl?: '5m' | '1h';
+  /**
+   * Explicit prompt-caching override. Unset means provider-appropriate
+   * default: on for everything except bedrock models that predate caching
+   * support there (see bedrockModelSupportsPromptCaching). Set false if a
+   * transport/account rejects cache_control markers — AWS's "your request
+   * did not allow prompt caching" can also be account/region-dependent.
+   */
+  promptCaching?: boolean;
   /**
    * Same-round routing policy for ordinary text emitted beside think().
    * Omitted preserves the compatibility carry-forward in Agent Framework.
@@ -965,6 +975,12 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.cacheTtl must be '5m' or '1h', got ${JSON.stringify(agent.cacheTtl)}.`);
   }
   agent.cacheTtl ??= '1h';
+
+  if (agent.promptCaching !== undefined && typeof agent.promptCaching !== 'boolean') {
+    throw new Error(
+      `Recipe agent.promptCaching must be a boolean, got ${JSON.stringify(agent.promptCaching)}.`,
+    );
+  }
 
   if (
     agent.sameRoundThinkTextPolicy !== undefined &&
