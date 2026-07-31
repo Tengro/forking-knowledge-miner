@@ -153,6 +153,13 @@ export interface RecipeAgent {
   thinking?: {
     enabled: boolean;
     budgetTokens?: number;
+    /** 'enabled' (explicit budget, legacy) or 'adaptive' (model-managed;
+     * required by opus-4-7+ / fable-5 era models). */
+    type?: 'enabled' | 'adaptive';
+    /** 'summarized' returns readable reasoning summaries in `thinking`;
+     * 'omitted' returns empty text + signature only. Models 4.7+ default
+     * to 'omitted' server-side. */
+    display?: 'summarized' | 'omitted';
   };
   /** OpenAI Responses settings. Reasoning applies to both OpenAI providers;
    * compaction and serviceTier are API-key transport settings. */
@@ -982,6 +989,12 @@ export function validateRecipe(raw: unknown): Recipe {
     }
     if (thinking.budgetTokens !== undefined && (typeof thinking.budgetTokens !== 'number' || thinking.budgetTokens <= 0)) {
       throw new Error('Recipe agent.thinking.budgetTokens must be a positive number.');
+    }
+    if (thinking.type !== undefined && thinking.type !== 'enabled' && thinking.type !== 'adaptive') {
+      throw new Error('Recipe agent.thinking.type must be "enabled" or "adaptive".');
+    }
+    if (thinking.display !== undefined && thinking.display !== 'summarized' && thinking.display !== 'omitted') {
+      throw new Error('Recipe agent.thinking.display must be "summarized" or "omitted".');
     }
     if (thinking.enabled === true && typeof thinking.budgetTokens === 'number' && typeof agent.maxTokens === 'number') {
       if (thinking.budgetTokens >= agent.maxTokens) {
