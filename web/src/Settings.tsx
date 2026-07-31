@@ -91,6 +91,10 @@ const TRANSITION_HELP: Record<string, string> = {
 export function SettingsPanel(props: {
   loaded: boolean;
   state: SettingsState | null;
+  /** Inspection scope ('local' or fleet-child name) — routes the preview
+   *  fetch through the host's ?scope= proxy so the DRY RUN compiles in the
+   *  same process whose settings this panel is editing. */
+  scope?: string;
   onRefresh(): void;
   onApply(patch: {
     contextBudgetTokens?: number;
@@ -157,6 +161,7 @@ export function SettingsPanel(props: {
     setElapsed(null);
     try {
       const qs = new URLSearchParams({ budget: String(b), agent: props.state!.agent });
+      if (props.scope && props.scope !== 'local') qs.set('scope', props.scope);
       const t = num(tail());
       if (t !== undefined) qs.set('tail', String(t));
       if (render) qs.set('render', '1');

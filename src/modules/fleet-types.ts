@@ -38,7 +38,18 @@ export type IncomingCommand =
    *  `cancel-subagent-result`. The child looks the agent up in its own
    *  SubagentModule, so this is the only way to stop a subagent that lives
    *  in a fleet child rather than the conductor. */
-  | { type: 'cancel-subagent'; name: string; corrId?: string };
+  | { type: 'cancel-subagent'; name: string; corrId?: string }
+  /**
+   * Run one operator-panel operation in the child (see PANEL_OPS in
+   * src/web/panel-data.ts: mcpl / settings(-update|-reset|-cancel-transition)
+   * / pins / pin-add / pin-remove / health / context-makeup /
+   * context-coverage / context-curve / context-preview / debug-context).
+   * Response is a single `panel-response` with the same corrId. One generic
+   * verb rather than a verb per panel: both ends dispatch through the SAME
+   * shared handler (`runPanelOp`), so a new panel surface needs no protocol
+   * change to work across the fleet.
+   */
+  | { type: 'panel-request'; op: string; params?: Record<string, unknown>; corrId?: string };
 
 // ---------------------------------------------------------------------------
 // Child → Parent: events
@@ -134,6 +145,23 @@ export interface CancelSubagentResultEvent {
   ts?: number;
 }
 
+/** Response to a {type:'panel-request'} request. `data` is the same
+ *  wire-shaped JSON the WebUI host serves locally for the given op;
+ *  `ok:false` carries the error plus an HTTP-ish `status` so the parent's
+ *  proxy routes can answer faithfully (404 unknown agent, 429 preview
+ *  cooldown, 501 unsupported build). */
+export interface PanelResponseEvent {
+  type: 'panel-response';
+  corrId?: string;
+  /** Echo of the requested op. */
+  op: string;
+  ok: boolean;
+  data?: unknown;
+  error?: string;
+  status?: number;
+  ts?: number;
+}
+
 /** Response to a {type:'request-workspace-file'} request. */
 export interface WorkspaceFileSnapshotEvent {
   type: 'workspace-file-snapshot';
@@ -163,6 +191,7 @@ export type WireEvent =
   | WorkspaceTreeSnapshotEvent
   | WorkspaceFileSnapshotEvent
   | CancelSubagentResultEvent
+  | PanelResponseEvent
   // Arbitrary framework TraceEvent passthrough. The child stamps every emitted
   // event with `ts: Date.now()` in `emit()` (see headless.ts), so ts is always
   // present on the wire even when the underlying TraceEvent doesn't declare it.

@@ -34,7 +34,7 @@ import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { connect as netConnect, type Socket } from 'node:net';
 import { existsSync, mkdirSync, unlinkSync, openSync, closeSync, appendFileSync, realpathSync } from 'node:fs';
 import { join, resolve, isAbsolute } from 'node:path';
-import { type IncomingCommand, type WireEvent, matchesSubscription } from './fleet-types.js';
+import { type IncomingCommand, type WireEvent, type PanelResponseEvent, matchesSubscription } from './fleet-types.js';
 import { loadRecipe } from '../recipe.js';
 import { REDUCER_REQUIRED_EVENTS } from '../state/agent-tree-reducer.js';
 
@@ -1619,6 +1619,65 @@ export class FleetModule implements Module {
     if (!child || !child.socket) return false;
     try { this.sendToChild(child, { type: 'cancel-subagent', name, corrId }); return true; }
     catch { return false; }
+  }
+
+  /** Monotonic corrId source for requestPanel. */
+  private panelSeq = 0;
+
+  /**
+   * Run one operator-panel op (see src/web/panel-data.ts) in a fleet child
+   * and await its `panel-response`. Promise-based counterpart to the
+   * fire-and-forget request* verbs above: HTTP proxy routes need to await a
+   * body, and the WS handlers are simpler for it too.
+   *
+   * Never rejects — a dead child, send failure, or timeout resolves as
+   * `{ok:false, error, status}` (502 unreachable, 504 timeout), so callers
+   * translate straight into a response without try/catch.
+   */
+  requestPanel(
+    childName: string,
+    op: string,
+    params?: Record<string, unknown>,
+    timeoutMs = 30_000,
+  ): Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }> {
+    const child = this.children.get(childName);
+    if (!child || !child.socket) {
+      return Promise.resolve({
+        ok: false,
+        error: child ? `child '${childName}' is ${child.status}, not running` : `unknown child: ${childName}`,
+        status: child ? 502 : 404,
+      });
+    }
+    const corrId = `panel-${op}-${++this.panelSeq}-${Date.now().toString(36)}`;
+    return new Promise((resolvePanel) => {
+      let settled = false;
+      const finish = (result: { ok: boolean; data?: unknown; error?: string; status?: number }): void => {
+        if (settled) return;
+        settled = true;
+        unsub();
+        clearTimeout(timer);
+        resolvePanel(result);
+      };
+      const unsub = this.onChildEvent(childName, (_name, evt) => {
+        if (evt.type !== 'panel-response') return;
+        const e = evt as unknown as PanelResponseEvent;
+        if (e.corrId !== corrId) return;
+        finish({
+          ok: e.ok === true,
+          ...(e.data !== undefined ? { data: e.data } : {}),
+          ...(typeof e.error === 'string' ? { error: e.error } : {}),
+          ...(typeof e.status === 'number' ? { status: e.status } : {}),
+        });
+      });
+      const timer = setTimeout(() => {
+        finish({ ok: false, error: `panel op '${op}' timed out after ${timeoutMs}ms (child '${childName}' unresponsive)`, status: 504 });
+      }, timeoutMs);
+      try {
+        this.sendToChild(child, { type: 'panel-request', op, ...(params ? { params } : {}), corrId });
+      } catch (err) {
+        finish({ ok: false, error: `send to child failed: ${err instanceof Error ? err.message : String(err)}`, status: 502 });
+      }
+    });
   }
 
   private async killChild(child: FleetChild): Promise<void> {

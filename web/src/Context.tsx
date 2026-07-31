@@ -8,7 +8,7 @@
  * a per-segment table, with an exact total token count.
  */
 
-import { createSignal, onCleanup, onMount, For, Show } from 'solid-js';
+import { createEffect, createSignal, on, onCleanup, onMount, For, Show } from 'solid-js';
 
 interface Seg { messages: number; tokens: number }
 interface Stats {
@@ -89,7 +89,7 @@ function rowsOf(s: Stats): Row[] {
   ].filter((r) => r.tokens > 0 || r.messages > 0);
 }
 
-export function ContextPanel(props: { agent?: string }) {
+export function ContextPanel(props: { scope?: string }) {
   const [data, setData] = createSignal<Makeup | null>(null);
   const [coverage, setCoverage] = createSignal<Coverage | null>(null);
   const [loading, setLoading] = createSignal(false);
@@ -97,18 +97,28 @@ export function ContextPanel(props: { agent?: string }) {
   const [err, setErr] = createSignal<string | null>(null);
   const [coverageErr, setCoverageErr] = createSignal<string | null>(null);
 
-  const query = () => props.agent ? `?agent=${encodeURIComponent(props.agent)}` : '';
+  /** Fleet-child scopes route through the host's ?scope= proxy; the child's
+   *  primary agent answers. Local scope needs no params. */
+  const query = () => props.scope && props.scope !== 'local'
+    ? `?scope=${encodeURIComponent(props.scope)}`
+    : '';
 
   const load = async () => {
+    const scopeAtStart = props.scope;
     setLoading(true);
     setErr(null);
     try {
       const res = await fetch(`/debug/context/makeup${query()}`, { credentials: 'same-origin' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `HTTP ${res.status}`);
+      }
       const j = (await res.json()) as Makeup;
       if (j.error) throw new Error(j.error);
+      if (props.scope !== scopeAtStart) return; // scope switched mid-flight
       setData(j);
     } catch (e) {
+      if (props.scope !== scopeAtStart) return;
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
@@ -116,13 +126,20 @@ export function ContextPanel(props: { agent?: string }) {
   };
 
   const loadCoverage = async () => {
+    const scopeAtStart = props.scope;
     setCoverageLoading(true);
     setCoverageErr(null);
     try {
       const res = await fetch(`/debug/context/coverage${query()}`, { credentials: 'same-origin' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setCoverage((await res.json()) as Coverage);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `HTTP ${res.status}`);
+      }
+      const cov = (await res.json()) as Coverage;
+      if (props.scope !== scopeAtStart) return;
+      setCoverage(cov);
     } catch (e) {
+      if (props.scope !== scopeAtStart) return;
       setCoverageErr(e instanceof Error ? e.message : String(e));
     } finally {
       setCoverageLoading(false);
@@ -134,8 +151,18 @@ export function ContextPanel(props: { agent?: string }) {
     void loadCoverage();
   };
 
-  onMount(() => {
+  // Initial load AND scope-switch refetch: the effect re-runs whenever the
+  // shared scope selector changes, clearing the previous scope's data so a
+  // slow child never renders under the wrong header.
+  createEffect(on(() => props.scope, () => {
+    setData(null);
+    setCoverage(null);
+    setErr(null);
+    setCoverageErr(null);
     refreshAll();
+  }));
+
+  onMount(() => {
     const timer = window.setInterval(() => void loadCoverage(), 5_000);
     onCleanup(() => window.clearInterval(timer));
   });
@@ -153,7 +180,7 @@ export function ContextPanel(props: { agent?: string }) {
         <div class="flex items-center gap-2">
           <a
             class="text-cyan-500 hover:text-cyan-300"
-            href="/curve"
+            href={`/curve${query()}`}
             target="_blank"
             rel="noreferrer"
             title="Compression curve — raw vs rendered tokens per compiled entry"

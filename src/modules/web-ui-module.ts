@@ -70,6 +70,28 @@ import {
   saveMcplServers,
   DEFAULT_CONFIG_PATH,
 } from '../mcpl-config.js';
+import {
+  resolveAgent,
+  buildMcplSnapshot,
+  buildSettingsState,
+  buildPinsSnapshot,
+  buildHealthSnapshot,
+  buildContextCoverage,
+  buildContextMakeup,
+  buildContextCurve,
+  buildContextMaintenance,
+  runContextPreview,
+  buildDebugContext,
+  notifyAgentOfSettingsChange,
+  applySettingsUpdate,
+  applySettingsReset,
+  applySettingsCancelTransition,
+  applyPinAdd,
+  applyPinRemove,
+  PanelError,
+  type PanelAppRef,
+  type McplLiveServer,
+} from '../web/panel-data.js';
 import { loadRecipe } from '../recipe.js';
 import {
   ObserverRegistry,
@@ -175,166 +197,59 @@ interface ClientState {
 /** Default port — picked to be memorable and unlikely to collide. */
 const DEFAULT_PORT = 7340;
 
+/** HTTP route → panel op, for ?scope=<child> proxying. /curve (the HTML
+ *  page) is deliberately absent: it is served locally and its own fetch of
+ *  /debug/context/curve carries the scope param through. */
+const HTTP_PANEL_OPS: Record<string, string> = {
+  '/debug/context/makeup': 'context-makeup',
+  '/debug/context/coverage': 'context-coverage',
+  '/debug/context/curve': 'context-curve',
+  '/debug/context/preview': 'context-preview',
+  '/debug/context/maintenance': 'context-maintenance',
+  '/debug/context': 'debug-context',
+  '/healthz': 'health',
+};
+
+/** True when a wire `scope` field names a fleet child (vs the local process). */
+function isChildScope(scope: string | undefined): scope is string {
+  return scope !== undefined && scope !== '' && scope !== 'local';
+}
+
+/** Map a panel-layer failure onto the HTTP response it deserves. */
+function panelErrorResponse(err: unknown): Response {
+  const status = err instanceof PanelError ? err.status : 500;
+  return Response.json(
+    { error: err instanceof Error ? err.message : String(err) },
+    { status },
+  );
+}
+
+/** Project the debug-route query string into panel-op params. Number/boolean
+ *  coercion happens here so the child-side handlers see typed values. */
+function panelParamsFromUrl(url: URL): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  const agent = url.searchParams.get('agent');
+  if (agent) params.agent = agent;
+  const budget = url.searchParams.get('budget');
+  if (budget !== null) params.budget = Number(budget);
+  const tail = url.searchParams.get('tail');
+  if (tail !== null) params.tail = Number(tail);
+  const render = url.searchParams.get('render');
+  if (render !== null && render !== '0' && render !== 'false') params.render = true;
+  const inj = url.searchParams.get('injections');
+  if (inj !== null && inj !== '0' && inj !== 'false') params.injections = true;
+  return params;
+}
+
 /** Messages shipped in the welcome frame (the tail window). */
 const WELCOME_HISTORY_LIMIT = 200;
 /** Default / max page size for request-history. */
 const HISTORY_PAGE_DEFAULT = 200;
 const HISTORY_PAGE_MAX = 500;
 
-interface CoverageSummary {
-  id: string;
-  level: number;
-  tokens?: number;
-  sourceIds?: string[];
-  mergedInto?: string;
-}
-
-interface CoverageChunk {
-  index: number;
-  tokens?: number;
-  compressed?: boolean;
-  summaryId?: string;
-  messages?: Array<{ id?: string }>;
-}
-
-interface CoverageStrategy {
-  summaries?: CoverageSummary[];
-  chunks?: CoverageChunk[];
-  compressionQueue?: number[];
-  mergeQueue?: Array<{ level: number; sourceIds: string[] }>;
-  resolutions?: Map<string, number>;
-  pendingCompression?: Promise<void> | null;
-}
-
-export interface ContextCoverageSnapshot {
-  agent: string;
-  branch: string;
-  generatedAt: string;
-  supported: boolean;
-  totals: {
-    chunks: number;
-    compressedChunks: number;
-    coveredMessages: number;
-    coveredTokens: number;
-    summaries: number;
-  };
-  levels: Array<{
-    level: number;
-    summaries: number;
-    frontier: number;
-    tokens: number;
-    coveredChunks: number;
-    coveredMessages: number;
-    coveredTokens: number;
-  }>;
-  chunks: Array<{
-    index: number;
-    messages: number;
-    tokens: number;
-    compressed: boolean;
-    summaryId: string | null;
-    maxLevel: number;
-    selectedMin: number;
-    selectedMax: number;
-    queued: boolean;
-  }>;
-  queue: {
-    inFlight: boolean;
-    pending: string | null;
-    l1: number[];
-    merges: Array<{ targetLevel: number; sourceCount: number; firstSource: string | null; lastSource: string | null }>;
-  };
-}
-
-/** Build a text-free projection of the autobiographical summary pyramid. */
-export function buildContextCoverageSnapshot(
-  agentName: string,
-  cm: {
-    currentBranch: () => { name: string };
-    getStrategy: () => unknown;
-    getPendingWork?: () => { description?: string } | null;
-  },
-): ContextCoverageSnapshot {
-  const strategy = cm.getStrategy() as CoverageStrategy;
-  const summaries = Array.isArray(strategy.summaries) ? strategy.summaries : [];
-  const chunks = Array.isArray(strategy.chunks) ? strategy.chunks : [];
-  const compressionQueue = Array.isArray(strategy.compressionQueue) ? strategy.compressionQueue : [];
-  const mergeQueue = Array.isArray(strategy.mergeQueue) ? strategy.mergeQueue : [];
-  const resolutions = strategy.resolutions instanceof Map ? strategy.resolutions : new Map<string, number>();
-  const summaryById = new Map(summaries.map(summary => [summary.id, summary]));
-  const queuedChunks = new Set(compressionQueue);
-
-  const projectedChunks = chunks.map((chunk) => {
-    let maxLevel = 0;
-    let current = chunk.summaryId ? summaryById.get(chunk.summaryId) : undefined;
-    const seen = new Set<string>();
-    while (current && !seen.has(current.id)) {
-      seen.add(current.id);
-      maxLevel = Math.max(maxLevel, current.level);
-      current = current.mergedInto ? summaryById.get(current.mergedInto) : undefined;
-    }
-
-    const selected = (chunk.messages ?? [])
-      .map(message => typeof message.id === 'string' ? (resolutions.get(message.id) ?? 0) : 0);
-    return {
-      index: chunk.index,
-      messages: chunk.messages?.length ?? 0,
-      tokens: Math.max(0, chunk.tokens ?? 0),
-      compressed: chunk.compressed === true,
-      summaryId: chunk.summaryId ?? null,
-      maxLevel,
-      selectedMin: selected.length > 0 ? Math.min(...selected) : 0,
-      selectedMax: selected.length > 0 ? Math.max(...selected) : 0,
-      queued: queuedChunks.has(chunk.index),
-    };
-  });
-
-  const levelNumbers = [...new Set(summaries.map(summary => summary.level))]
-    .filter(level => Number.isFinite(level) && level > 0)
-    .sort((a, b) => a - b);
-  const levels = levelNumbers.map((level) => {
-    const atLevel = summaries.filter(summary => summary.level === level);
-    const covered = projectedChunks.filter(chunk => chunk.maxLevel >= level);
-    return {
-      level,
-      summaries: atLevel.length,
-      frontier: atLevel.filter(summary => !summary.mergedInto).length,
-      tokens: atLevel.reduce((total, summary) => total + Math.max(0, summary.tokens ?? 0), 0),
-      coveredChunks: covered.length,
-      coveredMessages: covered.reduce((total, chunk) => total + chunk.messages, 0),
-      coveredTokens: covered.reduce((total, chunk) => total + chunk.tokens, 0),
-    };
-  });
-  const covered = projectedChunks.filter(chunk => chunk.maxLevel > 0);
-  const pending = cm.getPendingWork?.()?.description ?? null;
-
-  return {
-    agent: agentName,
-    branch: cm.currentBranch().name,
-    generatedAt: new Date().toISOString(),
-    supported: Array.isArray(strategy.summaries) && Array.isArray(strategy.chunks),
-    totals: {
-      chunks: projectedChunks.length,
-      compressedChunks: projectedChunks.filter(chunk => chunk.compressed).length,
-      coveredMessages: covered.reduce((total, chunk) => total + chunk.messages, 0),
-      coveredTokens: covered.reduce((total, chunk) => total + chunk.tokens, 0),
-      summaries: summaries.length,
-    },
-    levels,
-    chunks: projectedChunks,
-    queue: {
-      inFlight: strategy.pendingCompression != null,
-      pending,
-      l1: [...compressionQueue],
-      merges: mergeQueue.map(merge => ({
-        targetLevel: merge.level,
-        sourceCount: merge.sourceIds.length,
-        firstSource: merge.sourceIds[0] ?? null,
-        lastSource: merge.sourceIds[merge.sourceIds.length - 1] ?? null,
-      })),
-    },
-  };
-}
+/** Re-exported from the shared panel-data layer (moved there so headless
+ *  fleet children serve the same snapshot over the fleet IPC). */
+export { buildContextCoverageSnapshot, type ContextCoverageSnapshot } from '../web/panel-data.js';
 
 /**
  * Structural view of the windowed-read facade added to
@@ -681,9 +596,14 @@ export class WebUiModule implements Module {
         || eType === 'workspace-file-snapshot'
         || eType === 'cancel-subagent-result')
     ) {
-      this.routeChildSnapshotResponse(eType, corrId, event as Record<string, unknown>);
+      this.routeChildSnapshotResponse(eType, corrId, childName, event as Record<string, unknown>);
       return; // don't fan out — these are private replies, not telemetry
     }
+
+    // Panel-op replies are consumed by FleetModule.requestPanel's own
+    // corrId listener; they carry operator-panel payloads (settings, pins,
+    // health) and must never fan out as child-event telemetry.
+    if (eType === 'panel-response') return;
 
     // Roll up fleet-child session usage so the header total reflects every
     // process the operator is paying for, not just the parent. Children emit
@@ -742,6 +662,7 @@ export class WebUiModule implements Module {
   private routeChildSnapshotResponse(
     eType: string,
     corrId: string,
+    childName: string,
     event: Record<string, unknown>,
   ): void {
     if (!sharedServer) return;
@@ -754,6 +675,7 @@ export class WebUiModule implements Module {
     if (eType === 'lessons-snapshot') {
       this.send(client, {
         type: 'lessons-list',
+        scope: childName,
         loaded: Boolean(event.loaded),
         lessons: (event.lessons as LessonsListMessage['lessons']) ?? [],
       });
@@ -762,6 +684,7 @@ export class WebUiModule implements Module {
     if (eType === 'workspace-mounts-snapshot') {
       this.send(client, {
         type: 'workspace-mounts',
+        scope: childName,
         loaded: Boolean(event.loaded),
         mounts: (event.mounts as Array<{ name: string; path: string; mode: string }>) ?? [],
       });
@@ -770,6 +693,7 @@ export class WebUiModule implements Module {
     if (eType === 'workspace-tree-snapshot') {
       this.send(client, {
         type: 'workspace-tree',
+        scope: childName,
         mount: String(event.mount ?? ''),
         entries: (event.entries as Array<{ path: string; size: number }>) ?? [],
       });
@@ -783,6 +707,7 @@ export class WebUiModule implements Module {
       }
       this.send(client, {
         type: 'workspace-file',
+        scope: childName,
         path: String(event.path ?? ''),
         totalLines: Number(event.totalLines ?? 0),
         fromLine: Number(event.fromLine ?? 1),
@@ -1081,6 +1006,19 @@ export class WebUiModule implements Module {
       return this.handleRetrievalTraces(url);
     }
 
+    // Fleet-scope proxying: every debug/health route accepts ?scope=<child>.
+    // The request is forwarded to that fleet child over the panel IPC verb
+    // and the child's JSON comes back verbatim — same URLs, same payloads,
+    // whether the process answering is this one or a child. Keeps these
+    // endpoints curl-able for operators / connectome-doctor / the fleet hub
+    // without teaching any of them a second transport.
+    const scopeParam = url.searchParams.get('scope');
+    if (scopeParam && scopeParam !== 'local') {
+      const op = HTTP_PANEL_OPS[url.pathname];
+      if (op) return this.proxyPanelToChild(scopeParam, op, panelParamsFromUrl(url));
+      // Fall through: non-panel routes (static, /files) ignore the param.
+    }
+
     // Debug: the membrane-normalized request that WOULD be emitted if the
     // agent were activated right now — no inference, no state mutation.
     //   GET /debug/context[?agent=<name>][&hooks=false][&pretty=1]
@@ -1114,74 +1052,17 @@ export class WebUiModule implements Module {
     }
 
     // Liveness/health JSON for connectome-doctor and the fleet hub. Behind
-    // the same basic auth as everything else (checked above).
+    // the same basic auth as everything else (checked above). Assembly lives
+    // in panel-data so fleet children serve the identical snapshot.
     if (url.pathname === '/healthz') {
-      const app = sharedServer?.app;
+      const app = this.panelApp();
       if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-      const fw = app.framework as unknown as { healthSnapshot?: () => Record<string, unknown> };
-      if (typeof fw.healthSnapshot !== 'function') {
-        return Response.json({ error: 'framework lacks healthSnapshot()' }, { status: 501 });
-      }
-      const snapshot = fw.healthSnapshot();
-      // Compression quarantine is a guaranteed-eventual-outage state (raw
-      // spans accumulate until the picker cannot fit the window). Surface it
-      // here so the fleet hub and connectome-doctor can alarm on it — it
-      // must never be observable only in agent.log.
       try {
-        const quarantine: Record<string, unknown> = {};
-        for (const agent of app.framework.getAllAgents()) {
-          const strategy = (agent.getContextManager() as unknown as {
-            getStrategy?: () => { getCompressionQuarantineStatus?: () => unknown };
-          }).getStrategy?.();
-          const status = strategy?.getCompressionQuarantineStatus?.();
-          if (status) quarantine[(agent as unknown as { name: string }).name] = status;
-        }
-        (snapshot as Record<string, unknown>).compressionQuarantine = quarantine;
-      } catch {
-        // Health reads never throw.
+        return Response.json(buildHealthSnapshot(app));
+      } catch (err) {
+        const status = err instanceof PanelError ? err.status : 500;
+        return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status });
       }
-      // Rendered context COMPOSITION per agent — head / raw middle / summaries
-      // by level / tail, as actually emitted by the last compile.
-      //
-      // Sourced from the strategy's own render stats, which are already
-      // computed in-process: unlike /debug/context/makeup this costs nothing
-      // and makes no count_tokens network call, so it is safe on the 15s
-      // /healthz poll. Answers "how much of what was actually sent" without
-      // recompiling.
-      try {
-        const composition: Record<string, unknown> = {};
-        for (const agent of app.framework.getAllAgents()) {
-          const name = (agent as unknown as { name: string }).name;
-          const cm = agent.getContextManager() as unknown as {
-            getRenderStats?: () => unknown;
-          };
-          const rs = cm.getRenderStats?.();
-          if (rs) composition[name] = rs;
-        }
-        (snapshot as Record<string, unknown>).contextComposition = composition;
-      } catch {
-        // Health reads never throw.
-      }
-      // Per-agent runtime settings (context budget, tail, transition pace +
-      // convergence state) — the same numbers `agent_settings get` returns,
-      // exposed externally so the fleet hub / connectome-doctor can watch
-      // budget convergence without an agent turn.
-      try {
-        const fw2 = app.framework as unknown as {
-          getAgentRuntimeSettings?: (name: string) => unknown;
-        };
-        if (typeof fw2.getAgentRuntimeSettings === 'function') {
-          const settings: Record<string, unknown> = {};
-          for (const agent of app.framework.getAllAgents()) {
-            const name = (agent as unknown as { name: string }).name;
-            settings[name] = fw2.getAgentRuntimeSettings(name);
-          }
-          (snapshot as Record<string, unknown>).runtimeSettings = settings;
-        }
-      } catch {
-        // Health reads never throw.
-      }
-      return Response.json(snapshot);
     }
 
     // Workspace file passthrough: /files/<mount>/<path...>
@@ -1197,409 +1078,127 @@ export class WebUiModule implements Module {
     return this.serveStatic(requested);
   }
 
+  /** The minimal app slice the shared panel-data layer needs, or null before
+   *  setApp. Includes the call ledger so health snapshots ship recent calls. */
+  private panelApp(): PanelAppRef | null {
+    const app = sharedServer?.app;
+    if (!app) return null;
+    return { framework: app.framework, recipe: app.recipe, callLedger: this.config.callLedger ?? null };
+  }
+
+  private fleetModule(): FleetModule | undefined {
+    return sharedServer?.app?.framework.getAllModules().find((m) => m.name === 'fleet') as
+      | FleetModule | undefined;
+  }
+
+  /** Forward one panel op to a fleet child and answer with its JSON. Status
+   *  mapping comes from the child (PanelError.status travels the wire), with
+   *  502/504 supplied by requestPanel for unreachable/unresponsive children. */
+  private async proxyPanelToChild(
+    childName: string,
+    op: string,
+    params: Record<string, unknown>,
+  ): Promise<Response> {
+    const fleet = this.fleetModule();
+    if (!fleet) {
+      return Response.json(
+        { error: `scope '${childName}' requested but the fleet module is not loaded` },
+        { status: 404 },
+      );
+    }
+    const result = await fleet.requestPanel(childName, op, params);
+    if (!result.ok) {
+      return Response.json({ error: result.error ?? 'panel request failed' }, { status: result.status ?? 502 });
+    }
+    return Response.json(result.data);
+  }
+
   /**
    * Counts-only state and bounded history for periodic context maintenance.
    * Authentication is enforced by handleHttp before this method is reached.
    * The framework snapshot deliberately contains no message or summary text.
    */
   private handleContextMaintenance(): Response {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-    const framework = app.framework as unknown as {
-      getContextMaintenanceSnapshot?: () => Record<string, unknown>;
-    };
-    if (typeof framework.getContextMaintenanceSnapshot !== 'function') {
-      return Response.json(
-        { error: 'framework lacks context-maintenance diagnostics' },
-        { status: 501 },
-      );
+    try {
+      return Response.json(buildContextMaintenance(app));
+    } catch (err) {
+      return panelErrorResponse(err);
     }
-    return Response.json(framework.getContextMaintenanceSnapshot());
   }
 
   /** Summary-tree coverage and queued work, with no message or summary text. */
   private handleContextCoverage(url: URL): Response {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    const agent = app.framework.getAgent(agentName);
-    if (!agent) {
-      return Response.json({ error: `Agent not found: ${agentName}` }, { status: 404 });
+    try {
+      return Response.json(buildContextCoverage(app, resolveAgent(app, url.searchParams.get('agent') ?? undefined)));
+    } catch (err) {
+      return panelErrorResponse(err);
     }
-    const cm = agent.getContextManager();
-    return Response.json(buildContextCoverageSnapshot(agentName, cm));
   }
 
   /**
    * Preview the fold plan at a HYPOTHETICAL budget / tail, without applying it.
    *
-   *   GET /debug/context/preview?budget=<tokens>[&tail=<tokens>][&agent=<name>]
+   *   GET /debug/context/preview?budget=<tokens>[&tail=<tokens>][&agent=<name>][&render=1]
    *
-   * Commits nothing — no fold resolutions persisted, no compression enqueued,
-   * no transition bookkeeping advanced. That guarantee lives in
-   * context-manager's `previewContext` (dry-run select); this endpoint only
-   * forwards. An infeasible budget is reported as `fits: false` with the
-   * per-component diagnostics, NOT as an error: learning that a budget can't
-   * work is the reason to preview instead of applying and taking the outage.
-   *
-   * Returns 501 when the resolved context-manager predates dry-run support, so
-   * the panel can say so instead of rendering an empty result.
+   * Delegates to panel-data's runContextPreview, which owns the honest budget
+   * accounting AND the process-wide single-flight + cooldown guard (a preview
+   * is a real compile that blocks the agent's event loop — see panel-data).
+   * 429 responses here are the guard, not failures.
    */
-  /**
-   * Single-flight + cooldown for preview.
-   *
-   * A preview is a real compile: ~8s on a large store, and `select()` is
-   * synchronous so it BLOCKS the agent's event loop for that whole time (no
-   * heartbeat, no Discord, no MCPL). Overlapping or rapid-fire previews
-   * therefore don't just queue — they stack agent stalls. Reject instead.
-   */
-  private previewInFlight = false;
-  private previewLastAt = 0;
-  private static readonly PREVIEW_COOLDOWN_MS = 3_000;
-
-  /**
-   * Replace the dry run's full rendered entries with a compact display
-   * projection.
-   *
-   * Shipping the entries verbatim cost ~110s of BLOCKED AGENT on Mythos (353
-   * entries, megabytes of content plus any inlined media) against ~8s for the
-   * numbers-only path — and select() builds those entries either way, so the
-   * extra ~100s was pure serialization of data the UI never shows in full: the
-   * pane truncates every body past 600 chars anyway.
-   *
-   * So: keep identity, size and a bounded text preview; drop content blocks and
-   * never inline media. Also removes the blob-resolution heap risk the /curve
-   * handler warns about.
-   */
-  private projectDryEntries(result: unknown): unknown {
-    const r = result as { entries?: unknown[] } & Record<string, unknown>;
-    if (!Array.isArray(r.entries)) return result;
-    const MAX_TEXT = 1_200;
-    const projected = r.entries.map((e, i) => {
-      const o = (e ?? {}) as { participant?: string; role?: string; content?: unknown };
-      let text = '';
-      let media = 0;
-      const blocks = Array.isArray(o.content) ? o.content : [];
-      for (const b of blocks) {
-        if (!b || typeof b !== 'object') { text += String(b ?? ''); continue; }
-        const t = (b as { type?: string }).type;
-        if (t === 'text') text += (b as { text?: string }).text ?? '';
-        else if (t === 'image') { media++; text += '[image]'; }
-        else if (t === 'thinking' || t === 'redacted_thinking') text += '[thinking]';
-        else if (t === 'tool_use') text += `[tool_use ${(b as { name?: string }).name ?? ''}]`;
-        else if (t === 'tool_result') text += '[tool_result]';
-      }
-      if (typeof o.content === 'string') text = o.content;
-      return {
-        i,
-        who: o.participant ?? o.role ?? '?',
-        chars: text.length,
-        media,
-        truncated: text.length > MAX_TEXT,
-        text: text.length > MAX_TEXT ? text.slice(0, MAX_TEXT) : text,
-      };
-    });
-    return { ...r, entries: projected };
-  }
-
   private handleContextPreview(url: URL): Response {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    const agent = app.framework.getAgent(agentName);
-    if (!agent) {
-      return Response.json({ error: `Agent not found: ${agentName}` }, { status: 404 });
-    }
-
-    const budgetRaw = url.searchParams.get('budget');
-    const budget = budgetRaw === null ? NaN : Number(budgetRaw);
-    if (!Number.isSafeInteger(budget) || budget <= 0) {
-      return Response.json({ error: 'budget must be a positive integer' }, { status: 400 });
-    }
-    const tailRaw = url.searchParams.get('tail');
-    const overrides: Record<string, unknown> = {};
-    if (tailRaw !== null) {
-      const tail = Number(tailRaw);
-      if (!Number.isSafeInteger(tail) || tail < 0) {
-        return Response.json({ error: 'tail must be a non-negative integer' }, { status: 400 });
-      }
-      // The strategy knob behind "tail" is recentWindowTokens.
-      overrides.recentWindowTokens = tail;
-    }
-
-    // `render=1` additionally returns the rendered dry context for display.
-    const wantRender = (() => {
-      const v = url.searchParams.get('render');
-      return v !== null && v !== '0' && v !== 'false';
-    })();
-
-    if (this.previewInFlight) {
-      return Response.json(
-        { error: 'a preview is already running — it blocks the agent, so they are serialized' },
-        { status: 429 },
-      );
-    }
-    const sinceLast = Date.now() - this.previewLastAt;
-    if (sinceLast < WebUiModule.PREVIEW_COOLDOWN_MS) {
-      return Response.json(
-        {
-          error: `preview cooling down — ${Math.ceil((WebUiModule.PREVIEW_COOLDOWN_MS - sinceLast) / 1000)}s left. `
-            + 'Each run is a full compile and briefly pauses the agent.',
-        },
-        { status: 429 },
-      );
-    }
-
-    const fw = app.framework as unknown as {
-      previewContextSettings?: (
-        n: string, b: number, o?: Record<string, unknown>, x?: { render?: boolean },
-      ) => unknown;
-    };
-    if (typeof fw.previewContextSettings !== 'function') {
-      return Response.json(
-        { error: 'preview unsupported: this agent-framework build has no previewContextSettings' },
-        { status: 501 },
-      );
-    }
-    this.previewInFlight = true;
-    const startedAt = Date.now();
     try {
-      const result = fw.previewContextSettings(
-        agentName,
-        budget,
-        Object.keys(overrides).length > 0 ? overrides : undefined,
-        wantRender ? { render: true } : undefined,
-      );
-      if (result === null || result === undefined) {
-        return Response.json(
-          {
-            error: 'preview unavailable: the resolved context-manager has no dry-run support, '
-              + 'or the active strategy has no fold plan (non-adaptive)',
-          },
-          { status: 501 },
-        );
-      }
-      // Honest budget accounting. context-manager's `budgetTokens` is the
-      // REJECTION budget: (requested - reserve) * (1 + overBudgetGraceRatio),
-      // i.e. the threshold above which a compile throws. Its `fits` therefore
-      // means "would not hard-fail", NOT "fits the budget you asked for".
-      //
-      // On a recipe with overBudgetGraceRatio 0.35 those differ by a third, so
-      // reporting cm's `fits` verbatim told operators that a budget they
-      // cannot actually reach was fine. Split the two questions apart and let
-      // the panel say which one it means.
-      const r = result as { finalTokens?: number; budgetTokens?: number; exhausted?: boolean };
-      const reserve = app.recipe.agent.maxTokens ?? 16_384;
-      const effectiveBudget = Math.max(0, budget - reserve);
-      const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
-      const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudget;
-      const withinGrace = Number.isFinite(finalTokens) && typeof r.budgetTokens === 'number'
-        ? finalTokens <= r.budgetTokens
-        : undefined;
-      return Response.json({
-        agent: agentName,
-        budget,
-        ...(overrides as object),
-        accounting: {
-          requestedBudgetTokens: budget,
-          reserveForResponseTokens: reserve,
-          /** What the picker actually targets. */
-          effectiveBudgetTokens: effectiveBudget,
-          /** Hard-fail ceiling — requested minus reserve, plus grace. */
-          rejectionBudgetTokens: r.budgetTokens,
-          /** Fits the budget the operator asked for. */
-          fitsRequested,
-          /** Merely tolerated by the grace margin — over budget, but no throw. */
-          withinGrace,
-          /** Exhausted AND over the request => this budget is UNREACHABLE. */
-          unreachable: r.exhausted === true && !fitsRequested,
-        },
-        /** How long the agent was blocked, so the operator sees the real cost. */
-        elapsedMs: Date.now() - startedAt,
-        preview: wantRender ? this.projectDryEntries(result) : result,
-      });
+      const params = panelParamsFromUrl(url);
+      return Response.json(runContextPreview(app, resolveAgent(app, params.agent), params));
     } catch (err) {
-      return Response.json(
-        { error: err instanceof Error ? err.message : String(err) },
-        { status: 500 },
-      );
-    } finally {
-      this.previewInFlight = false;
-      this.previewLastAt = Date.now();
+      return panelErrorResponse(err);
     }
   }
 
   /**
    * Debug endpoint: return the membrane-normalized request the framework would
-   * hand to the model if the agent were activated right now. Delegates to
-   * `framework.previewActivation`. Auth is already enforced by the caller
-   * (`handleHttp`).
+   * hand to the model if the agent were activated right now. Auth is already
+   * enforced by the caller (`handleHttp`).
    *
    * Transparent by default: no inference, no Chronicle writes, no external
-   * MCPL calls — the preview leaves the system state untouched. This omits the
-   * dynamically-gathered injections (lessons/retrieval/MCPL context). Pass
-   * `?injections=1` to gather them for full fidelity, which is NOT transparent:
-   * it can run inference (e.g. RetrievalModule's configured model calls) and fire MCPL
-   * `beforeInference` hooks (whose paired `afterInference` is never sent).
+   * MCPL calls. Pass `?injections=1` to gather the dynamic injections
+   * (lessons/retrieval/MCPL context) for full fidelity, which is NOT
+   * transparent: it can run inference and fire MCPL `beforeInference` hooks.
    */
   private async handleDebugContext(url: URL): Promise<Response> {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return new Response('Not ready', { status: 503 });
-
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    // Default OFF: keep the preview transparent to system state. Opt in to
-    // dynamic injection gathering (and its side effects) with ?injections=1.
-    const injParam = url.searchParams.get('injections');
-    const injections = injParam !== null && injParam !== 'false' && injParam !== '0';
+    const params = panelParamsFromUrl(url);
     const pretty = url.searchParams.get('pretty') !== null && url.searchParams.get('pretty') !== '0';
-
-    if (!app.framework.getAgent(agentName)) {
-      return new Response(
-        JSON.stringify({ error: `Agent not found: ${agentName}` }),
-        { status: 404, headers: { 'content-type': 'application/json' } },
-      );
-    }
-
     try {
-      const request = await app.framework.previewActivation(agentName, { injections });
-      // `transparent` reflects whether this call was side-effect-free.
-      const body = JSON.stringify(
-        { agent: agentName, injections, transparent: !injections, request },
-        null,
-        pretty ? 2 : undefined,
-      );
-      return new Response(body, { headers: { 'content-type': 'application/json' } });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const payload = await buildDebugContext(app, resolveAgent(app, params.agent), params);
       return new Response(
-        JSON.stringify({ error: message }),
-        { status: 500, headers: { 'content-type': 'application/json' } },
+        JSON.stringify(payload, null, pretty ? 2 : undefined),
+        { headers: { 'content-type': 'application/json' } },
       );
+    } catch (err) {
+      return panelErrorResponse(err);
     }
   }
 
   /**
-   * Context curve (GET /debug/context/curve[?agent=<name>]): compile the
-   * agent's window and return one record per compiled entry with its
-   * provenance — kind (raw / L1..Ln summary), rendered token estimate, the
-   * raw-history tokens it covers (leaf messages, recursively through the
-   * summary tree), date span, and full text. The /curve page plots the
-   * cumulative raw→rendered curve from this; slope = local compression rate.
-   *
-   * Same side-effect class as previewActivation / makeup: the compile may
-   * commit resolution updates, exactly as the agent's own next turn would.
-   * No inference, no message writes.
+   * Context curve (GET /debug/context/curve[?agent=<name>]): per-entry
+   * provenance of the live compiled window. Same side-effect class as
+   * previewActivation / makeup: the compile may commit resolution updates,
+   * exactly as the agent's own next turn would. No inference, no writes.
    */
   private async handleContextCurve(url: URL): Promise<Response> {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return new Response('Not ready', { status: 503 });
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    const agent = app.framework.getAgent(agentName);
-    if (!agent) {
-      return new Response(JSON.stringify({ error: `Agent not found: ${agentName}` }), {
-        status: 404, headers: { 'content-type': 'application/json' },
-      });
-    }
     try {
-      const cm = (agent as unknown as { getContextManager: () => any }).getContextManager();
-      // Use the LIVE budget, not the recipe's. Runtime overrides persist in the
-      // `framework/state` Chronicle slot and win over the recipe, so reading
-      // app.recipe here plotted the wrong curve on any agent whose budget had
-      // ever been changed at runtime — which is every agent the settings panel
-      // touches. Fall back to the recipe only if the live read is unavailable.
-      let maxTokens = app.recipe.agent.contextBudgetTokens ?? 200_000;
-      try {
-        const live = (app.framework as unknown as {
-          getAgentRuntimeSettings?: (n: string) => { contextBudgetTokens?: number };
-        }).getAgentRuntimeSettings?.(agentName)?.contextBudgetTokens;
-        if (typeof live === 'number' && live > 0) maxTokens = live;
-      } catch { /* keep the recipe fallback */ }
-      const reserveForResponse = app.recipe.agent.maxTokens ?? 16_384;
-      const compiled = await cm.compile({ maxTokens, reserveForResponse });
-
-      // Curve inspection only needs text and source metadata. Resolving every
-      // historical blob here re-inlines all base64 media and can expand a
-      // few-hundred-MB Chronicle into several GB of JS heap. Use the windowed
-      // reader with blob resolution disabled so production diagnostics stay
-      // bounded by text history rather than the media archive.
-      const messageCount = cm.getMessageCount();
-      const messages: Array<{ id: string; timestamp?: unknown; content?: unknown[] }> =
-        cm.getMessageWindow(0, messageCount, { resolveBlobs: false }).messages;
-      const msgById = new Map(messages.map((mm) => [mm.id, mm]));
-      const estimate = (mm: { content?: unknown[] }): number => {
-        let t = 0;
-        for (const b of (mm.content ?? []) as Array<Record<string, unknown>>) {
-          if (b?.type === 'text') t += Math.ceil(String(b.text ?? '').length / 4);
-          else if (b?.type === 'image') t += 1600;
-          else if (b?.type === 'tool_result') t += Math.ceil(JSON.stringify(b.content ?? '').length / 4);
-          else if (b?.type === 'tool_use') t += Math.ceil(JSON.stringify(b.input ?? {}).length / 4);
-          else if (b?.type === 'thinking') t += Math.ceil(String(b.thinking ?? '').length / 4);
-        }
-        return t;
-      };
-
-      type Summary = { id: string; level: number; content: string; sourceLevel: number; sourceIds: string[] };
-      const strategy = cm.getStrategy() as { summaries?: Summary[] };
-      const sums: Summary[] = strategy.summaries ?? [];
-      const sumById = new Map(sums.map((x) => [x.id, x]));
-      const headOf = (txt: string): string => txt.replace(/\s+/g, ' ').slice(0, 100);
-      const byHead = new Map(sums.map((x) => [headOf(x.content), x]));
-      const leaves = (x: Summary, seen = new Set<string>()): string[] => {
-        if (seen.has(x.id)) return [];
-        seen.add(x.id);
-        if (x.sourceLevel === 0) return x.sourceIds;
-        const out: string[] = [];
-        for (const cid of x.sourceIds) {
-          const c = sumById.get(cid);
-          if (c) out.push(...leaves(c, seen));
-        }
-        return out;
-      };
-
-      const entries = [];
-      let i = 0;
-      for (const e of compiled.messages as Array<{ participant: string; content?: unknown[]; sourceMessageId?: string }>) {
-        const blocks = (e.content ?? []) as Array<Record<string, unknown>>;
-        const text = blocks.filter((b) => b?.type === 'text').map((b) => String(b.text ?? '')).join('\n');
-        const nImages = blocks.filter((b) => b?.type === 'image').length;
-        const rendered = Math.ceil(text.length / 4) + nImages * 1600 +
-          blocks.filter((b) => b?.type === 'tool_result' || b?.type === 'tool_use')
-            .reduce((a, b) => a + Math.ceil(JSON.stringify(b.input ?? b.content ?? '').length / 4), 0);
-        const sum = byHead.get(headOf(text));
-        if (sum) {
-          const leafIds = leaves(sum).filter((id) => msgById.has(id));
-          const rawCovered = leafIds.reduce((a, id) => a + estimate(msgById.get(id)!), 0);
-          const dates = leafIds.map((id) => msgById.get(id)!.timestamp).filter(Boolean).sort();
-          entries.push({
-            i: i++, kind: `L${sum.level}`, id: sum.id, participant: e.participant,
-            rendered, rawCovered, msgCount: leafIds.length, nImages,
-            dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
-          });
-        } else {
-          const src = e.sourceMessageId ? msgById.get(e.sourceMessageId) : null;
-          entries.push({
-            i: i++, kind: 'raw', id: e.sourceMessageId ?? null, participant: e.participant,
-            rendered, rawCovered: src ? estimate(src) : rendered, msgCount: 1, nImages,
-            dateFirst: src?.timestamp ?? null, dateLast: src?.timestamp ?? null, text,
-          });
-        }
-      }
-      return Response.json({
-        agent: agentName,
-        generatedAt: new Date().toISOString(),
-        branch: cm.currentBranch().name,
-        budget: { maxTokens, reserveForResponse },
-        totals: {
-          entries: entries.length,
-          rendered: entries.reduce((a, e) => a + e.rendered, 0),
-          rawCovered: entries.reduce((a, e) => a + e.rawCovered, 0),
-        },
-        entries,
-      });
-    } catch (error) {
-      return new Response(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), {
-        status: 500, headers: { 'content-type': 'application/json' },
-      });
+      return Response.json(await buildContextCurve(app, resolveAgent(app, url.searchParams.get('agent') ?? undefined)));
+    } catch (err) {
+      return panelErrorResponse(err);
     }
   }
 
@@ -1639,93 +1238,22 @@ export class WebUiModule implements Module {
 
   /**
    * Context makeup: the segment breakdown of the agent's current compiled
-   * context — head window, raw middle, summaries by level (L1/L2/L3), and the
-   * recent verbatim tail — from the strategy's RenderStats, plus an exact
-   * total token count via the model's count_tokens endpoint. Transparent:
+   * context, plus an exact total via count_tokens. Transparent:
    * previewActivation + count_tokens only; no inference, no Chronicle writes.
    *
    *   GET /debug/context/makeup[?agent=<name>]
    */
   private async handleContextMakeup(url: URL): Promise<Response> {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return new Response('Not ready', { status: 503 });
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    const agent = app.framework.getAgent(agentName);
-    if (!agent) {
-      return new Response(JSON.stringify({ error: `Agent not found: ${agentName}` }), {
-        status: 404, headers: { 'content-type': 'application/json' },
-      });
-    }
     try {
-      // Populates the strategy's render stats as a side-effect of compiling.
-      const request = await app.framework.previewActivation(agentName);
-      const cm = (agent as { getContextManager: () => { getRenderStats: () => unknown } }).getContextManager();
-      const stats = cm.getRenderStats();
-
-      // Build an Anthropic-faithful payload for an exact count_tokens: map
-      // participants to roles (the agent's own -> assistant, others -> user
-      // with a "Name:" prefix) and merge consecutive same-role runs, mirroring
-      // what the NativeFormatter sends.
-      const textOf = (c: unknown): string =>
-        Array.isArray(c)
-          ? c.map((b) => (b && typeof b === 'object' && (b as { type?: string }).type === 'text' ? (b as { text: string }).text : '')).join('')
-          : String(c ?? '');
-      const merged: Array<{ role: 'user' | 'assistant'; text: string }> = [];
-      for (const m of ((request as { messages?: Array<{ participant?: string; role?: string; content: unknown }> }).messages ?? [])) {
-        const who = m.participant ?? m.role ?? 'user';
-        const role: 'user' | 'assistant' = who === agentName ? 'assistant' : 'user';
-        let t = textOf(m.content);
-        if (role === 'user' && who && who !== 'user') t = `${who}: ${t}`;
-        const last = merged[merged.length - 1];
-        if (last && last.role === role) last.text += '\n' + t;
-        else merged.push({ role, text: t });
-      }
-      const anthMessages = merged.filter((m) => m.text.trim().length > 0).map((m) => ({ role: m.role, content: m.text }));
-      const sysRaw = (request as { system?: unknown }).system;
-      const systemStr = Array.isArray(sysRaw)
-        ? sysRaw.map((b) => (b && typeof b === 'object' ? (b as { text?: string }).text ?? '' : String(b))).join('\n')
-        : (typeof sysRaw === 'string' ? sysRaw : undefined);
-
-      let exactTotalTokens: number | null = null;
-      const countModel = process.env.COUNT_TOKENS_MODEL || 'anthropic/claude-opus-4.5';
-      let countSource = 'count_tokens';
-      try {
-        const base = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
-        const res = await fetch(base + '/v1/messages/count_tokens', {
-          method: 'POST',
-          headers: {
-            // Mirror the main adapter's auth: OAuth Bearer (subscription) when
-            // ANTHROPIC_AUTH_TOKEN is set, x-api-key otherwise.
-            ...(process.env.ANTHROPIC_AUTH_TOKEN
-              ? {
-                  authorization: `Bearer ${process.env.ANTHROPIC_AUTH_TOKEN}`,
-                  'anthropic-beta': 'oauth-2025-04-20',
-                }
-              : { 'x-api-key': process.env.ANTHROPIC_API_KEY ?? '' }),
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
-            'user-agent': 'conhost/1.0',
-          },
-          body: JSON.stringify({ model: countModel, ...(systemStr ? { system: systemStr } : {}), messages: anthMessages }),
-        });
-        if (res.ok) {
-          const j = (await res.json()) as { input_tokens?: number };
-          exactTotalTokens = j.input_tokens ?? null;
-        } else {
-          countSource = `count_tokens_failed_${res.status}`;
-        }
-      } catch {
-        countSource = 'count_tokens_error';
-      }
-
+      const payload = await buildContextMakeup(app, resolveAgent(app, url.searchParams.get('agent') ?? undefined));
       return new Response(
-        JSON.stringify({ agent: agentName, stats, exactTotalTokens, countModel, countSource }, null, 2),
+        JSON.stringify(payload, null, 2),
         { headers: { 'content-type': 'application/json' } },
       );
-    } catch (error) {
-      return new Response(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), {
-        status: 500, headers: { 'content-type': 'application/json' },
-      });
+    } catch (err) {
+      return panelErrorResponse(err);
     }
   }
 
@@ -1992,7 +1520,11 @@ export class WebUiModule implements Module {
       }
 
       case 'request-mcpl': {
-        this.sendMcplList(client);
+        if (isChildScope(parsed.scope)) {
+          void this.sendScopedMcpl(client, parsed.scope!);
+        } else {
+          this.sendMcplList(client);
+        }
         return;
       }
 
@@ -2001,6 +1533,11 @@ export class WebUiModule implements Module {
         return;
       }
 
+      // MCPL mutations stay host-side regardless of panel scope: the registry
+      // FILE is one cwd-shared mcpl-servers.json for the whole fleet, so
+      // "edit clerk's zulip env" and "edit the shared file" are the same
+      // write. Which entries a child actually loads is its recipe's opt-in —
+      // the scoped VIEW (request-mcpl + live) is what differs per child.
       case 'mcpl-add': {
         try {
           const servers = readMcplServersFile(DEFAULT_CONFIG_PATH);
@@ -2057,31 +1594,33 @@ export class WebUiModule implements Module {
       }
 
       case 'request-pins': {
-        const msg = this.buildPinsList(this.resolveSettingsAgent(parsed.agent));
-        if (!msg) {
-          this.send(client, { type: 'error', message: 'pins unavailable on this build' });
-          return;
+        if (isChildScope(parsed.scope)) {
+          void this.sendScopedPins(client, parsed.scope!, parsed.agent);
+        } else {
+          this.sendPinsList(client, parsed.agent);
         }
-        this.send(client, msg);
         return;
       }
 
       // Pins change what the NEXT compile folds, so like settings these
       // broadcast rather than replying to the requester only.
       case 'pin-add': {
-        const agentName = this.resolveSettingsAgent(parsed.agent);
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedPinMutation(client, parsed.scope!, 'pin-add', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+            ...(parsed.kind ? { kind: parsed.kind } : {}),
+            firstMessageId: parsed.firstMessageId,
+            ...(parsed.lastMessageId ? { lastMessageId: parsed.lastMessageId } : {}),
+            ...(parsed.level !== undefined ? { level: parsed.level } : {}),
+            ...(parsed.maxLevel !== undefined ? { maxLevel: parsed.maxLevel } : {}),
+            ...(parsed.name ? { name: parsed.name } : {}),
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
         try {
-          const cm = this.pinnableCm(agentName);
-          const opts: Record<string, unknown> = {};
-          if (parsed.name !== undefined) opts.name = parsed.name;
-          if (parsed.level !== undefined) opts.level = parsed.level;
-          if (parsed.maxLevel !== undefined) opts.maxLevel = parsed.maxLevel;
-          if (parsed.kind === 'document') {
-            cm.markDocument!(parsed.firstMessageId, opts);
-          } else {
-            // A single-message pin is a range of one; the strategy takes both ends.
-            cm.pinRange!(parsed.firstMessageId, parsed.lastMessageId ?? parsed.firstMessageId, opts);
-          }
+          applyPinAdd(app, agentName, parsed as unknown as Record<string, unknown>);
         } catch (err) {
           this.send(client, {
             type: 'error',
@@ -2094,10 +1633,17 @@ export class WebUiModule implements Module {
       }
 
       case 'pin-remove': {
-        const agentName = this.resolveSettingsAgent(parsed.agent);
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedPinMutation(client, parsed.scope!, 'pin-remove', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+            pinId: parsed.pinId,
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
         try {
-          const cm = this.pinnableCm(agentName);
-          const ok = cm.unpin!(parsed.pinId);
+          const ok = applyPinRemove(app, agentName, parsed.pinId);
           if (!ok) {
             // Not an exception: a stale panel can ask twice. Say so plainly and
             // still re-broadcast, so the client converges on reality.
@@ -2115,7 +1661,11 @@ export class WebUiModule implements Module {
       }
 
       case 'request-settings': {
-        this.sendSettingsState(client, parsed.agent);
+        if (isChildScope(parsed.scope)) {
+          void this.sendScopedSettings(client, parsed.scope!, parsed.agent);
+        } else {
+          this.sendSettingsState(client, parsed.agent);
+        }
         return;
       }
 
@@ -2123,17 +1673,22 @@ export class WebUiModule implements Module {
       // rather than replying to the requester only (contrast sendMcplList,
       // which is file-only). Two operators must not see divergent budgets.
       case 'settings-update': {
-        const agentName = this.resolveSettingsAgent(parsed.agent);
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedSettingsMutation(client, parsed.scope!, 'settings-update', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+            ...(parsed.contextBudgetTokens !== undefined ? { contextBudgetTokens: parsed.contextBudgetTokens } : {}),
+            ...(parsed.tailTokens !== undefined ? { tailTokens: parsed.tailTokens } : {}),
+            ...(parsed.transitionPaceTokens !== undefined ? { transitionPaceTokens: parsed.transitionPaceTokens } : {}),
+            ...(parsed.immediate !== undefined ? { immediate: parsed.immediate } : {}),
+            ...(parsed.persist !== undefined ? { persist: parsed.persist } : {}),
+            ...(parsed.notify !== undefined ? { notify: parsed.notify } : {}),
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
         try {
-          const patch: Record<string, number | boolean> = {};
-          if (parsed.contextBudgetTokens !== undefined) patch.contextBudgetTokens = parsed.contextBudgetTokens;
-          if (parsed.tailTokens !== undefined) patch.tailTokens = parsed.tailTokens;
-          if (parsed.transitionPaceTokens !== undefined) patch.transitionPaceTokens = parsed.transitionPaceTokens;
-          if (parsed.immediate !== undefined) patch.immediate = parsed.immediate;
-          const fw = sharedServer!.app.framework as unknown as {
-            updateAgentRuntimeSettings: (n: string, p: unknown, o?: { persist?: boolean }) => unknown;
-          };
-          fw.updateAgentRuntimeSettings(agentName, patch, { persist: parsed.persist !== false });
+          applySettingsUpdate(app, agentName, parsed as unknown as Record<string, unknown>);
         } catch (err) {
           // Expected failures land here and must reach the operator verbatim:
           // budget ≤ max response tokens, or a strategy that cannot prepare a
@@ -2145,18 +1700,25 @@ export class WebUiModule implements Module {
           });
           return;
         }
-        if (parsed.notify === true) this.notifyAgentOfSettingsChange(agentName, 'update');
+        if (parsed.notify === true) notifyAgentOfSettingsChange(app, agentName, 'update');
         this.broadcastSettingsState(agentName);
         return;
       }
 
       case 'settings-reset': {
-        const agentName = this.resolveSettingsAgent(parsed.agent);
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedSettingsMutation(client, parsed.scope!, 'settings-reset', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+            ...(parsed.keys ? { keys: parsed.keys } : {}),
+            ...(parsed.persist !== undefined ? { persist: parsed.persist } : {}),
+            ...(parsed.notify !== undefined ? { notify: parsed.notify } : {}),
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
         try {
-          const fw = sharedServer!.app.framework as unknown as {
-            resetAgentRuntimeSettings: (n: string, k?: string[], o?: { persist?: boolean }) => unknown;
-          };
-          fw.resetAgentRuntimeSettings(agentName, parsed.keys, { persist: parsed.persist !== false });
+          applySettingsReset(app, agentName, parsed as unknown as Record<string, unknown>);
         } catch (err) {
           this.send(client, {
             type: 'error',
@@ -2164,18 +1726,22 @@ export class WebUiModule implements Module {
           });
           return;
         }
-        if (parsed.notify === true) this.notifyAgentOfSettingsChange(agentName, 'reset');
+        if (parsed.notify === true) notifyAgentOfSettingsChange(app, agentName, 'reset');
         this.broadcastSettingsState(agentName);
         return;
       }
 
       case 'settings-cancel-transition': {
-        const agentName = this.resolveSettingsAgent(parsed.agent);
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedSettingsMutation(client, parsed.scope!, 'settings-cancel-transition', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
         try {
-          const fw = sharedServer!.app.framework as unknown as {
-            cancelAgentRuntimeSettingsTransition: (n: string) => unknown;
-          };
-          fw.cancelAgentRuntimeSettingsTransition(agentName);
+          applySettingsCancelTransition(app, agentName);
         } catch (err) {
           this.send(client, {
             type: 'error',
@@ -2290,7 +1856,7 @@ export class WebUiModule implements Module {
   private async sendWorkspaceMounts(client: ClientState): Promise<void> {
     const mod = await this.workspaceMod();
     if (!mod) {
-      this.send(client, { type: 'workspace-mounts', loaded: false, mounts: [] });
+      this.send(client, { type: 'workspace-mounts', scope: 'local', loaded: false, mounts: [] });
       return;
     }
     try {
@@ -2298,6 +1864,7 @@ export class WebUiModule implements Module {
       const data = (result.data ?? {}) as { mounts?: Array<{ name: string; path: string; mode: string }> };
       this.send(client, {
         type: 'workspace-mounts',
+        scope: 'local',
         loaded: true,
         mounts: data.mounts ?? [],
       });
@@ -2325,6 +1892,7 @@ export class WebUiModule implements Module {
       const data = (result.data ?? {}) as { entries?: Array<{ path: string; size: number }> };
       this.send(client, {
         type: 'workspace-tree',
+        scope: 'local',
         mount,
         entries: data.entries ?? [],
       });
@@ -2381,6 +1949,7 @@ export class WebUiModule implements Module {
       }
       this.send(client, {
         type: 'workspace-file',
+        scope: 'local',
         path: data.path ?? path,
         totalLines,
         fromLine: data.fromLine ?? 1,
@@ -2397,24 +1966,23 @@ export class WebUiModule implements Module {
    *  config path is whatever the host's mcpl-config module resolves at
    *  module-load time — usually `<cwd>/mcpl-servers.json`. */
   private sendMcplList(client: ClientState): void {
-    let servers: ReturnType<typeof readMcplServersFile> = {};
-    try { servers = readMcplServersFile(DEFAULT_CONFIG_PATH); }
-    catch { /* missing or malformed file → empty list */ }
-    const out: McplListMessage = {
-      type: 'mcpl-list',
-      configPath: DEFAULT_CONFIG_PATH,
-      servers: Object.entries(servers).map(([id, entry]) => ({
-        id,
-        command: entry.command,
-        ...(entry.args ? { args: entry.args } : {}),
-        ...(entry.env ? { env: entry.env } : {}),
-        ...(entry.toolPrefix ? { toolPrefix: entry.toolPrefix } : {}),
-        ...(entry.reconnect !== undefined ? { reconnect: entry.reconnect } : {}),
-        ...(entry.enabledFeatureSets ? { enabledFeatureSets: entry.enabledFeatureSets } : {}),
-        ...(entry.disabledFeatureSets ? { disabledFeatureSets: entry.disabledFeatureSets } : {}),
-      })),
+    const app = this.panelApp();
+    if (!app) return;
+    const snap = buildMcplSnapshot(app) as {
+      configPath: string;
+      servers: McplListMessage['servers'];
+      live: McplLiveServer[];
     };
+    const out: McplListMessage = { type: 'mcpl-list', scope: 'local', ...snap };
     this.send(client, out);
+  }
+
+  /** Scoped MCPL view: the child's own runPanelOp('mcpl') — same shared
+   *  registry file, but the LIVE list is the child's actual loaded servers. */
+  private async sendScopedMcpl(client: ClientState, scope: string): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, 'mcpl', {});
+    if (data === null) return;
+    this.send(client, { type: 'mcpl-list', scope, ...(data as object) } as WebUiServerMessage);
   }
 
   /** Build a BranchesListMessage from the agent's context manager. Lineage
@@ -2458,7 +2026,7 @@ export class WebUiModule implements Module {
       | { getLessons(): Array<{ id: string; content: string; confidence: number; tags: string[]; deprecated: boolean; deprecationReason?: string; created?: number; updated?: number }> }
       | undefined;
     if (!lessonsMod) {
-      this.send(client, { type: 'lessons-list', loaded: false, lessons: [] });
+      this.send(client, { type: 'lessons-list', scope: 'local', loaded: false, lessons: [] });
       return;
     }
     const lessons = lessonsMod.getLessons().map(l => ({
@@ -2471,7 +2039,7 @@ export class WebUiModule implements Module {
       ...(typeof l.created === 'number' ? { created: l.created } : {}),
       ...(typeof l.updated === 'number' ? { updated: l.updated } : {}),
     }));
-    this.send(client, { type: 'lessons-list', loaded: true, lessons });
+    this.send(client, { type: 'lessons-list', scope: 'local', loaded: true, lessons });
   }
 
   /** Names of fleet children currently running. Empty when no fleet module
@@ -2850,215 +2418,140 @@ export class WebUiModule implements Module {
     }
   }
 
-  /** Duck-typed pin surface. Throws with a clear reason rather than returning a
-   *  half-usable object, so handlers can report it to the operator verbatim. */
-  private pinnableCm(agentName: string): {
-    pinRange?: (a: string, b: string, o?: unknown) => string;
-    markDocument?: (a: string, o?: unknown) => string;
-    unpin?: (id: string) => boolean;
-    listPins?: () => ReadonlyArray<Record<string, unknown>>;
-  } {
-    const app = sharedServer?.app;
-    if (!app) throw new Error('app not bound yet');
-    const agent = app.framework.getAgent(agentName);
-    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
-    const cm = agent.getContextManager() as unknown as {
-      pinRange?: (a: string, b: string, o?: unknown) => string;
-      markDocument?: (a: string, o?: unknown) => string;
-      unpin?: (id: string) => boolean;
-      listPins?: () => ReadonlyArray<Record<string, unknown>>;
-    };
-    if (typeof cm.listPins !== 'function' || typeof cm.pinRange !== 'function') {
-      throw new Error('the active context strategy does not support pins');
+  // -------------------------------------------------------------------------
+  // Pins + settings senders — all snapshot/mutation logic lives in the shared
+  // panel-data layer; these wrappers only add wire envelopes, scope stamps,
+  // and requester-vs-broadcast routing.
+  // -------------------------------------------------------------------------
+
+  private sendPinsList(client: ClientState, agentName?: string): void {
+    const app = this.panelApp();
+    if (!app) return;
+    try {
+      const snap = buildPinsSnapshot(app, resolveAgent(app, agentName));
+      this.send(client, { type: 'pins-list', scope: 'local', ...snap });
+    } catch (err) {
+      this.send(client, {
+        type: 'error',
+        message: `pins unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      });
     }
-    return cm;
   }
 
-  /**
-   * Pin snapshot. Never throws — an unsupported strategy is a legitimate
-   * read-only state for the panel, not an error to surface.
-   *
-   * `levelHonored` matters: pin-AT-level is implemented only by the kv-stable
-   * controller. Elsewhere it degrades to raw, which is a safe superset but not
-   * what the operator asked for, so the UI needs to be able to say so.
-   */
-  private buildPinsList(agentName: string): PinsListMessage | null {
-    const app = sharedServer?.app;
-    if (!app) return null;
-    let pins: PinsListMessage['pins'] = [];
-    let supported = false;
-    try {
-      const cm = this.pinnableCm(agentName);
-      pins = (cm.listPins!() ?? []).map((p) => ({
-        id: String(p.id),
-        firstMessageId: String(p.firstMessageId),
-        lastMessageId: String(p.lastMessageId),
-        kind: p.kind === 'document' ? 'document' : 'pin',
-        ...(typeof p.name === 'string' ? { name: p.name } : {}),
-        created: typeof p.created === 'number' ? p.created : 0,
-        ...(typeof p.level === 'number' ? { level: p.level } : {}),
-        ...(typeof p.maxLevel === 'number' ? { maxLevel: p.maxLevel } : {}),
-      }));
-      supported = true;
-    } catch {
-      supported = false;
+  /** Scoped pins view. Asks the child for picker candidates too — the SPA
+   *  has no window into a child's message store to build its own list. */
+  private async sendScopedPins(client: ClientState, scope: string, agentName?: string): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, 'pins', {
+      ...(agentName ? { agent: agentName } : {}),
+      withCandidates: true,
+    });
+    if (data === null) return;
+    this.send(client, { type: 'pins-list', scope, ...(data as object) } as WebUiServerMessage);
+  }
+
+  /** Run pin-add / pin-remove in a fleet child; the op returns the fresh
+   *  pins snapshot, which BROADCASTS (pins alter the next compile's fold
+   *  plan — two operators must not hold divergent views, same rule as the
+   *  local path). A `warning` in the data (stale pin-remove) goes back to
+   *  the requester only. */
+  private async applyScopedPinMutation(
+    client: ClientState,
+    scope: string,
+    op: 'pin-add' | 'pin-remove',
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, op, { ...params, withCandidates: true });
+    if (data === null) return;
+    const warning = (data as { warning?: unknown }).warning;
+    if (typeof warning === 'string') {
+      this.send(client, { type: 'error', message: warning });
     }
-
-    let levelHonored = false;
-    let deepestLevel: number | undefined;
-    try {
-      const strategyCfg = (app.recipe.agent as unknown as {
-        strategy?: { foldingStrategy?: string };
-      }).strategy;
-      levelHonored = strategyCfg?.foldingStrategy === 'kv-stable';
-      const agent = app.framework.getAgent(agentName);
-      const cm = agent?.getContextManager() as unknown as {
-        getSummaries?: () => Array<{ level?: number }>;
-      } | undefined;
-      const sums = cm?.getSummaries?.() ?? [];
-      for (const s of sums) {
-        if (typeof s.level === 'number' && (deepestLevel === undefined || s.level > deepestLevel)) {
-          deepestLevel = s.level;
-        }
-      }
-    } catch { /* informational only */ }
-
-    return {
-      type: 'pins-list',
-      agent: agentName,
-      pins,
-      pinsSupported: supported,
-      levelHonored,
-      ...(deepestLevel !== undefined ? { deepestLevel } : {}),
-    };
+    this.broadcastToWelcomed({ type: 'pins-list', scope, ...(data as object) } as WebUiServerMessage);
   }
 
   private broadcastPinsList(agentName: string): void {
-    if (!sharedServer?.app) return;
-    const msg = this.buildPinsList(agentName);
-    if (!msg) return;
-    for (const c of sharedServer.clients.values()) {
-      if (c.welcomed) this.send(c, msg);
-    }
-  }
-
-  /** Default to the recipe's primary agent when the client omits a name. */
-  private resolveSettingsAgent(name?: string): string {
-    if (name) return name;
-    const app = sharedServer?.app;
-    return app?.recipe.agent.name ?? app?.framework.getAllAgents()[0]?.name ?? 'agent';
-  }
-
-  /**
-   * Build the settings snapshot. Never throws: this feeds a panel, and a
-   * strategy that isn't hot-configurable is a legitimate state to render
-   * read-only rather than an error to surface.
-   */
-  private buildSettingsState(agentName: string): SettingsStateMessage | null {
-    const app = sharedServer?.app;
-    if (!app) return null;
-    const fw = app.framework as unknown as {
-      getAgentRuntimeSettings?: (n: string) => Record<string, unknown>;
-      getAgent?: (n: string) => unknown;
-    };
-    if (typeof fw.getAgentRuntimeSettings !== 'function') return null;
-
-    let settings: Record<string, unknown>;
+    const app = this.panelApp();
+    if (!app) return;
     try {
-      settings = fw.getAgentRuntimeSettings(agentName);
-    } catch {
-      return null;
-    }
-
-    // Which knobs this build can apply live, probed rather than assumed: the
-    // hot set is a property of the ACTIVE strategy, not of the host version.
-    let hotConfigurable = false;
-    let previewAvailable = false;
-    try {
-      const agent = app.framework.getAgent(agentName);
-      const cm = agent?.getContextManager() as unknown as {
-        getHotContextSettings?: () => unknown;
-        previewContext?: unknown;
-      } | undefined;
-      hotConfigurable = !!cm && typeof cm.getHotContextSettings === 'function'
-        && cm.getHotContextSettings() !== null;
-      // Older context-manager builds resolve without previewContext. Report it
-      // so the panel says "preview unavailable on this build" instead of
-      // rendering an empty chart and looking broken.
-      previewAvailable = !!cm && typeof cm.previewContext === 'function';
-    } catch { /* leave both false — read-only panel */ }
-
-    const overrides: string[] = [];
-    try {
-      const agent = app.framework.getAgent(agentName) as unknown as {
-        getRuntimeSettingsOverrides?: () => Record<string, unknown>;
-      } | undefined;
-      const ov = agent?.getRuntimeSettingsOverrides?.() ?? {};
-      for (const [k, val] of Object.entries(ov)) if (val !== undefined) overrides.push(k);
-    } catch { /* informational only */ }
-
-    return {
-      type: 'settings-state',
-      agent: agentName,
-      settings: settings as SettingsStateMessage['settings'],
-      overrides,
-      // contextBudgetTokens is applied by the Agent itself; the other three are
-      // forwarded into the strategy's hot-settings channel, so they need a
-      // hot-configurable strategy to mean anything.
-      hotKeys: hotConfigurable
-        ? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']
-        : ['contextBudgetTokens'],
-      hotConfigurable,
-      previewAvailable,
-    };
+      const snap = buildPinsSnapshot(app, agentName);
+      this.broadcastToWelcomed({ type: 'pins-list', scope: 'local', ...snap });
+    } catch { /* pins unsupported — nothing to broadcast */ }
   }
 
   private sendSettingsState(client: ClientState, agentName?: string): void {
-    const msg = this.buildSettingsState(this.resolveSettingsAgent(agentName));
+    const app = this.panelApp();
+    if (!app) return;
+    const msg = buildSettingsState(app, resolveAgent(app, agentName));
     if (!msg) {
       this.send(client, { type: 'error', message: 'runtime settings unavailable on this build' });
       return;
     }
-    this.send(client, msg);
+    this.send(client, { type: 'settings-state', scope: 'local', ...msg } as WebUiServerMessage);
+  }
+
+  private async sendScopedSettings(client: ClientState, scope: string, agentName?: string): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, 'settings',
+      agentName ? { agent: agentName } : {});
+    if (data === null) return;
+    this.send(client, { type: 'settings-state', scope, ...(data as object) } as WebUiServerMessage);
+  }
+
+  /** Run a settings mutation in a fleet child. The op applies the change AND
+   *  returns the fresh state in one round trip; like the local path, the
+   *  result broadcasts to every welcomed client. */
+  private async applyScopedSettingsMutation(
+    client: ClientState,
+    scope: string,
+    op: 'settings-update' | 'settings-reset' | 'settings-cancel-transition',
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, op, params);
+    if (data === null) return;
+    this.broadcastToWelcomed({ type: 'settings-state', scope, ...(data as object) } as WebUiServerMessage);
   }
 
   /** Fan out to every welcomed client — settings are live process state. */
   private broadcastSettingsState(agentName: string): void {
-    if (!sharedServer?.app) return;
-    const msg = this.buildSettingsState(agentName);
+    const app = this.panelApp();
+    if (!app) return;
+    const msg = buildSettingsState(app, agentName);
     if (!msg) return;
+    this.broadcastToWelcomed({ type: 'settings-state', scope: 'local', ...msg } as WebUiServerMessage);
+  }
+
+  private broadcastToWelcomed(msg: WebUiServerMessage): void {
+    if (!sharedServer) return;
     for (const c of sharedServer.clients.values()) {
       if (c.welcomed) this.send(c, msg);
     }
   }
 
   /**
-   * Opt-in push notice to the agent that an operator changed its context
-   * settings. OFF by default at the protocol level, because this injects text
-   * into the very context being tuned: it invalidates the KV prefix and is
-   * itself classifier-visible. The zero-cost alternative the agent always has
-   * is to PULL via its `agent_settings` tool.
+   * Run one panel op in a fleet child and hand back its data, or send the
+   * error to the requesting client and return null. The WS twin of
+   * proxyPanelToChild — corrId bookkeeping lives inside requestPanel, so
+   * unlike routeFleetRequest there is no pendingFleetRequests entry.
    */
-  private notifyAgentOfSettingsChange(agentName: string, kind: 'update' | 'reset'): void {
-    try {
-      const app = sharedServer?.app;
-      if (!app) return;
-      const s = this.buildSettingsState(agentName);
-      const budget = s?.settings.contextBudgetTokens;
-      const tail = s?.settings.tailTokens;
-      const transition = s?.settings.transition;
-      const text = kind === 'reset'
-        ? `[operator] context settings reset to recipe defaults`
-        : `[operator] context settings changed`
-          + (budget !== undefined ? ` — budget ${budget}` : '')
-          + (tail !== undefined ? `, tail ${tail}` : '')
-          + (transition === 'converging' ? ' (converging gradually)' : '');
-      const cm = app.framework.getAgent(agentName)?.getContextManager();
-      cm?.addMessage('Context Manager', [{ type: 'text', text }], { system: true });
-    } catch (err) {
-      // A failed notice must never fail the apply that already succeeded.
-      console.warn('[settings] notify failed (change still applied):', err);
+  private async requestChildPanel(
+    client: ClientState,
+    childName: string,
+    op: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown | null> {
+    const fleet = this.fleetModule();
+    if (!fleet) {
+      this.send(client, { type: 'error', message: 'fleet module not loaded' });
+      return null;
     }
+    const result = await fleet.requestPanel(childName, op, params);
+    if (!result.ok) {
+      this.send(client, {
+        type: 'error',
+        message: `${op} on '${childName}' failed: ${result.error ?? 'unknown error'}`,
+      });
+      return null;
+    }
+    return result.data ?? {};
   }
 
   private broadcastBranchChanged(): void {

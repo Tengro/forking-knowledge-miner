@@ -19,14 +19,20 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
-    // Dev server proxies WS to the running conhost so `bun run dev` in web/
-    // talks to a real backend. Port matches WebUiModule default.
+    // Dev server proxies WS + HTTP surfaces to the running conhost so
+    // `bun run dev` in web/ talks to a real backend. Port matches the
+    // WebUiModule default. Without the HTTP entries every /debug and
+    // /healthz fetch 404s against Vite itself in dev.
     proxy: {
       '/ws': {
         target: 'ws://127.0.0.1:7340',
         ws: true,
         changeOrigin: true,
       },
+      '/debug': { target: 'http://127.0.0.1:7340', changeOrigin: true },
+      '/healthz': { target: 'http://127.0.0.1:7340', changeOrigin: true },
+      '/curve': { target: 'http://127.0.0.1:7340', changeOrigin: true },
+      '/files': { target: 'http://127.0.0.1:7340', changeOrigin: true },
     },
   },
 });

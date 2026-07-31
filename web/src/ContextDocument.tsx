@@ -11,7 +11,7 @@
  * the middle are styled distinctly.
  */
 
-import { createSignal, onMount, For, Show } from 'solid-js';
+import { createEffect, createSignal, on, For, Show } from 'solid-js';
 
 interface Msg { participant?: string; role?: string; content: unknown }
 interface Seg { messages: number; tokens: number }
@@ -30,30 +30,45 @@ function textOf(c: unknown): string {
   return String(c ?? '');
 }
 
-export function ContextDocument(props: { agent?: string; scrollRoot?: () => HTMLElement | undefined }) {
+export function ContextDocument(props: { scope?: string; scrollRoot?: () => HTMLElement | undefined }) {
   const [msgs, setMsgs] = createSignal<Msg[]>([]);
   const [stats, setStats] = createSignal<Stats | null>(null);
   const [exact, setExact] = createSignal<number | null>(null);
   const [err, setErr] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(false);
 
+  /** Fleet-child scopes route through the host's ?scope= proxy. */
+  const query = () => props.scope && props.scope !== 'local'
+    ? `?scope=${encodeURIComponent(props.scope)}`
+    : '';
+
   const load = async () => {
+    const scopeAtStart = props.scope;
     setLoading(true); setErr(null);
     try {
-      const q = props.agent ? `?agent=${encodeURIComponent(props.agent)}` : '';
+      const q = query();
       const [ctxRes, mkRes] = await Promise.all([
         fetch(`/debug/context${q}`, { credentials: 'same-origin' }),
         fetch(`/debug/context/makeup${q}`, { credentials: 'same-origin' }),
       ]);
-      if (!ctxRes.ok) throw new Error(`context HTTP ${ctxRes.status}`);
+      if (!ctxRes.ok) {
+        const body = (await ctxRes.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `context HTTP ${ctxRes.status}`);
+      }
       const ctx = await ctxRes.json();
+      if (props.scope !== scopeAtStart) return; // scope switched mid-flight
       setMsgs((ctx?.request?.messages ?? []) as Msg[]);
       if (mkRes.ok) { const mk = await mkRes.json(); setStats(mk.stats); setExact(mk.exactTotalTokens); }
     } catch (e) {
+      if (props.scope !== scopeAtStart) return;
       setErr(e instanceof Error ? e.message : String(e));
     } finally { setLoading(false); }
   };
-  onMount(load);
+  // Initial load AND scope-switch refetch, clearing the stale document first.
+  createEffect(on(() => props.scope, () => {
+    setMsgs([]); setStats(null); setExact(null); setErr(null);
+    void load();
+  }));
 
   // Zone boundaries from the makeup counts (render order: head | middle | tail).
   const headN = () => stats()?.head.messages ?? 0;
