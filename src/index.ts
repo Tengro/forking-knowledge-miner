@@ -467,7 +467,7 @@ async function createFramework(
       if (identityModule) {
         const identity = identityModule;
         const audience = withEnv.access as string;
-        withEnv.tokenProvider = () => identity.getFreshToken(audience);
+        withEnv.accessProvider = () => identity.accessFor(audience);
       } else {
         console.error(
           `[mcpl] server "${server.id}": access "${withEnv.access}" declared but the recipe has no identity module — connecting without credentials`,

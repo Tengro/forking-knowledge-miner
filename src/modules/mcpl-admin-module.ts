@@ -92,8 +92,8 @@ export class McplAdminModule implements Module {
    *  the identity module): lets deployed servers name an `access` grant that
    *  the host turns into a per-dial credential provider. The agent names the
    *  access; credentials never surface. */
-  private identity: { getFreshToken(audience?: string): Promise<string> } | null = null;
-  setIdentity(identity: { getFreshToken(audience?: string): Promise<string> } | null): void {
+  private identity: { accessFor(audience?: string): Promise<string> } | null = null;
+  setIdentity(identity: { accessFor(audience?: string): Promise<string> } | null): void {
     this.identity = identity;
   }
 
@@ -308,7 +308,7 @@ export class McplAdminModule implements Module {
       const audience = entry.access;
       // Fresh credential on every dial, resolved host-side; the overlay
       // stores only the access NAME. See identity-module.ts header.
-      config.tokenProvider = () => identity.getFreshToken(audience);
+      config.accessProvider = () => identity.accessFor(audience);
     }
 
     const alreadyLoaded = framework.listMcplServers().some(s => s.id === id);
