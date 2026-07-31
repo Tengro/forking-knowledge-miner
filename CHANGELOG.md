@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Upgrade notes
+
+- **subagents/lessons/retrieval are now opt-in** (they were opt-out, and
+  DEFAULT_RECIPE enabled all three). A recipe that omits them ran them under
+  v0.7.2 and stops running them on this upgrade — that is the fix for
+  "lessons injected despite following the onboarding guide" (Discord issue
+  #32) working as intended. A recipe that *explicitly* enables them keeps
+  them, deliberately: a defaults change cannot tell old boilerplate from a
+  real choice. Before upgrading an existing deployment, run
+
+      bun scripts/audit-module-optins.ts <recipes-and-data-dirs...>
+
+  It reports every explicit enable, every omission that changes behavior,
+  and every retrieval-without-lessons combination that would go silently
+  inert — and modifies nothing; the decisions stay with the operator.
+  Persisted `data/.recipe.json` files are launch-time snapshots, not
+  authoritative sources — the audit lists them separately as pointers back
+  to the source recipe. Retrieved-lesson injection also moved from the
+  system prompt to after the last user message, which keeps the stable
+  prefix KV-cacheable.
+
 ### Changed
 
 - **Subscription-GC closes carry honest provenance and respect explicit
