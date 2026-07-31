@@ -4,6 +4,26 @@
 
 ### Changed
 
+- **Prompt caching enabled on Bedrock for models that support it**
+  (Discord issue #35). The previous transport-wide `promptCaching: false`
+  was a workaround for "your request did not allow prompt caching" —
+  which turned out to be the account-level denial for 3.5 Sonnet v2
+  (caching there was preview-only and dropped at Bedrock's GA), not a
+  transport property. Caching is now gated per model
+  (`bedrockModelSupportsPromptCaching`): on for the Bedrock caching-GA
+  lineup (3.5 Haiku, 3.7 Sonnet, Claude 4+), off for Claude 3.x and
+  3.5 Sonnet. New recipe field `agent.promptCaching: boolean` overrides
+  the gate in either direction (any provider) — `true` opts a
+  grandfathered preview account back into 3.6 caching, `false` covers
+  other denied accounts/regions. `cacheTtl` is no longer forwarded on
+  bedrock: that transport only has the default 5-minute cache and
+  rejects the ttl field. Verified live 2026-07-31: every currently
+  invokable Claude on Bedrock (all 4-era; 3.5-era and opus-4-0514 are
+  EOL there) writes and reads the cache cleanly. Requires
+  `@animalabs/membrane` ≥ 0.5.77 (cache_control ttl strip, stream cache
+  usage capture, 4-era inference-profile model mapping); the dependency
+  and lockfile are bumped accordingly in this change.
+
 - **Subscription-GC closes carry honest provenance and respect explicit
   opens** (Discord issue #5, the Mythos "channel settings keep resetting"
   mechanism). GC closes are now recorded as `subscription-gc`, never
