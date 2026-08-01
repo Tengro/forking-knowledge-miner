@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **Operator retrieval traces.** The Web UI now exposes operator-only,
+  process-memory retrieval traces at `/debug/retrieval` and a readable
+  lesson-selection viewer at `/debug/retrieval/view`, including invoking-agent
+  attribution, mechanical candidates, relevance decisions, cache provenance,
+  and the exact injected lesson block. Exact conversation/model inputs remain
+  opt-in via literal `includeInputs=1`.
+
 ### Fixed
 
 - **OpenAI retrieval reasoning effort.** Recipes using `openai-responses` or

@@ -185,6 +185,7 @@ non-loopback binds require basic-auth credentials. Build the SPA bundle once wit
 - Ops alerts (compression quarantine, refusal streaks, inference-exhausted) render as persistent banner rows
 - Usage panel: per-agent costs and a billing-grade call ledger with cache verdicts
 - `/curve` — compression-curve visualization; `/healthz` — liveness JSON for doctor/fleet tooling
+- `/debug/retrieval/view` — operator-only per-run lesson selection viewer (see `docs/retrieval-traces.md`)
 - Read-only observer access via Ed25519 device keys with per-grant scopes (see `docs/webui-deployment.md`)
 
 For SPA development: `cd web && bun run dev` proxies the Vite dev server onto a
