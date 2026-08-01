@@ -11,13 +11,18 @@
   (caching there was preview-only and dropped at Bedrock's GA), not a
   transport property. Caching is now gated per model
   (`bedrockModelSupportsPromptCaching`): on for the Bedrock caching-GA
-  lineup (3.5 Haiku, 3.7 Sonnet, Claude 4+), off for Claude 3.x and
-  3.5 Sonnet. New recipe field `agent.promptCaching: boolean` overrides
-  the gate in either direction (any provider) — `true` opts a
-  grandfathered preview account back into 3.6 caching, `false` covers
-  other denied accounts/regions. `cacheTtl` is no longer forwarded on
-  bedrock: that transport only has the default 5-minute cache and
-  rejects the ttl field. Verified live 2026-07-31: every currently
+  lineup (3.5 Haiku, 3.7 Sonnet, Claude 4+), off for the pre-GA families
+  (Claude v2/instant, Claude 3, 3.5 Sonnet — matched at the family
+  boundary, so bare aliases and `-latest` forms gate the same as dated
+  ids; non-Claude Bedrock ids are conservatively off). New recipe field
+  `agent.promptCaching: boolean` overrides the gate in either direction
+  on any provider, and lands at both layers — per-agent config and
+  Membrane's default for internal callers (compression/merge) — for
+  accounts/regions whose entitlements differ from the GA table.
+  `cacheTtl` is withheld at the host layer on bedrock (Agent Framework
+  still supplies its own default downstream; membrane ≥ 0.5.77 strips
+  the ttl field at the provider boundary, so the wire request never
+  carries it either way). Verified live 2026-07-31: every currently
   invokable Claude on Bedrock (all 4-era; 3.5-era and opus-4-0514 are
   EOL there) writes and reads the cache cleanly. Requires
   `@animalabs/membrane` ≥ 0.5.77 (cache_control ttl strip, stream cache
