@@ -21,6 +21,8 @@
  */
 
 import { CURVE_PAGE_HTML } from './web-ui-curve-page.js';
+import { RETRIEVAL_TRACE_PAGE_HTML } from './retrieval-trace-page.js';
+import type { RetrievalTraceSource } from './retrieval-trace.js';
 import type {
   AgentFramework,
   Module,
@@ -975,6 +977,8 @@ export class WebUiModule implements Module {
 
   private async handleHttp(req: Request, server: ReturnType<typeof Bun.serve>): Promise<Response> {
     const url = new URL(req.url);
+    const isRetrievalTraceRoute = url.pathname === '/debug/retrieval'
+      || url.pathname === '/debug/retrieval/view';
 
     // Observer feature gate: live only when grants exist. With no grants
     // every path below reduces to the historical basic-auth-only behavior.
@@ -1014,6 +1018,7 @@ export class WebUiModule implements Module {
     // authenticate at all.
     const session = sharedServer!.observerSessions.lookup(sessionTokenFromRequest(req));
     const basicOk = this.checkAuth(req) || (session?.full ?? false);
+    const operatorAuthenticated = this.config.basicAuth !== undefined && basicOk;
     const sessionScopes = basicOk ? null : session?.scopes ?? null;
     const httpAllowed = (scope: ObserverScope): boolean =>
       basicOk || (sessionScopes?.has(scope) ?? false);
@@ -1042,12 +1047,12 @@ export class WebUiModule implements Module {
       && url.pathname !== '/healthz'
       && !url.pathname.startsWith('/files/');
     if (!basicOk && !(observersActive && isStatic) && !sessionScopes) {
-      return this.unauthorized();
+      return this.unauthorized(isRetrievalTraceRoute);
     }
 
     // Per-route scope gates for observer sessions (basic auth passes all).
     if ((url.pathname.startsWith('/debug/') || url.pathname === '/curve') && !httpAllowed('debug')) {
-      return this.unauthorized();
+      return this.unauthorized(isRetrievalTraceRoute);
     }
     if (url.pathname === '/healthz' && !httpAllowed('health')) {
       return this.unauthorized();
@@ -1057,6 +1062,23 @@ export class WebUiModule implements Module {
       // observer scope model (they are the agent's working files, not wire
       // events). Revisit if a 'files' scope is ever warranted.
       return this.unauthorized();
+    }
+
+    // Retrieval traces can include lesson contents, raw selector output, and
+    // opt-in recent conversation. Keep them operator-only: a password-authenticated
+    // full session is equivalent to Basic Auth, but observer `debug` scope is not.
+    if (isRetrievalTraceRoute && !operatorAuthenticated) return this.unauthorized(true);
+
+    if (url.pathname === '/debug/retrieval/view') {
+      return new Response(RETRIEVAL_TRACE_PAGE_HTML, {
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
+    if (url.pathname === '/debug/retrieval') {
+      return this.handleRetrievalTraces(url);
     }
 
     // Debug: the membrane-normalized request that WOULD be emitted if the
@@ -1579,6 +1601,40 @@ export class WebUiModule implements Module {
         status: 500, headers: { 'content-type': 'application/json' },
       });
     }
+  }
+
+  private handleRetrievalTraces(url: URL): Response {
+    try {
+      const app = sharedServer?.app;
+      if (!app) return this.retrievalJson({ error: 'app not bound yet' }, { status: 503 });
+
+      const module = app.framework.getAllModules().find(candidate => candidate.name === 'retrieval') as
+        | (RetrievalTraceSource & { name: string })
+        | undefined;
+      if (!module || typeof module.getRetrievalTraces !== 'function') {
+        return this.retrievalJson(
+          { schemaVersion: 1, enabled: false, includeInputs: false, traces: [] },
+        );
+      }
+
+      const requestedLimit = Number(url.searchParams.get('limit') ?? '20');
+      const limit = Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : 20;
+      const includeInputs = url.searchParams.get('includeInputs') === '1';
+      const traces = module.getRetrievalTraces({ limit, includeInputs });
+      return this.retrievalJson({ schemaVersion: 1, enabled: true, includeInputs, traces });
+    } catch (error) {
+      let message = 'unavailable error';
+      try {
+        message = error instanceof Error ? error.message : String(error);
+      } catch { /* keep the safe fallback */ }
+      return this.retrievalJson({ error: message }, { status: 500 });
+    }
+  }
+
+  private retrievalJson(value: unknown, init: ResponseInit = {}): Response {
+    const headers = new Headers(init.headers);
+    headers.set('cache-control', 'no-store');
+    return Response.json(value, { ...init, headers });
   }
 
   /**
@@ -3273,10 +3329,12 @@ export class WebUiModule implements Module {
     return userOk && passOk;
   }
 
-  private unauthorized(): Response {
+  private unauthorized(noStore = false): Response {
+    const headers = new Headers({ 'www-authenticate': 'Basic realm="connectome-host"' });
+    if (noStore) headers.set('cache-control', 'no-store');
     return new Response('Unauthorized', {
       status: 401,
-      headers: { 'www-authenticate': 'Basic realm="connectome-host"' },
+      headers,
     });
   }
 }

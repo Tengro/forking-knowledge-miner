@@ -24,6 +24,11 @@ import type {
 import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
 import type { ContextInjection } from '@animalabs/context-manager';
 import type { LessonsModule, Lesson } from './lessons-module.js';
+import {
+  RetrievalTraceStore,
+  type RetrievalTraceListOptions,
+  type RetrievalTraceRun,
+} from './retrieval-trace.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -33,6 +38,12 @@ export type RetrievalReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | '
 
 export interface RetrievalReasoningConfig {
   effort: RetrievalReasoningEffort;
+}
+
+interface RecentRetrievalContext {
+  text: string;
+  messageCount: number;
+  messageIds: string[];
 }
 
 export interface RetrievalModuleConfig {
@@ -75,6 +86,10 @@ export class RetrievalModule implements Module {
   private config: RetrievalModuleConfig;
   private lastContextHash = '';
   private cachedInjections: ContextInjection[] = [];
+  private cachedLessonIds: string[] = [];
+  private cachedLessons: Lesson[] = [];
+  private cachedSourceTraceId: number | undefined;
+  private readonly traceStore = new RetrievalTraceStore();
 
   constructor(config: RetrievalModuleConfig) {
     this.config = config;
@@ -101,50 +116,115 @@ export class RetrievalModule implements Module {
     return {};
   }
 
+  /** Recent retrieval runs, newest first. Exact conversation inputs are opt-in. */
+  getRetrievalTraces(options?: RetrievalTraceListOptions) {
+    return this.traceStore.list(options);
+  }
+
+  private beginTrace(agentName: string): RetrievalTraceRun | undefined {
+    try {
+      const providerParams = this.retrievalProviderParams();
+      return this.traceStore.begin({
+        agentName,
+        model: this.config.retrievalModel ?? 'claude-haiku-4-5-20251001',
+        ...(this.config.retrievalReasoning
+          ? { requestedReasoning: this.config.retrievalReasoning }
+          : {}),
+        ...(providerParams ? { providerParams } : {}),
+        minConfidence: this.config.minConfidence ?? 0.3,
+        maxCandidates: 20,
+        maxInjectedLessons: this.config.maxInjectedLessons ?? 5,
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * Run the 3-step retrieval pipeline before each inference.
    */
-  async gatherContext(_agentName: string): Promise<ContextInjection[]> {
-    if (!this.ctx) return [];
+  async gatherContext(agentName: string): Promise<ContextInjection[]> {
+    const trace = this.beginTrace(agentName);
+    if (!this.ctx) {
+      trace?.finish('not-started');
+      return [];
+    }
 
-    // Get the LessonsModule to query
-    const lessonsModule = this.ctx.getModule<LessonsModule>('lessons');
-    if (!lessonsModule) return [];
+    let lessons: Lesson[];
+    let recentMessages: string;
+    let contextHash: string;
+    try {
+      // These lookups, eligibility checks, context rendering, and hashing are
+      // pre-existing throwing paths. Record their failure, then preserve the
+      // upstream rejection rather than applying the provider-stage fail-open.
+      const lessonsModule = this.ctx.getModule<LessonsModule>('lessons');
+      if (!lessonsModule) {
+        trace?.finish('no-lessons-module');
+        return [];
+      }
 
-    const lessons = lessonsModule.getLessons().filter(
-      l => !l.deprecated && l.confidence >= (this.config.minConfidence ?? 0.3)
-    );
-    if (lessons.length === 0) return [];
+      lessons = lessonsModule.getLessons().filter(
+        l => !l.deprecated && l.confidence >= (this.config.minConfidence ?? 0.3)
+      );
+      if (lessons.length === 0) {
+        trace?.finish('no-eligible-lessons');
+        return [];
+      }
 
-    // Get recent context for concept extraction
-    const recentMessages = this.getRecentContext();
-    if (!recentMessages) return [];
+      const recent = this.getRecentContext();
+      if (!recent) {
+        trace?.finish('no-recent-context');
+        return [];
+      }
+      recentMessages = recent.text;
 
-    // Check cache: if context hasn't changed, reuse cached results
-    const contextHash = this.hashContext(recentMessages);
-    if (contextHash === this.lastContextHash && this.cachedInjections.length > 0) {
-      return this.cachedInjections;
+      // Check cache: if context hasn't changed, reuse cached results.
+      contextHash = this.hashContext(recentMessages);
+      trace?.setContext(contextHash, recentMessages, recent.messageCount, recent.messageIds);
+      if (contextHash === this.lastContextHash && this.cachedInjections.length > 0) {
+        trace?.recordCacheHit(
+          this.cachedSourceTraceId,
+          this.cachedLessonIds,
+          this.cachedLessons,
+          this.cachedInjections,
+        );
+        trace?.finish('cache-hit');
+        return this.cachedInjections;
+      }
+    } catch (error) {
+      trace?.finish('error', error);
+      throw error;
     }
 
     try {
-      // Step 1: Flag concepts (Haiku call)
-      const concepts = await this.flagConcepts(recentMessages);
+      // Step 1: Flag concepts
+      const concepts = await this.flagConcepts(recentMessages, trace);
       if (concepts.length === 0) {
         this.lastContextHash = contextHash;
         this.cachedInjections = [];
+        this.cachedLessonIds = [];
+        this.cachedLessons = [];
+        this.cachedSourceTraceId = undefined;
+        trace?.finish('no-concepts');
         return [];
       }
 
       // Step 2: Mechanical query (keyword matching)
       const candidates = this.queryCandidates(concepts, lessons);
+      trace?.recordCandidates(concepts, candidates);
       if (candidates.length === 0) {
         this.lastContextHash = contextHash;
         this.cachedInjections = [];
+        this.cachedLessonIds = [];
+        this.cachedLessons = [];
+        this.cachedSourceTraceId = undefined;
+        trace?.finish('no-candidates');
         return [];
       }
 
-      // Step 3: Validate relevance (Haiku call)
-      const relevant = await this.validateRelevance(recentMessages, candidates);
+      // Step 3: Validate relevance
+      const relevant = await this.validateRelevance(recentMessages, candidates, trace);
+      trace?.recordRelevant(relevant);
 
       // Build injection
       const maxLessons = this.config.maxInjectedLessons ?? 5;
@@ -153,6 +233,10 @@ export class RetrievalModule implements Module {
       if (injected.length === 0) {
         this.lastContextHash = contextHash;
         this.cachedInjections = [];
+        this.cachedLessonIds = [];
+        this.cachedLessons = [];
+        this.cachedSourceTraceId = undefined;
+        trace?.finish('no-relevant-lessons');
         return [];
       }
 
@@ -172,9 +256,15 @@ export class RetrievalModule implements Module {
 
       this.lastContextHash = contextHash;
       this.cachedInjections = injections;
+      this.cachedLessons = this.safeLessonSnapshots(injected);
+      this.cachedLessonIds = this.safeLessonIds(this.cachedLessons);
+      this.cachedSourceTraceId = trace?.id;
+      trace?.recordInjection(injected, injections);
+      trace?.finish('injected');
       return injections;
     } catch (err) {
       // Fail open — don't block inference if retrieval fails
+      trace?.finish('error', err);
       console.error('RetrievalModule: retrieval failed:', err);
       return [];
     }
@@ -194,15 +284,19 @@ export class RetrievalModule implements Module {
   /**
    * Step 1: Use the configured retrieval model to identify concepts that might benefit from background knowledge.
    */
-  private async flagConcepts(recentContext: string): Promise<string[]> {
+  private async flagConcepts(
+    recentContext: string,
+    trace?: RetrievalTraceRun,
+  ): Promise<string[]> {
     const model = this.config.retrievalModel ?? 'claude-haiku-4-5-20251001';
     const providerParams = this.retrievalProviderParams();
+    const input = `Recent conversation:\n${recentContext}`;
 
     const request: NormalizedRequest = {
       messages: [
         {
           participant: 'user',
-          content: [{ type: 'text', text: `Recent conversation:\n${recentContext}` }],
+          content: [{ type: 'text', text: input }],
         },
       ],
       system: CONCEPT_FLAG_PROMPT,
@@ -210,7 +304,14 @@ export class RetrievalModule implements Module {
       ...(providerParams ? { providerParams } : {}),
     };
 
-    const response = await this.config.membrane.complete(request);
+    trace?.startConceptExtraction(CONCEPT_FLAG_PROMPT, input);
+    let response;
+    try {
+      response = await this.config.membrane.complete(request);
+    } catch (error) {
+      trace?.recordStageError('conceptExtraction', error);
+      throw error;
+    }
     const text = response.content
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
       .map(b => b.text)
@@ -219,16 +320,28 @@ export class RetrievalModule implements Module {
     try {
       const parsed = JSON.parse(text);
       if (Array.isArray(parsed)) {
-        return parsed.filter((s): s is string => typeof s === 'string');
+        const concepts = parsed.filter((value): value is string => typeof value === 'string');
+        trace?.finishConceptExtraction(text, concepts, 'json', response.content);
+        return concepts;
       }
+      trace?.finishConceptExtraction(text, [], 'invalid', response.content);
     } catch {
-      // Try to extract from markdown code block
+      // Try to extract an array from a prose/markdown wrapper.
       const match = text.match(/\[([^\]]*)\]/);
       if (match) {
         try {
-          return JSON.parse(`[${match[1]}]`);
+          const parsed = JSON.parse(`[${match[1]}]`);
+          if (Array.isArray(parsed)) {
+            const traceValues = parsed.filter((value): value is string => typeof value === 'string');
+            trace?.finishConceptExtraction(text, traceValues, 'array-extraction', response.content);
+            // Preserve the historical malformed-wrapper behavior exactly: mixed
+            // arrays proceed to queryCandidates(), which then fails open rather
+            // than silently becoming a different, partially valid concept set.
+            return parsed as string[];
+          }
         } catch { /* fall through */ }
       }
+      trace?.finishConceptExtraction(text, [], 'invalid', response.content);
     }
     return [];
   }
@@ -269,9 +382,14 @@ export class RetrievalModule implements Module {
   /**
    * Step 3: Use the configured retrieval model to validate which candidates are actually relevant.
    */
-  private async validateRelevance(recentContext: string, candidates: Lesson[]): Promise<Lesson[]> {
+  private async validateRelevance(
+    recentContext: string,
+    candidates: Lesson[],
+    trace?: RetrievalTraceRun,
+  ): Promise<Lesson[]> {
     if (candidates.length <= 3) {
-      // If only a few candidates, skip validation — they're probably all relevant
+      // If only a few candidates, skip validation — they're probably all relevant.
+      trace?.recordRelevanceSkipped('three-or-fewer-candidates');
       return candidates;
     }
 
@@ -281,12 +399,13 @@ export class RetrievalModule implements Module {
     const candidateList = candidates.map(l =>
       `[${l.id}] (${l.confidence.toFixed(2)}) ${l.content}`
     ).join('\n');
+    const input = `Current conversation:\n${recentContext}\n\nCandidate lessons:\n${candidateList}`;
 
     const request: NormalizedRequest = {
       messages: [
         {
           participant: 'user',
-          content: [{ type: 'text', text: `Current conversation:\n${recentContext}\n\nCandidate lessons:\n${candidateList}` }],
+          content: [{ type: 'text', text: input }],
         },
       ],
       system: RELEVANCE_VALIDATION_PROMPT,
@@ -294,7 +413,14 @@ export class RetrievalModule implements Module {
       ...(providerParams ? { providerParams } : {}),
     };
 
-    const response = await this.config.membrane.complete(request);
+    trace?.startRelevance(RELEVANCE_VALIDATION_PROMPT, input);
+    let response;
+    try {
+      response = await this.config.membrane.complete(request);
+    } catch (error) {
+      trace?.recordStageError('relevance', error);
+      throw error;
+    }
     const text = response.content
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
       .map(b => b.text)
@@ -303,38 +429,91 @@ export class RetrievalModule implements Module {
     try {
       const parsed = JSON.parse(text);
       if (Array.isArray(parsed)) {
-        const relevantIds = new Set(parsed.filter((s): s is string => typeof s === 'string'));
+        const parsedIds = parsed.filter((value): value is string => typeof value === 'string');
+        trace?.finishRelevance(text, parsedIds, 'json', response.content);
+        const relevantIds = new Set(parsedIds);
         return candidates.filter(l => relevantIds.has(l.id));
       }
     } catch {
-      // On parse failure, return top 5 by confidence (fail open)
-      return candidates.slice(0, 5);
+      // Fall through to confidence-ordered fallback.
     }
-    return candidates.slice(0, 5);
+
+    const fallback = candidates.slice(0, 5);
+    trace?.finishRelevance(text, [], 'fallback', response.content);
+    return fallback;
   }
 
   // =========================================================================
   // Helpers
   // =========================================================================
 
-  private getRecentContext(): string | null {
+  private getRecentContext(): RecentRetrievalContext | null {
     if (!this.ctx) return null;
 
-    // Get the last few messages from the conversation
+    // Get the last few messages from the conversation.
     const { messages } = this.ctx.queryMessages({});
     if (messages.length === 0) return null;
 
-    // Take the last 10 messages for context
+    // Take the last 10 messages for context.
     const recent = messages.slice(-10);
-    return recent
+    const text = recent
       .map(m => {
-        const text = m.content
+        const messageText = m.content
           .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
           .map(b => b.text)
           .join('\n');
-        return `${m.participant}: ${text}`;
+        return `${m.participant}: ${messageText}`;
       })
       .join('\n\n');
+    const messageIds = recent.flatMap(message => {
+      try {
+        const candidate = (message as unknown as { id?: unknown }).id;
+        return typeof candidate === 'string' || typeof candidate === 'number'
+          ? [String(candidate)]
+          : [];
+      } catch {
+        // Trace-only metadata must never alter retrieval behavior.
+        return [];
+      }
+    });
+
+    return { text, messageCount: recent.length, messageIds };
+  }
+
+  private safeLessonIds(lessons: Lesson[]): string[] {
+    const ids: string[] = [];
+    for (const lesson of lessons) {
+      try {
+        if (typeof lesson.id === 'string') ids.push(lesson.id);
+      } catch {
+        // Cache provenance is observability metadata; omit unreadable IDs.
+      }
+    }
+    return ids;
+  }
+
+  private safeLessonSnapshots(lessons: Lesson[]): Lesson[] {
+    const snapshots: Lesson[] = [];
+    for (const item of lessons) {
+      try {
+        snapshots.push({
+          id: item.id,
+          content: item.content,
+          confidence: item.confidence,
+          tags: [...item.tags],
+          evidence: [...item.evidence],
+          created: item.created,
+          updated: item.updated,
+          deprecated: item.deprecated,
+          ...(item.deprecationReason !== undefined
+            ? { deprecationReason: item.deprecationReason }
+            : {}),
+        });
+      } catch {
+        // Trace-only lesson snapshots must not alter retrieval behavior.
+      }
+    }
+    return snapshots;
   }
 
   private hashContext(text: string): string {
