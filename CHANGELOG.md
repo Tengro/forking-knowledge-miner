@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.3 — 2026-08-01
+
 ### Changed
 
 - **Prompt caching enabled on Bedrock for models that support it**
