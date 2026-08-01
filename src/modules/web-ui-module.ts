@@ -1417,7 +1417,7 @@ export class WebUiModule implements Module {
    * MCPL calls — the preview leaves the system state untouched. This omits the
    * dynamically-gathered injections (lessons/retrieval/MCPL context). Pass
    * `?injections=1` to gather them for full fidelity, which is NOT transparent:
-   * it can run inference (e.g. RetrievalModule's Haiku calls) and fire MCPL
+   * it can run inference (e.g. RetrievalModule's configured model calls) and fire MCPL
    * `beforeInference` hooks (whose paired `afterInference` is never sent).
    */
   private async handleDebugContext(url: URL): Promise<Response> {

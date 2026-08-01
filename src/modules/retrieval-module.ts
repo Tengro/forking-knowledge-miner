@@ -2,12 +2,12 @@
  * RetrievalModule — LLM-as-retriever for semantic memory.
  *
  * Three-step retrieval pipeline running in gatherContext():
- *   1. Flag concepts (Haiku): identify concepts being discussed that might
- *      benefit from background knowledge
+ *   1. Flag concepts: identify concepts being discussed that might benefit
+ *      from background knowledge
  *   2. Mechanical query: keyword-match against LessonsModule
- *   3. Validate relevance (Haiku): filter to actually relevant lessons
+ *   3. Validate relevance: filter to actually relevant lessons
  *
- * Steps 1 and 3 use cheap Haiku calls (~$0.001 each).
+ * Steps 1 and 3 use the configured retrieval model and optional reasoning.
  * Results are cached to avoid redundant calls on unchanged context.
  */
 
@@ -29,11 +29,19 @@ import type { LessonsModule, Lesson } from './lessons-module.js';
 // Configuration
 // ---------------------------------------------------------------------------
 
+export type RetrievalReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export interface RetrievalReasoningConfig {
+  effort: RetrievalReasoningEffort;
+}
+
 export interface RetrievalModuleConfig {
-  /** Membrane instance for Haiku calls */
+  /** Membrane instance for retrieval calls */
   membrane: Membrane;
   /** Model to use for retrieval calls (default: claude-haiku-4-5-20251001) */
   retrievalModel?: string;
+  /** Optional OpenAI reasoning effort, applied to both retrieval LLM stages. */
+  retrievalReasoning?: RetrievalReasoningConfig;
   /** Max lessons to inject (default: 5) */
   maxInjectedLessons?: number;
   /** Minimum lesson confidence for injection (default: 0.3) */
@@ -176,11 +184,19 @@ export class RetrievalModule implements Module {
   // Pipeline Steps
   // =========================================================================
 
+  /** Build OpenAI request parameters for configured retrieval reasoning effort. */
+  private retrievalProviderParams(): Record<string, unknown> | undefined {
+    const reasoning = this.config.retrievalReasoning;
+    if (!reasoning) return undefined;
+    return { reasoning: { effort: reasoning.effort } };
+  }
+
   /**
-   * Step 1: Use Haiku to identify concepts that might benefit from background knowledge.
+   * Step 1: Use the configured retrieval model to identify concepts that might benefit from background knowledge.
    */
   private async flagConcepts(recentContext: string): Promise<string[]> {
     const model = this.config.retrievalModel ?? 'claude-haiku-4-5-20251001';
+    const providerParams = this.retrievalProviderParams();
 
     const request: NormalizedRequest = {
       messages: [
@@ -191,6 +207,7 @@ export class RetrievalModule implements Module {
       ],
       system: CONCEPT_FLAG_PROMPT,
       config: { model, maxTokens: 500, temperature: 0 },
+      ...(providerParams ? { providerParams } : {}),
     };
 
     const response = await this.config.membrane.complete(request);
@@ -250,7 +267,7 @@ export class RetrievalModule implements Module {
   }
 
   /**
-   * Step 3: Use Haiku to validate which candidates are actually relevant.
+   * Step 3: Use the configured retrieval model to validate which candidates are actually relevant.
    */
   private async validateRelevance(recentContext: string, candidates: Lesson[]): Promise<Lesson[]> {
     if (candidates.length <= 3) {
@@ -259,6 +276,7 @@ export class RetrievalModule implements Module {
     }
 
     const model = this.config.retrievalModel ?? 'claude-haiku-4-5-20251001';
+    const providerParams = this.retrievalProviderParams();
 
     const candidateList = candidates.map(l =>
       `[${l.id}] (${l.confidence.toFixed(2)}) ${l.content}`
@@ -273,6 +291,7 @@ export class RetrievalModule implements Module {
       ],
       system: RELEVANCE_VALIDATION_PROMPT,
       config: { model, maxTokens: 500, temperature: 0 },
+      ...(providerParams ? { providerParams } : {}),
     };
 
     const response = await this.config.membrane.complete(request);

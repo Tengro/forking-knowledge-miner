@@ -37,6 +37,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
+import { buildRetrievalModuleConfig } from './retrieval-config.js';
 import type { RecipeWorkspaceMount } from './recipe.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
@@ -227,16 +228,13 @@ async function createFramework(
   }
 
   // Retrieval (requires lessons). OPT-IN — not part of the standard recipe:
-  // it injects context-dependent content into every compile (plus two Haiku
-  // calls per turn), which adds per-turn context churn. Enable explicitly via
-  // modules.retrieval only when an agent actually curates a lesson library.
+  // it injects context-dependent content into every compile (plus up to two
+  // configured retrieval-model calls), which adds per-turn context churn.
+  // Enable explicitly only when an agent actually curates a lesson library.
   if (modules.retrieval && lessonsModule) {
-    const retrievalConfig = typeof modules.retrieval === 'object' ? modules.retrieval : {};
-    moduleInstances.push(new RetrievalModule({
-      membrane,
-      retrievalModel: retrievalConfig.model,
-      maxInjectedLessons: retrievalConfig.maxInjected,
-    }));
+    moduleInstances.push(new RetrievalModule(
+      buildRetrievalModuleConfig(membrane, modules.retrieval, recipe.agent.provider),
+    ));
   }
 
   // Gate config — core AF EventGate feature.

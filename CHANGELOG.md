@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **OpenAI retrieval reasoning effort.** Recipes using `openai-responses` or
+  `openai-codex` can set `modules.retrieval.reasoningEffort` independently of
+  the primary agent. Unsupported providers fail recipe validation instead of
+  receiving an invalid OpenAI-shaped request, and reasoning-enabled retrieval
+  requires an explicit model instead of falling through to the Claude default.
+
 ## 0.7.3 — 2026-08-01
 
 ### Changed

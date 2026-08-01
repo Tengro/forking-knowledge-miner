@@ -421,10 +421,19 @@ export interface RecipeModules {
   /**
    * Lesson retrieval-injection (requires `lessons`). OPT-IN — defaults to off
    * and is deliberately not part of the standard recipe: it injects
-   * context-dependent content into every compile and spends two Haiku calls
-   * per turn. Enable only for agents that actually curate a lesson library.
+   * context-dependent content into every compile and spends up to two
+   * configured retrieval-model calls. Enable only for agents that actually
+   * curate a lesson library.
    */
-  retrieval?: boolean | { model?: string; maxInjected?: number };
+  retrieval?: boolean | {
+    model?: string;
+    maxInjected?: number;
+    /**
+     * Optional OpenAI Responses/Codex reasoning effort for both retrieval calls.
+     * Requires an explicit retrieval model.
+     */
+    reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  };
   wake?: boolean | import('@animalabs/agent-framework').GateConfig;
   workspace?: boolean | { mounts: RecipeWorkspaceMount[]; configMount?: boolean };
   /**
@@ -718,7 +727,7 @@ export const DEFAULT_RECIPE: Recipe = {
   },
   modules: {
     // subagents + lessons + retrieval deliberately omitted — all opt-in only
-    // (retrieval additionally adds per-turn context churn + Haiku costs);
+    // (retrieval additionally adds per-turn context churn + retrieval-model costs);
     // see the RecipeModules field docs.
     wake: true,
     workspace: true,
@@ -1252,6 +1261,43 @@ export function validateRecipe(raw: unknown): Recipe {
         if (m.mode !== undefined && m.mode !== 'read-write' && m.mode !== 'read-only') {
           throw new Error(`workspace.mounts[${i}].mode must be "read-write" or "read-only"`);
         }
+      }
+    }
+
+    // Validate retrieval provider reasoning when configured.
+    const retrieval = mods.retrieval;
+    if (retrieval !== undefined && typeof retrieval !== 'boolean') {
+      if (!retrieval || typeof retrieval !== 'object' || Array.isArray(retrieval)) {
+        throw new Error('Recipe modules.retrieval must be a boolean or object.');
+      }
+      const retrievalConfig = retrieval as Record<string, unknown>;
+      if (retrievalConfig.reasoningContext !== undefined) {
+        throw new Error(
+          'modules.retrieval.reasoningContext is not supported: retrieval model calls ' +
+          'are independent one-shot requests with no earlier reasoning items.',
+        );
+      }
+      const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+      if (retrievalConfig.reasoningEffort !== undefined &&
+          (typeof retrievalConfig.reasoningEffort !== 'string'
+            || !efforts.includes(retrievalConfig.reasoningEffort))) {
+        throw new Error(`Invalid modules.retrieval.reasoningEffort ${JSON.stringify(retrievalConfig.reasoningEffort)}.`);
+      }
+      if (retrievalConfig.reasoningEffort !== undefined
+          && agent.provider !== 'openai-responses'
+          && agent.provider !== 'openai-codex') {
+        throw new Error(
+          'modules.retrieval.reasoningEffort requires agent.provider ' +
+          '"openai-responses" or "openai-codex".',
+        );
+      }
+      if (retrievalConfig.reasoningEffort !== undefined
+          && (typeof retrievalConfig.model !== 'string'
+            || !retrievalConfig.model.trim())) {
+        throw new Error(
+          'modules.retrieval.model must be a non-empty string when ' +
+          'modules.retrieval.reasoningEffort is configured.',
+        );
       }
     }
 
