@@ -4,6 +4,21 @@
 
 ### Added
 
+- **Operator retrieval traces.** The Web UI now exposes operator-only,
+  process-memory retrieval traces at `/debug/retrieval` and a readable
+  lesson-selection viewer at `/debug/retrieval/view`, including invoking-agent
+  attribution, mechanical candidates, relevance decisions, cache provenance,
+  and the exact injected lesson block. Exact conversation/model inputs remain
+  opt-in via literal `includeInputs=1`.
+
+### Fixed
+
+- **OpenAI retrieval reasoning effort.** Recipes using `openai-responses` or
+  `openai-codex` can set `modules.retrieval.reasoningEffort` independently of
+  the primary agent. Unsupported providers fail recipe validation instead of
+  receiving an invalid OpenAI-shaped request, and reasoning-enabled retrieval
+  requires an explicit model instead of falling through to the Claude default.
+  
 - **`mcpl_list` reports the live MCPL policy boundary.** Each server now shows
   connected/retrying state, whether its initial policy was established, its
   effective grant, host-masked and deny-by-default capability paths, and the
