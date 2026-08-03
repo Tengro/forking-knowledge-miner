@@ -223,12 +223,34 @@ One JSON object per line. All events include `type`; most include `ts` (epoch ms
 {"type":"text","content":"Please resummarize last week"}
 {"type":"command","command":"/status"}
 {"type":"shutdown","graceful":true}
+{"type":"panel-request","op":"settings","params":{"agent":"clerk"},"corrId":"panel-1"}
 ```
 
 - `subscribe` is idempotent. Typically sent once right after connection. Supports simple glob (`tool:*`, `inference:*`).
 - `text` produces an `external-message` event with `source: 'headless'` — same effect as user typing into the child's own TUI.
 - `command` routes through the child's `commands.ts` handler exactly as if typed locally.
 - `shutdown` sets `graceful`; child completes in-flight inference, then exits. `graceful: false` is equivalent to SIGTERM.
+- `panel-request` runs one operator-panel operation in the child via the shared
+  `runPanelOp` dispatcher (`src/web/panel-data.ts`) — the same code the WebUI
+  host runs for its own process, so parent and child views of any panel can
+  never drift. Ops: `mcpl`, `settings`, `settings-update`, `settings-reset`,
+  `settings-cancel-transition`, `pins`, `pin-add`, `pin-remove`, `health`,
+  `context-makeup`, `context-coverage`, `context-curve`, `context-preview`,
+  `context-maintenance`, `debug-context`. The child answers with a single
+  `panel-response`:
+
+  ```json
+  {"type":"panel-response","op":"settings","corrId":"panel-1","ok":true,"data":{...}}
+  {"type":"panel-response","op":"settings","corrId":"panel-1","ok":false,"error":"Agent not found: x","status":404}
+  ```
+
+  `status` is HTTP-ish so the parent's `?scope=<child>` proxy routes
+  (`/debug/context/*`, `/healthz`) can answer faithfully. `panel-response`
+  (like the other request/response snapshots) bypasses the subscription
+  filter. Parent-side, `FleetModule.requestPanel()` wraps the corrId
+  bookkeeping in a promise and never rejects — unreachable children resolve
+  `{ok:false,status:502}`, silence resolves `{ok:false,status:504}` after the
+  timeout (default 30s).
 
 ### Connection lifecycle
 

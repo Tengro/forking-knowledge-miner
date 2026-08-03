@@ -323,6 +323,10 @@ export interface PeekMessage {
  *  surface a "module not loaded" hint rather than appearing broken. */
 export interface LessonsListMessage {
   type: 'lessons-list';
+  /** Which process this snapshot describes: 'local' or a fleet-child name.
+   *  Lets the SPA drop stale replies after a scope switch instead of
+   *  rendering child A's data under child B's header. */
+  scope?: string;
   loaded: boolean;
   lessons: Array<{
     id: string;
@@ -339,6 +343,8 @@ export interface LessonsListMessage {
 /** Workspace mount summary — response to request-workspace-mounts. */
 export interface WorkspaceMountsMessage {
   type: 'workspace-mounts';
+  /** Process this snapshot describes ('local' or fleet-child name). */
+  scope?: string;
   /** True iff WorkspaceModule is loaded in the recipe. */
   loaded: boolean;
   mounts: Array<{
@@ -353,6 +359,8 @@ export interface WorkspaceMountsMessage {
 /** Recursive file listing for one mount — response to request-workspace-tree. */
 export interface WorkspaceTreeMessage {
   type: 'workspace-tree';
+  /** Process this listing came from ('local' or fleet-child name). */
+  scope?: string;
   mount: string;
   entries: Array<{ path: string; size: number }>;
 }
@@ -361,6 +369,8 @@ export interface WorkspaceTreeMessage {
  *  line-numbered (cat -n style) as returned by the workspace `read` tool. */
 export interface WorkspaceFileMessage {
   type: 'workspace-file';
+  /** Process this file came from ('local' or fleet-child name). */
+  scope?: string;
   path: string;
   totalLines: number;
   fromLine: number;
@@ -376,6 +386,10 @@ export interface WorkspaceFileMessage {
  *  changes are file-only and require restart anyway. */
 export interface McplListMessage {
   type: 'mcpl-list';
+  /** Process whose MCPL view this is ('local' or fleet-child name). The
+   *  registry FILE is shared cwd-wide, but which entries a process actually
+   *  loads is per-recipe — see `live`. */
+  scope?: string;
   /** Path to the config file (informational — operator may want to grep
    *  for it locally). */
   configPath: string;
@@ -389,6 +403,18 @@ export interface McplListMessage {
     enabledFeatureSets?: string[];
     disabledFeatureSets?: string[];
   }>;
+  /** Servers the scoped process actually LOADED (recipe opt-in + agent
+   *  overlay), with live connection status from its framework. Absent on
+   *  older hosts. This is the per-scope truth the file registry can't give:
+   *  a conductor with zero MCPLs and a clerk with five share one file. */
+  live?: Array<{
+    id: string;
+    connected: boolean;
+    toolCount: number;
+    toolPrefix?: string;
+    /** command or url — whatever the transport targets. */
+    target?: string;
+  }>;
 }
 
 /**
@@ -399,6 +425,8 @@ export interface McplListMessage {
  */
 export interface PinsListMessage {
   type: 'pins-list';
+  /** Process these pins live in ('local' or fleet-child name). */
+  scope?: string;
   agent: string;
   pins: Array<{
     id: string;
@@ -418,6 +446,11 @@ export interface PinsListMessage {
   levelHonored: boolean;
   /** Deepest fold level currently present, so the UI can bound level inputs. */
   deepestLevel?: number;
+  /** Recent pinnable messages (REAL store ids) from the scoped process.
+   *  Shipped for fleet-child scopes, where the SPA has no message window of
+   *  its own to build a picker from; local scope keeps using the client-side
+   *  candidate list. */
+  candidates?: Array<{ id: string; index: number; participant: string; text: string }>;
 }
 
 /**
@@ -429,6 +462,8 @@ export interface PinsListMessage {
  */
 export interface SettingsStateMessage {
   type: 'settings-state';
+  /** Process these settings belong to ('local' or fleet-child name). */
+  scope?: string;
   agent: string;
   /** Live values. `transition` is 'converging' while a paced descent runs. */
   settings: {
@@ -661,11 +696,14 @@ export interface RequestLessonsMessage {
   scope?: string;
 }
 
-/** Pull the configured MCPL servers from mcpl-servers.json. Response is an
- *  `mcpl-list` envelope. Recipe-defined servers are excluded — those live in
+/** Pull the MCPL server view: the shared file registry plus the scoped
+ *  process's LIVE loaded servers. Response is an `mcpl-list` envelope.
+ *  Recipe-defined servers appear only in `live` — their definitions live in
  *  the recipe file and aren't editable from here. */
 export interface RequestMcplMessage {
   type: 'request-mcpl';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
 }
 
 /** Pull the Chronicle branch listing. Response is a `branches-list` envelope
@@ -699,9 +737,13 @@ export interface McplSetEnvMessage {
   env: Record<string, string>;
 }
 
-/** Pull the agent's protected ranges. Response is a `pins-list` envelope. */
+/** Pull the agent's protected ranges. Response is a `pins-list` envelope.
+ *  With a fleet-child `scope` the child also ships picker `candidates`
+ *  (recent real store ids) since the SPA has no window into its store. */
 export interface RequestPinsMessage {
   type: 'request-pins';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
   agent?: string;
 }
 
@@ -723,6 +765,8 @@ export interface RequestPinsMessage {
  */
 export interface PinAddMessage {
   type: 'pin-add';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
   agent?: string;
   kind?: 'pin' | 'document';
   firstMessageId: string;
@@ -735,6 +779,8 @@ export interface PinAddMessage {
 
 export interface PinRemoveMessage {
   type: 'pin-remove';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
   agent?: string;
   pinId: string;
 }
@@ -743,7 +789,9 @@ export interface PinRemoveMessage {
  *  live-appliable vs restart-only. Response is a `settings-state` envelope. */
 export interface RequestSettingsMessage {
   type: 'request-settings';
-  /** Agent name; defaults to the recipe's primary agent. */
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
+  /** Agent name; defaults to the scoped process's primary agent. */
   agent?: string;
 }
 
@@ -767,6 +815,8 @@ export interface RequestSettingsMessage {
  */
 export interface SettingsUpdateMessage {
   type: 'settings-update';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
   agent?: string;
   contextBudgetTokens?: number;
   tailTokens?: number;
@@ -782,6 +832,8 @@ export interface SettingsUpdateMessage {
 /** Revert named settings to their recipe values (all four when omitted). */
 export interface SettingsResetMessage {
   type: 'settings-reset';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
   agent?: string;
   keys?: string[];
   persist?: boolean;
@@ -791,6 +843,8 @@ export interface SettingsResetMessage {
 /** Abandon an in-flight paced descent, holding the current frontier. */
 export interface SettingsCancelTransitionMessage {
   type: 'settings-cancel-transition';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
   agent?: string;
   persist?: boolean;
 }
@@ -898,9 +952,10 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
   switch (v.type) {
     case 'ping':
     case 'interrupt':
-    case 'request-mcpl':
     case 'request-branches':
       return true;
+    case 'request-mcpl':
+      return isOptionalScope(v.scope);
     case 'user-message':
       return typeof v.content === 'string';
     case 'observer-hello': {
@@ -938,8 +993,9 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
     case 'mcpl-set-env':
       return isValidMcplId(v.id) && isStringMap(v.env);
     case 'request-pins':
-      return isOptionalNonEmptyString(v.agent);
+      return isOptionalScope(v.scope) && isOptionalNonEmptyString(v.agent);
     case 'pin-add': {
+      if (!isOptionalScope(v.scope)) return false;
       if (!isOptionalNonEmptyString(v.agent)) return false;
       if (!isNonEmptyString(v.firstMessageId)) return false;
       if (v.lastMessageId !== undefined && !isNonEmptyString(v.lastMessageId)) return false;
@@ -957,10 +1013,11 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
       return true;
     }
     case 'pin-remove':
-      return isOptionalNonEmptyString(v.agent) && isNonEmptyString(v.pinId);
+      return isOptionalScope(v.scope) && isOptionalNonEmptyString(v.agent) && isNonEmptyString(v.pinId);
     case 'request-settings':
-      return isOptionalNonEmptyString(v.agent);
+      return isOptionalScope(v.scope) && isOptionalNonEmptyString(v.agent);
     case 'settings-update': {
+      if (!isOptionalScope(v.scope)) return false;
       if (!isOptionalNonEmptyString(v.agent)) return false;
       if (!isOptionalBool(v.persist) || !isOptionalBool(v.notify) || !isOptionalBool(v.immediate)) return false;
       // Positive-integer-or-absent for each knob. The semantic gate (budget must
@@ -976,12 +1033,13 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
         || v.transitionPaceTokens !== undefined;
     }
     case 'settings-reset':
-      return isOptionalNonEmptyString(v.agent)
+      return isOptionalScope(v.scope)
+        && isOptionalNonEmptyString(v.agent)
         && isOptionalBool(v.persist)
         && isOptionalBool(v.notify)
         && isOptionalStringArray(v.keys);
     case 'settings-cancel-transition':
-      return isOptionalNonEmptyString(v.agent) && isOptionalBool(v.persist);
+      return isOptionalScope(v.scope) && isOptionalNonEmptyString(v.agent) && isOptionalBool(v.persist);
     case 'request-workspace-mounts':
       return v.scope === undefined || typeof v.scope === 'string';
     case 'request-workspace-tree':
@@ -1039,6 +1097,13 @@ function isOptionalStringArray(v: unknown): v is string[] | undefined {
 
 function isOptionalNonEmptyString(v: unknown): v is string | undefined {
   return v === undefined || isNonEmptyString(v);
+}
+
+/** Scope fields: 'local' or a fleet-child name. Same lax shape the existing
+ *  lessons/workspace requests use — the server resolves unknown children to
+ *  a clean error rather than the validator guessing the fleet roster. */
+function isOptionalScope(v: unknown): v is string | undefined {
+  return v === undefined || typeof v === 'string';
 }
 
 function isOptionalBool(v: unknown): v is boolean | undefined {
