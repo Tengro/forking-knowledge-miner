@@ -32,7 +32,11 @@ import { summarizeCacheControls, type ProviderCallRecord } from './call-ledger.j
 /** Live read of the current reasoning setting. The host wires this to
  *  `SettingsModule.getReasoning()` so toggles via the `agent_settings` tool's
  *  reasoning_enabled field take effect on the next call without restart. */
-export type ReasoningGetter = () => { enabled: boolean; budgetTokens: number };
+export type ReasoningGetter = () => {
+  enabled: boolean;
+  budgetTokens: number;
+  display?: 'summarized' | 'omitted';
+};
 export type ProviderCallObserver = (record: ProviderCallRecord) => void;
 
 /** Exact first-system-block identity Anthropic requires on subscription
@@ -119,9 +123,16 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     // request.extra; Object.assign(params, rest)`), so we route thinking
     // through the typed `extra` bag — no type assertion, and it survives the
     // next dependency reshuffle instead of hiding it from the compiler.
+    //
+    // `display`: models 4.7+ default to 'omitted' (empty `thinking` text,
+    // signature only). We pass the setting through — default 'summarized' —
+    // so reasoning summaries are visible again (stores, webui, estimators).
     return {
       ...request,
-      extra: { ...request.extra, thinking: { type: 'adaptive' } },
+      extra: {
+        ...request.extra,
+        thinking: { type: 'adaptive', display: r.display ?? 'summarized' },
+      },
     };
   }
 

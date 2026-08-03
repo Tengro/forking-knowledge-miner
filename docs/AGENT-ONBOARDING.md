@@ -274,7 +274,7 @@ workloads whose cache is normally reused within five minutes.
 
 **`subagents`/`lessons`/`retrieval` are NOT part of the standard recipe.**
 All three are opt-in. RetrievalModule in particular injects context-dependent
-content into every compile (and spends two Haiku calls per turn), so it must
+content into every compile (and spends up to two configured retrieval-model calls), so it must
 be an explicit opt-in for agents that actually curate a lesson library.
 Current host code defaults all three to off, but keep the explicit `false`
 entries in the recipe anyway — older host checkouts treated these as opt-out,

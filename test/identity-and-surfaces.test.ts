@@ -4,7 +4,7 @@
 //
 // Design under test: the AGENT surface is credential-free (status /
 // accept_invite, no tokens in any result); credentials exist only on the
-// HOST-facing API (getFreshToken/authHeader) that the MCPL dial provider
+// HOST-facing API (accessFor/httpAuthFor) that the MCPL dial provider
 // and HTTP helpers consume outside model context.
 import { describe, it, expect } from 'bun:test';
 import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
@@ -86,7 +86,7 @@ describe('identity module', () => {
     expect(again.error).toContain('Already registered');
   });
 
-  it('host-facing getFreshToken: requires registration, then exchanges per call', async () => {
+  it('host-facing accessFor: requires registration, then exchanges per call', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ident-'));
     let mints = 0;
     const mod = new IdentityModule({
@@ -100,13 +100,13 @@ describe('identity module', () => {
           : { status: 400, json: { error: 'unknown audience' } },
       }),
     });
-    await expect(mod.getFreshToken()).rejects.toThrow(/not registered/);
+    await expect(mod.accessFor()).rejects.toThrow(/not registered/);
 
     await mod.handleToolCall(call('accept_invite', { invite: 'i', name: 'A' }));
-    expect(await mod.getFreshToken()).toBe('aid1.fresh.1');
-    expect(await mod.getFreshToken('eidoverse')).toBe('aid1.fresh.2'); // fresh per call — dial-time rotation
-    expect((await mod.authHeader()).authorization).toBe('Bearer aid1.fresh.3');
-    await expect(mod.getFreshToken('nope')).rejects.toThrow(/unknown audience/);
+    expect(await mod.accessFor()).toBe('aid1.fresh.1');
+    expect(await mod.accessFor('eidoverse')).toBe('aid1.fresh.2'); // fresh per call — dial-time rotation
+    expect((await mod.httpAuthFor()).authorization).toBe('Bearer aid1.fresh.3');
+    await expect(mod.accessFor('nope')).rejects.toThrow(/unknown audience/);
     expect(mod.isEnrolled()).toBe(true);
     expect(mod.sub()).toBe('agent:a@guest');
   });

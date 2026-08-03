@@ -37,6 +37,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
+import { buildRetrievalModuleConfig } from './retrieval-config.js';
 import type { RecipeWorkspaceMount } from './recipe.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
@@ -63,7 +64,7 @@ import {
   parseRecipeArg,
 } from './recipe.js';
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
-import { buildFrameworkAgentConfig } from './framework-agent-config.js';
+import { buildFrameworkAgentConfig, membraneCachingOverride } from './framework-agent-config.js';
 import { buildFrameworkStrategy } from './framework-strategy.js';
 import { loadExtensions } from './extensions.js';
 
@@ -147,6 +148,11 @@ async function resolveRecipe(): Promise<Recipe> {
 // Framework factory
 // ---------------------------------------------------------------------------
 
+function resolveModel(recipe: Recipe): string {
+  return config.model || recipe.agent.model ||
+    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+}
+
 async function createFramework(
   membrane: Membrane,
   storePath: string,
@@ -155,8 +161,7 @@ async function createFramework(
   settingsModule: SettingsModule,
   callLedger: CallLedger | null,
 ): Promise<AgentFramework> {
-  const model = config.model || recipe.agent.model ||
-    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+  const model = resolveModel(recipe);
   const modules = recipe.modules ?? {};
   const timeZone = resolveTimeZone(recipe.agent.timezone);
 
@@ -223,16 +228,13 @@ async function createFramework(
   }
 
   // Retrieval (requires lessons). OPT-IN — not part of the standard recipe:
-  // it injects context-dependent content into every compile (plus two Haiku
-  // calls per turn), which adds per-turn context churn. Enable explicitly via
-  // modules.retrieval only when an agent actually curates a lesson library.
+  // it injects context-dependent content into every compile (plus up to two
+  // configured retrieval-model calls), which adds per-turn context churn.
+  // Enable explicitly only when an agent actually curates a lesson library.
   if (modules.retrieval && lessonsModule) {
-    const retrievalConfig = typeof modules.retrieval === 'object' ? modules.retrieval : {};
-    moduleInstances.push(new RetrievalModule({
-      membrane,
-      retrievalModel: retrievalConfig.model,
-      maxInjectedLessons: retrievalConfig.maxInjected,
-    }));
+    moduleInstances.push(new RetrievalModule(
+      buildRetrievalModuleConfig(membrane, modules.retrieval, recipe.agent.provider),
+    ));
   }
 
   // Gate config — core AF EventGate feature.
@@ -467,7 +469,7 @@ async function createFramework(
       if (identityModule) {
         const identity = identityModule;
         const audience = withEnv.access as string;
-        withEnv.tokenProvider = () => identity.getFreshToken(audience);
+        withEnv.accessProvider = () => identity.accessFor(audience);
       } else {
         console.error(
           `[mcpl] server "${server.id}": access "${withEnv.access}" declared but the recipe has no identity module — connecting without credentials`,
@@ -872,13 +874,18 @@ async function main() {
         xTitle: recipe.agent.name ?? recipe.name,
       })
     : undefined;
-  // Bedrock: legacy Claude models (3.5 Sonnet 0620/1022, Opus 3) that have
-  // left the Anthropic API but survive on AWS. The adapter reads AWS_* env
-  // vars (AWS_REGION defaults us-west-2) and maps standard Claude model IDs
-  // to Bedrock IDs (explicit map + `anthropic.<id>-v1:0` fallback). Uses the
-  // Anthropic-native message shape, so NativeFormatter applies unchanged.
-  // No CallLedger: prompt caching is rejected outright by legacy Bedrock
-  // models (tested 2026-07-21). Wrapped for llm-calls.jsonl visibility.
+  // Bedrock: an alternate Claude transport. (Historically for models that
+  // left the direct API — as of 2026-07-31 every 3.5-era id and opus-4-0514
+  // are EOL on Bedrock too, so what actually runs here is the 4-era via
+  // inference profiles.) The adapter reads AWS_* env vars (AWS_REGION
+  // defaults us-west-2) and maps standard Claude model IDs to Bedrock IDs.
+  // Uses the Anthropic-native message shape, so NativeFormatter applies
+  // unchanged. Prompt caching is model-gated
+  // (bedrockModelSupportsPromptCaching): pre-GA families (Claude 3,
+  // 3.5 Sonnet) off, everything currently invokable caches — verified by
+  // live probe 2026-07-31. Still no CallLedger — it's
+  // anthropic-transport-only for now; cache metrics are visible in
+  // llm-calls.jsonl via the logging wrapper.
   const bedrockAdapter = provider === 'bedrock'
     ? new LoggingBedrockAdapter({}, llmLogPath)
     : undefined;
@@ -960,10 +967,13 @@ async function main() {
       : recipe.agent.formatter === 'anthropic-xml'
         ? new AnthropicXmlFormatter()
         : new NativeFormatter(),
-    // Bedrock legacy Claude models 400 on any cache_control block
-    // ("your request did not allow prompt caching") — suppress the
-    // historical promptCaching=true default on that transport.
-    ...(provider === 'bedrock' ? { defaultPromptCaching: false } : {}),
+    // Caching default for internal callers (autobio compression,
+    // executeMerge), which read Membrane's defaultPromptCaching rather
+    // than the per-agent flag. Applies on EVERY provider whenever the
+    // recipe/model resolves an explicit answer — an Anthropic recipe with
+    // promptCaching:false must disable internal calls too, and on bedrock
+    // the model gate decides (see bedrockModelSupportsPromptCaching).
+    ...membraneCachingOverride(recipe, resolveModel(recipe)),
     // Anchor the assistant role for internal callers that don't set
     // request.assistantParticipant themselves (autobio compression,
     // executeMerge). Mismatch here flips stored assistant turns to

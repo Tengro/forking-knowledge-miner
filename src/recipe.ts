@@ -95,6 +95,11 @@ export interface RecipeStrategy {
   /** Override wording for the witnessed-record instruction ({targetTokens}
    *  substituted). */
   witnessedInstruction?: string;
+  /** Identity reminder appended to every compression/merge instruction.
+   *  For agents in multi-resident channels (and older models especially):
+   *  names the agent and directs attribution so pure-witness chunks don't
+   *  flip the summarizer into another speaker's identity. */
+  identityReminder?: string;
 }
 
 export interface RecipeAgent {
@@ -124,8 +129,18 @@ export interface RecipeAgent {
    *  ContextManager default (100k) applies. Raise for large-context models. */
   contextBudgetTokens?: number;
   /** Prompt-cache TTL ('5m' | '1h') forwarded to the provider. Defaults to
-   *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads. */
+   *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads.
+   *  Not forwarded on bedrock — that transport only has the default 5m
+   *  cache and rejects the ttl field. */
   cacheTtl?: '5m' | '1h';
+  /**
+   * Explicit prompt-caching override. Unset means provider-appropriate
+   * default: on for everything except bedrock models that predate caching
+   * support there (see bedrockModelSupportsPromptCaching). Set false if a
+   * transport/account rejects cache_control markers — AWS's "your request
+   * did not allow prompt caching" can also be account/region-dependent.
+   */
+  promptCaching?: boolean;
   /**
    * Same-round routing policy for ordinary text emitted beside think().
    * Omitted preserves the compatibility carry-forward in Agent Framework.
@@ -153,6 +168,13 @@ export interface RecipeAgent {
   thinking?: {
     enabled: boolean;
     budgetTokens?: number;
+    /** 'enabled' (explicit budget, legacy) or 'adaptive' (model-managed;
+     * required by opus-4-7+ / fable-5 era models). */
+    type?: 'enabled' | 'adaptive';
+    /** 'summarized' returns readable reasoning summaries in `thinking`;
+     * 'omitted' returns empty text + signature only. Models 4.7+ default
+     * to 'omitted' server-side. */
+    display?: 'summarized' | 'omitted';
   };
   /** OpenAI Responses settings. Reasoning applies to both OpenAI providers;
    * compaction and serviceTier are API-key transport settings. */
@@ -404,10 +426,19 @@ export interface RecipeModules {
   /**
    * Lesson retrieval-injection (requires `lessons`). OPT-IN — defaults to off
    * and is deliberately not part of the standard recipe: it injects
-   * context-dependent content into every compile and spends two Haiku calls
-   * per turn. Enable only for agents that actually curate a lesson library.
+   * context-dependent content into every compile and spends up to two
+   * configured retrieval-model calls. Enable only for agents that actually
+   * curate a lesson library.
    */
-  retrieval?: boolean | { model?: string; maxInjected?: number };
+  retrieval?: boolean | {
+    model?: string;
+    maxInjected?: number;
+    /**
+     * Optional OpenAI Responses/Codex reasoning effort for both retrieval calls.
+     * Requires an explicit retrieval model.
+     */
+    reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  };
   wake?: boolean | import('@animalabs/agent-framework').GateConfig;
   workspace?: boolean | { mounts: RecipeWorkspaceMount[]; configMount?: boolean };
   /**
@@ -701,7 +732,7 @@ export const DEFAULT_RECIPE: Recipe = {
   },
   modules: {
     // subagents + lessons + retrieval deliberately omitted — all opt-in only
-    // (retrieval additionally adds per-turn context churn + Haiku costs);
+    // (retrieval additionally adds per-turn context churn + retrieval-model costs);
     // see the RecipeModules field docs.
     wake: true,
     workspace: true,
@@ -959,6 +990,12 @@ export function validateRecipe(raw: unknown): Recipe {
   }
   agent.cacheTtl ??= '1h';
 
+  if (agent.promptCaching !== undefined && typeof agent.promptCaching !== 'boolean') {
+    throw new Error(
+      `Recipe agent.promptCaching must be a boolean, got ${JSON.stringify(agent.promptCaching)}.`,
+    );
+  }
+
   if (
     agent.sameRoundThinkTextPolicy !== undefined &&
     agent.sameRoundThinkTextPolicy !== 'public' &&
@@ -982,6 +1019,12 @@ export function validateRecipe(raw: unknown): Recipe {
     }
     if (thinking.budgetTokens !== undefined && (typeof thinking.budgetTokens !== 'number' || thinking.budgetTokens <= 0)) {
       throw new Error('Recipe agent.thinking.budgetTokens must be a positive number.');
+    }
+    if (thinking.type !== undefined && thinking.type !== 'enabled' && thinking.type !== 'adaptive') {
+      throw new Error('Recipe agent.thinking.type must be "enabled" or "adaptive".');
+    }
+    if (thinking.display !== undefined && thinking.display !== 'summarized' && thinking.display !== 'omitted') {
+      throw new Error('Recipe agent.thinking.display must be "summarized" or "omitted".');
     }
     if (thinking.enabled === true && typeof thinking.budgetTokens === 'number' && typeof agent.maxTokens === 'number') {
       if (thinking.budgetTokens >= agent.maxTokens) {
@@ -1223,6 +1266,43 @@ export function validateRecipe(raw: unknown): Recipe {
         if (m.mode !== undefined && m.mode !== 'read-write' && m.mode !== 'read-only') {
           throw new Error(`workspace.mounts[${i}].mode must be "read-write" or "read-only"`);
         }
+      }
+    }
+
+    // Validate retrieval provider reasoning when configured.
+    const retrieval = mods.retrieval;
+    if (retrieval !== undefined && typeof retrieval !== 'boolean') {
+      if (!retrieval || typeof retrieval !== 'object' || Array.isArray(retrieval)) {
+        throw new Error('Recipe modules.retrieval must be a boolean or object.');
+      }
+      const retrievalConfig = retrieval as Record<string, unknown>;
+      if (retrievalConfig.reasoningContext !== undefined) {
+        throw new Error(
+          'modules.retrieval.reasoningContext is not supported: retrieval model calls ' +
+          'are independent one-shot requests with no earlier reasoning items.',
+        );
+      }
+      const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+      if (retrievalConfig.reasoningEffort !== undefined &&
+          (typeof retrievalConfig.reasoningEffort !== 'string'
+            || !efforts.includes(retrievalConfig.reasoningEffort))) {
+        throw new Error(`Invalid modules.retrieval.reasoningEffort ${JSON.stringify(retrievalConfig.reasoningEffort)}.`);
+      }
+      if (retrievalConfig.reasoningEffort !== undefined
+          && agent.provider !== 'openai-responses'
+          && agent.provider !== 'openai-codex') {
+        throw new Error(
+          'modules.retrieval.reasoningEffort requires agent.provider ' +
+          '"openai-responses" or "openai-codex".',
+        );
+      }
+      if (retrievalConfig.reasoningEffort !== undefined
+          && (typeof retrievalConfig.model !== 'string'
+            || !retrievalConfig.model.trim())) {
+        throw new Error(
+          'modules.retrieval.model must be a non-empty string when ' +
+          'modules.retrieval.reasoningEffort is configured.',
+        );
       }
     }
 

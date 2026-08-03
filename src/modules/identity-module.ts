@@ -5,9 +5,9 @@
  * Two audiences, deliberately separated:
  *
  * HOST-FACING (this module's public methods): the deployment holds an
- * ed25519 keypair in the data dir; `getFreshToken(audience)` exchanges a
+ * ed25519 keypair in the data dir; `accessFor(audience)` exchanges a
  * key-proof at the home node for a short-lived aid1 token, and
- * `authHeader(audience)` wraps it for HTTP. This is plumbing other host
+ * `httpAuthFor(audience)` wraps it for HTTP. This is plumbing other host
  * pieces call — the MCPL transport's per-dial credential provider, future
  * HTTP helpers. Credentials live and die HERE.
  *
@@ -154,7 +154,7 @@ export class IdentityModule implements Module {
    * what lets audience tokens be short-lived. Throws with an actionable
    * message when unregistered or refused.
    */
-  async getFreshToken(audience?: string): Promise<string> {
+  async accessFor(audience?: string): Promise<string> {
     const aud = audience ?? this.config.defaultAudience;
     if (!aud) throw new Error('identity: no audience named and none configured');
     if (!this.record()) {
@@ -174,8 +174,8 @@ export class IdentityModule implements Module {
   }
 
   /** Authorization header for HTTP calls to an audience's API. */
-  async authHeader(audience?: string): Promise<Record<string, string>> {
-    return { authorization: `Bearer ${await this.getFreshToken(audience)}` };
+  async httpAuthFor(audience?: string): Promise<Record<string, string>> {
+    return { authorization: `Bearer ${await this.accessFor(audience)}` };
   }
 
   // ── key material ──

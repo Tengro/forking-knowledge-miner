@@ -23,7 +23,58 @@
   system prompt to after the last user message, which keeps the stable
   prefix KV-cacheable.
 
+### Added
+
+- **Operator retrieval traces.** The Web UI now exposes operator-only,
+  process-memory retrieval traces at `/debug/retrieval` and a readable
+  lesson-selection viewer at `/debug/retrieval/view`, including invoking-agent
+  attribution, mechanical candidates, relevance decisions, cache provenance,
+  and the exact injected lesson block. Exact conversation/model inputs remain
+  opt-in via literal `includeInputs=1`.
+
+### Fixed
+
+- **OpenAI retrieval reasoning effort.** Recipes using `openai-responses` or
+  `openai-codex` can set `modules.retrieval.reasoningEffort` independently of
+  the primary agent. Unsupported providers fail recipe validation instead of
+  receiving an invalid OpenAI-shaped request, and reasoning-enabled retrieval
+  requires an explicit model instead of falling through to the Claude default.
+  
+- **`mcpl_list` reports the live MCPL policy boundary.** Each server now shows
+  connected/retrying state, whether its initial policy was established, its
+  effective grant, host-masked and deny-by-default capability paths, and the
+  separate host-owned `host/command` authority. During a rolling upgrade,
+  fields unavailable from an older agent-framework render as `unknown` rather
+  than as a misleading empty grant.
+
+## 0.7.3 — 2026-08-01
+
 ### Changed
+
+- **Prompt caching enabled on Bedrock for models that support it**
+  (Discord issue #35). The previous transport-wide `promptCaching: false`
+  was a workaround for "your request did not allow prompt caching" —
+  which turned out to be the account-level denial for 3.5 Sonnet v2
+  (caching there was preview-only and dropped at Bedrock's GA), not a
+  transport property. Caching is now gated per model
+  (`bedrockModelSupportsPromptCaching`): on for the Bedrock caching-GA
+  lineup (3.5 Haiku, 3.7 Sonnet, Claude 4+), off for the pre-GA families
+  (Claude v2/instant, Claude 3, 3.5 Sonnet — matched at the family
+  boundary, so bare aliases and `-latest` forms gate the same as dated
+  ids; non-Claude Bedrock ids are conservatively off). New recipe field
+  `agent.promptCaching: boolean` overrides the gate in either direction
+  on any provider, and lands at both layers — per-agent config and
+  Membrane's default for internal callers (compression/merge) — for
+  accounts/regions whose entitlements differ from the GA table.
+  `cacheTtl` is withheld at the host layer on bedrock (Agent Framework
+  still supplies its own default downstream; membrane ≥ 0.5.77 strips
+  the ttl field at the provider boundary, so the wire request never
+  carries it either way). Verified live 2026-07-31: every currently
+  invokable Claude on Bedrock (all 4-era; 3.5-era and opus-4-0514 are
+  EOL there) writes and reads the cache cleanly. Requires
+  `@animalabs/membrane` ≥ 0.5.77 (cache_control ttl strip, stream cache
+  usage capture, 4-era inference-profile model mapping); the dependency
+  and lockfile are bumped accordingly in this change.
 
 - **Subscription-GC closes carry honest provenance and respect explicit
   opens** (Discord issue #5, the Mythos "channel settings keep resetting"

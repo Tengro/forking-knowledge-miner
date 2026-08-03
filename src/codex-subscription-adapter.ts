@@ -532,7 +532,19 @@ export class CodexSubscriptionAdapter implements ProviderAdapter {
         stopReason,
         stopSequence: undefined,
         usage: {
-          inputTokens: terminal.usage?.input_tokens ?? 0,
+          // OpenAI/Codex reports `input_tokens` INCLUSIVE of cached tokens,
+          // whereas the rest of the stack uses the additive Anthropic
+          // convention (inputTokens = fresh/uncached, cacheReadTokens added on
+          // top, so inputTokens + cacheReadTokens == total prompt). Report
+          // fresh-only here so that convention holds. Without this, every
+          // consumer that sums the buckets — the calibration realTotal
+          // (framework.ts), cost pricing, and gate metering — double-counts
+          // the cached prefix: on a heavily-cached turn real/est hit ~2.0,
+          // which the estimator rejected as out-of-band on full-cache compiles
+          // and (worse) ratcheted the multiplier upward on partial-cache ones,
+          // inflating estimates until the budget solver exhausted and the
+          // agent wedged (Sol, 2026-07-31).
+          inputTokens: Math.max(0, (terminal.usage?.input_tokens ?? 0) - cachedTokens),
           outputTokens: terminal.usage?.output_tokens ?? 0,
           cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
         },

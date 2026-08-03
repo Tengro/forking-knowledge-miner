@@ -160,7 +160,8 @@ Query params:
 - `agent=<name>` — defaults to the recipe's root agent
 - `injections=1` — opt into full fidelity: gather the dynamic injections too.
   **Not transparent** — this can run inference (e.g. the retrieval module's
-  Haiku calls cost tokens) and fires MCPL `beforeInference` hooks (whose paired
+  configured model calls cost tokens) and fires MCPL `beforeInference` hooks
+  (whose paired
   `afterInference` is never sent, so a stateful server may be left half-open).
 - `pretty=1` — pretty-print the JSON
 

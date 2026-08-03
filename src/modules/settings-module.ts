@@ -33,6 +33,14 @@ import type {
 export interface ReasoningSettings {
   enabled: boolean;
   budgetTokens: number;
+  /**
+   * How thinking content comes back from the API: 'summarized' returns a
+   * readable reasoning summary in the `thinking` field; 'omitted' returns an
+   * empty `thinking` field with only the encrypted signature. Models 4.7+
+   * default to 'omitted' server-side — we default to 'summarized' to restore
+   * the pre-4.7 behavior (visible reasoning in stores, webui, estimators).
+   */
+  display: 'summarized' | 'omitted';
 }
 
 export interface SettingsState {
@@ -40,7 +48,7 @@ export interface SettingsState {
 }
 
 const DEFAULTS: SettingsState = {
-  reasoning: { enabled: false, budgetTokens: 8192 },
+  reasoning: { enabled: false, budgetTokens: 8192, display: 'summarized' },
 };
 
 export class SettingsModule implements Module {
@@ -112,8 +120,16 @@ export class SettingsModule implements Module {
           type: 'number',
           description: 'Token budget for thinking blocks (min 1024).',
         },
+        reasoning_display: {
+          type: 'string',
+          enum: ['summarized', 'omitted'],
+          description:
+            "How your thinking is returned: 'summarized' (a readable summary of your reasoning " +
+            "is recorded alongside the signature) or 'omitted' (signature only, slightly faster " +
+            'first token; your reasoning is not visible to anyone, including you on replay).',
+        },
       },
-      keys: ['reasoning_enabled', 'reasoning_budget_tokens'],
+      keys: ['reasoning_enabled', 'reasoning_budget_tokens', 'reasoning_display'],
       get: () => this.reasoningSettingsView(),
       update: (_agentName, patch) => {
         const next = { ...this.state.reasoning };
@@ -130,6 +146,12 @@ export class SettingsModule implements Module {
           }
           next.budgetTokens = Math.max(1024, Math.round(budget));
         }
+        if (patch.reasoning_display !== undefined) {
+          if (patch.reasoning_display !== 'summarized' && patch.reasoning_display !== 'omitted') {
+            throw new Error("reasoning_display must be 'summarized' or 'omitted'");
+          }
+          next.display = patch.reasoning_display;
+        }
         this.state.reasoning = next;
         this.ctx?.setState(this.state);
         return this.reasoningSettingsView();
@@ -142,6 +164,9 @@ export class SettingsModule implements Module {
         if (all || keys?.includes('reasoning_budget_tokens')) {
           this.state.reasoning.budgetTokens = DEFAULTS.reasoning.budgetTokens;
         }
+        if (all || keys?.includes('reasoning_display')) {
+          this.state.reasoning.display = DEFAULTS.reasoning.display;
+        }
         this.ctx?.setState(this.state);
         return this.reasoningSettingsView();
       },
@@ -153,6 +178,7 @@ export class SettingsModule implements Module {
     return {
       reasoning_enabled: this.state.reasoning.enabled,
       reasoning_budget_tokens: this.state.reasoning.budgetTokens,
+      reasoning_display: this.state.reasoning.display,
     };
   }
 
