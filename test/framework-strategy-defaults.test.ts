@@ -39,6 +39,28 @@ describe('standard-recipe memory defaults', () => {
     expect(config.summaryParticipant).toBe('Mira');
   });
 
+  test('frontdesk gets adaptive + kv-stable too (2026-08-03 clerk outage: hierarchical saturates)', () => {
+    const strategy = buildFrameworkStrategy(
+      recipe({ name: 'Desk', strategy: { type: 'frontdesk' } }),
+      'some-model',
+      'Europe/Kyiv',
+    );
+    const config = configView(strategy);
+    expect(config.adaptiveResolution).toBe(true);
+    expect(config.foldingStrategy).toBe('kv-stable');
+  });
+
+  test('frontdesk adaptiveResolution: false is the hierarchical rollback lever', () => {
+    const strategy = buildFrameworkStrategy(
+      recipe({ name: 'Desk', strategy: { type: 'frontdesk', adaptiveResolution: false } }),
+      'some-model',
+      'Europe/Kyiv',
+    );
+    const config = configView(strategy);
+    expect(config.adaptiveResolution).toBe(false);
+    expect(config.foldingStrategy).toBeUndefined();
+  });
+
   test('explicit recipe values override the defaults', () => {
     const strategy = buildFrameworkStrategy(
       recipe({

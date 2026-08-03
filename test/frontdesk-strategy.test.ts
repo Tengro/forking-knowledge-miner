@@ -2,7 +2,6 @@ import { describe, test, expect } from 'bun:test';
 import type {
   MessageStoreView,
   StoredMessage,
-  SummaryEntry,
   ContextEntry,
 } from '@animalabs/context-manager';
 import { FrontdeskStrategy } from '../src/strategies/frontdesk-strategy.js';
@@ -54,11 +53,11 @@ class TestFrontdesk extends FrontdeskStrategy {
   public pub_updateSalience(store: MessageStoreView) {
     this.updateSalience(store);
   }
-  public pub_selectL1(l1: SummaryEntry[], budget: number, maxTokens: number) {
-    return this.selectL1Summaries(l1, budget, maxTokens);
-  }
   public pub_isTopicBoundary(a: StoredMessage, b: StoredMessage) {
     return this.isTopicBoundary(a, b);
+  }
+  public pub_chunkBoundaryHint(a: StoredMessage, b: StoredMessage) {
+    return this.chunkBoundaryHint(a, b);
   }
   public pub_compressionInstruction(chunkMessages: StoredMessage[], target: number) {
     // Build a minimal Chunk shape sufficient for getCompressionInstruction
@@ -293,44 +292,33 @@ describe('compression instruction', () => {
   });
 });
 
-describe('salience-biased L1 selection', () => {
-  function summary(id: string, tokens: number, sourceIds: string[]): SummaryEntry {
-    return {
-      id,
-      level: 1,
-      content: '',
-      tokens,
-      sourceLevel: 0,
-      sourceIds,
-      sourceRange: { first: sourceIds[0] ?? '', last: sourceIds[sourceIds.length - 1] ?? '' },
-      created: Date.now(),
-    };
-  }
+describe('chunk boundary hint (topic-aware chunking via the base seam)', () => {
+  // The chunking mechanics — record persistence, minimum-size, tool-pairing
+  // guard — are context-manager's contract, gated by its
+  // chunk-boundary-hook tests. What is conhost's to pin is the hint policy:
+  // frontdesk hints exactly at topic boundaries.
 
-  test('prefers L1 summaries whose sources contain salient messages', () => {
+  test('hints a close when adjacent messages change topic on one channel', () => {
     const s = makeStrategy();
-    const q = msg('User', 'what is x?', {}); // salient: unanswered
-    s.pub_updateSalience(makeStore([q]));
-
-    // Two L1 summaries, each 100 tokens; budget fits only one
-    const routineFirst = summary('L1-0', 100, ['unrelated-1']);
-    const salientSecond = summary('L1-1', 100, [q.id]);
-
-    const { selected } = s.pub_selectL1([routineFirst, salientSecond], 100, 100);
-    expect(selected).toHaveLength(1);
-    expect(selected[0].id).toBe('L1-1');
+    const a = msg('User', 'x', { serverId: 'zulip', channelId: 'zulip:eng', topic: 'retries' });
+    const b = msg('User', 'y', { serverId: 'zulip', channelId: 'zulip:eng', topic: 'deploys' });
+    expect(s.pub_chunkBoundaryHint(a, b)).toBe(true);
   });
 
-  test('falls back to routine summaries once salient are exhausted', () => {
+  test('does not hint within a topic or when topic metadata is absent', () => {
     const s = makeStrategy();
-    const q = msg('User', 'what is x?', {});
-    s.pub_updateSalience(makeStore([q]));
+    const a = msg('User', 'x', { serverId: 'zulip', channelId: 'zulip:eng', topic: 'retries' });
+    const b = msg('User', 'y', { serverId: 'zulip', channelId: 'zulip:eng', topic: 'retries' });
+    const bare = msg('User', 'z', {});
+    expect(s.pub_chunkBoundaryHint(a, b)).toBe(false);
+    expect(s.pub_chunkBoundaryHint(a, bare)).toBe(false);
+    expect(s.pub_chunkBoundaryHint(bare, a)).toBe(false);
+  });
 
-    const salient = summary('L1-1', 50, [q.id]);
-    const routine = summary('L1-2', 50, ['unrelated-1']);
-    const { selected } = s.pub_selectL1([routine, salient], 200, 200);
-    expect(selected).toHaveLength(2);
-    expect(selected[0].id).toBe('L1-1'); // salient first
-    expect(selected[1].id).toBe('L1-2');
+  test('hint agrees with isTopicBoundary across channels (same topic name, different channel)', () => {
+    const s = makeStrategy();
+    const a = msg('User', 'x', { serverId: 'zulip', channelId: 'zulip:eng', topic: 'retries' });
+    const b = msg('User', 'y', { serverId: 'zulip', channelId: 'zulip:ops', topic: 'retries' });
+    expect(s.pub_chunkBoundaryHint(a, b)).toBe(s.pub_isTopicBoundary(a, b));
   });
 });

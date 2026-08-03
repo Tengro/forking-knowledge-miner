@@ -83,9 +83,17 @@ export function buildFrameworkStrategy(
     if (value !== undefined) autobiographicalOpts[key] = value;
   }
 
-  // Autobiographical agents default to adaptive resolution unless a recipe
-  // opts out; frontdesk keeps its historical hierarchical renderer default.
-  if (strategyType === 'autobiographical' && autobiographicalOpts.adaptiveResolution === undefined) {
+  // Autobiographical AND frontdesk agents default to adaptive resolution
+  // unless a recipe opts out. Frontdesk historically kept the hierarchical
+  // renderer; that geometry has no tail reservation and no way to shed
+  // summary mass, so a long-lived agent saturates a fixed budget into a
+  // terminal context refusal (2026-08-03 boter clerk outage). The adaptive
+  // picker solves a frontier to fit — recipes can still pin
+  // `adaptiveResolution: false` as a rollback lever.
+  if (
+    (strategyType === 'autobiographical' || strategyType === 'frontdesk') &&
+    autobiographicalOpts.adaptiveResolution === undefined
+  ) {
     autobiographicalOpts.adaptiveResolution = true;
   }
 
@@ -100,7 +108,7 @@ export function buildFrameworkStrategy(
   //   'Claude', which voices self-recollections as a stranger for any agent
   //   not named Claude. Summaries should speak as the agent itself.
   if (
-    strategyType === 'autobiographical' &&
+    (strategyType === 'autobiographical' || strategyType === 'frontdesk') &&
     autobiographicalOpts.adaptiveResolution !== false &&
     autobiographicalOpts.foldingStrategy === undefined
   ) {
