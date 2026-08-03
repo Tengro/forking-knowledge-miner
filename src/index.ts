@@ -890,8 +890,16 @@ async function main() {
   // live probe 2026-07-31. Still no CallLedger — it's
   // anthropic-transport-only for now; cache metrics are visible in
   // llm-calls.jsonl via the logging wrapper.
+  // BEDROCK_BASE_URL routes bedrock-runtime calls through an inference
+  // gateway (gate.animalabs.ai/bedrock/<credSet>) — mirrors the
+  // ANTHROPIC_BASE_URL hook below. The gate reads the agent token from the
+  // SigV4 Credential (AWS_ACCESS_KEY_ID slot), discards the client
+  // signature, and re-signs with real AWS creds held on the gate box.
   const bedrockAdapter = provider === 'bedrock'
-    ? new LoggingBedrockAdapter({}, llmLogPath)
+    ? new LoggingBedrockAdapter(
+        { baseURL: process.env.BEDROCK_BASE_URL || undefined },
+        llmLogPath,
+      )
     : undefined;
   const adapter = provider === 'openai-responses'
     ? new LoggingProviderAdapter(
