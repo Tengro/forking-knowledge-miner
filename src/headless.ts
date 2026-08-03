@@ -136,6 +136,8 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     'workspace-mounts-snapshot',
     'workspace-tree-snapshot',
     'workspace-file-snapshot',
+    'cancel-subagent-result',
+    'panel-response',
   ]);
 
   function emit(event: Record<string, unknown>): void {
@@ -327,6 +329,18 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
         } catch (err) {
           emit({ type: 'workspace-file-snapshot', corrId: cmd.corrId, path: cmd.path, totalLines: 0, fromLine: 1, toLine: 0, content: '', truncated: false, error: err instanceof Error ? err.message : String(err) });
         }
+        return;
+      }
+      case 'panel-request': {
+        // Operator-panel query/mutation, shared verb. The SAME handler the
+        // WebUI host runs locally answers here, so parent and child views of
+        // any panel op can never drift. runPanelOp never throws — failures
+        // come back as {ok:false} and still produce a panel-response, which
+        // the parent's promise API requires to settle.
+        const op = typeof cmd.op === 'string' ? cmd.op : '';
+        const { runPanelOp } = await import('./web/panel-data.js');
+        const result = await runPanelOp(app, op, cmd.params ?? {});
+        emit({ type: 'panel-response', corrId: cmd.corrId, op, ...result });
         return;
       }
       case 'cancel-subagent': {

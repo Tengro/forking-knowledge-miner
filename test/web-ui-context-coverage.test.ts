@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { buildContextCoverageSnapshot } from '../src/modules/web-ui-module.js';
+import { buildContextCoverageSnapshot } from '../src/web/panel-data.js';
 
 function contextManager(strategy: Record<string, unknown>) {
   return {

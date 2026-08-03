@@ -28,6 +28,38 @@
 
 ### Added
 
+- **Every WebUI inspection panel now works per fleet child.** One persistent
+  scope dropdown in the sidebar header ("inspecting: …") replaces the
+  per-tab pill rows Lessons/Files carried — MCPL, Context, Settings, Pins,
+  Health, and the main-pane Context document all follow it, instead of the
+  previous split where only Lessons/Files could switch (statefully, via
+  duplicated pickers), Context 404'd by mis-sending the child name as an
+  `?agent=` param, and MCPL/Settings/Pins/Health were silently locked to the
+  fleetmaster. Backed by one generic fleet IPC verb pair
+  (`panel-request`/`panel-response`) dispatching into a shared panel layer
+  (`src/web/panel-data.ts`) that both the WebUI host and headless children
+  run — a new panel op needs no protocol change to work fleet-wide.
+  Details:
+  - `/debug/context/{,makeup,coverage,curve,preview,maintenance}` and
+    `/healthz` accept `?scope=<child>` — the host proxies to the child over
+    the fleet IPC and answers with its JSON verbatim (still curl-able;
+    connectome-doctor / fleet hub can now watch children through the host).
+    `/curve?scope=<child>` passes through to the scoped JSON.
+  - The MCPL tab shows the scoped process's **live** loaded servers
+    (connection status, tool counts — the long-missing fleet mcpl snapshot)
+    above the shared registry file; registry edits stay host-scope (the
+    file is one cwd-shared registry, so a "child-local edit" would be a
+    lie) and the panel says so instead of hiding the fact.
+  - Settings mutations, dry-run previews (single-flight guard now lives in
+    the target process), and pin add/remove run inside the scoped child;
+    child pins snapshots ship picker candidates (real store ids) since the
+    SPA has no window into a child's message store.
+  - Scoped WS responses (`lessons-list`, `workspace-*`, `mcpl-list`,
+    `settings-state`, `pins-list`) now echo their `scope`, and the SPA
+    drops replies that arrive after the operator switched — fixing a
+    pre-existing race where a slow child's lessons/files could render under
+    another child's header.
+  - Child health snapshots include the child's recent provider-call ledger.
 - **TUI: context budget gauge.** The status bar's `ctx:` readout and the fleet
   tree's per-agent readouts show `142k/180k` against the *live* runtime budget
   (runtime overrides win over the recipe), and the status segment goes yellow at
@@ -70,6 +102,12 @@
 
 ### Fixed
 
+- `cancel-subagent-result` was missing from the headless runtime's
+  subscription-filter exemptions: a parent that narrowed the event stream
+  could never see its own cancel confirmations.
+- The Vite dev server proxies `/debug`, `/healthz`, `/curve`, and `/files`
+  to the running host — previously every HTTP panel fetch 404'd under
+  `bun run dev`.
 - **TUI: "Branch switched" announcements survive.** The line was printed *before*
   `refreshFromStore()` cleared the scrollbox, so it was destroyed unread.
 

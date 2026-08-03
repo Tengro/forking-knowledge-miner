@@ -104,6 +104,10 @@ interface AppContext {
   branchState: BranchState;
   userMessageCount: number;
   codexAdapter?: CodexSubscriptionAdapter;
+  /** Content-free recent provider-call ledger. Consumed by the panel-data
+   *  layer (health snapshots) in BOTH runtimes — WebUI host and headless
+   *  fleet child. Null when the provider adapter exposes no ledger. */
+  callLedger: CallLedger | null;
 
   /** Stop current framework, switch to a different session, start new framework. */
   switchSession(id: string): Promise<void>;
@@ -994,6 +998,7 @@ async function main() {
     branchState: createBranchState(),
     userMessageCount: 0,
     codexAdapter,
+    callLedger,
 
     async switchSession(id: string) {
       handleExport(this);

@@ -8,7 +8,7 @@ import { TreeSidebar } from './TreeSidebar';
 import { StreamPanel, formatStreamEvent, type StreamLine } from './Stream';
 import { UsagePanel } from './Usage';
 import { LessonsPanel, type LessonRow } from './Lessons';
-import { McplPanel, type McplServerRow } from './Mcpl';
+import { McplPanel, type McplServerRow, type McplLiveRow } from './Mcpl';
 import { SettingsPanel, type SettingsState } from './Settings';
 import { DryContext, type DryContextData } from './DryContext';
 import { PinsPanel, type PinsState, type PinCandidate } from './Pins';
@@ -233,27 +233,47 @@ export function App() {
   };
 
   /** `force` retries past a remembered 401/403 — the operator's grant may
-   *  have gained the 'health' scope since the poll gave up. */
+   *  have gained the 'health' scope since the poll gave up. Follows the
+   *  inspection scope: a fleet child's /healthz is proxied over the panel
+   *  IPC by the host. Alert reconciliation stays LOCAL-only — the strip is
+   *  a host-level surface, and child agent names could collide with the
+   *  parent's alert keys. */
   const loadHealth = async (force = false): Promise<void> => {
     if (healthDenied && !force) return;
     if (force) healthDenied = false;
+    const scope = panelScope();
     try {
-      const res = await fetch('/healthz', { credentials: 'same-origin' });
+      const res = await fetch(`/healthz${scopeQuery()}`, { credentials: 'same-origin' });
       if (!res.ok) {
         if (res.status === 403 || res.status === 401) {
           healthDenied = true;
           setHealthErr('403');
           return;
         }
-        throw new Error(`HTTP ${res.status}`);
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `HTTP ${res.status}`);
       }
       const h = (await res.json()) as HealthSnapshot;
+      if (scope !== panelScope()) return; // scope switched mid-flight — stale
       setHealth(h);
       setHealthErr(null);
-      reconcileHealthAlerts(h);
+      if (scope === 'local') reconcileHealthAlerts(h);
     } catch (e) {
+      if (scope !== panelScope()) return;
       setHealthErr(e instanceof Error ? e.message : String(e));
     }
+  };
+
+  /** Local-alert reconciliation when the panel scope is parked on a child:
+   *  the strip's durable-state alerts (quarantine, hard-down) are host-level
+   *  and must keep reconciling regardless of what the Health tab inspects. */
+  const reconcileLocalAlerts = async (): Promise<void> => {
+    if (healthDenied) return;
+    try {
+      const res = await fetch('/healthz', { credentials: 'same-origin' });
+      if (!res.ok) return; // auth handling lives on the loadHealth path
+      reconcileHealthAlerts((await res.json()) as HealthSnapshot);
+    } catch { /* transient — next tick retries */ }
   };
 
   // ---------------------------------------------------------------------------
@@ -281,11 +301,15 @@ export function App() {
   /** Rendered dry-run context awaiting display. Never applied — see DryContext. */
   const [dryContext, setDryContext] = createSignal<DryContextData | null>(null);
 
-  /** Scope shared by Lessons / Files / Recipe panels. 'local' means the
-   *  parent process; otherwise the fleet child's name. The scope is shared
-   *  so an operator can pin a child of interest and see all three views
-   *  without re-selecting per panel. */
+  /** THE inspection scope — one selector for every operator panel (lessons,
+   *  files, MCPL, context, settings, pins, health, recipe). 'local' means
+   *  the parent process; otherwise the fleet child's name. Deliberately
+   *  shared and sticky: an operator pins a child of interest once (the
+   *  dropdown in the sidebar header) and every panel follows. */
   const [panelScope, setPanelScope] = createSignal<string>('local');
+  /** Query-string suffix routing scoped HTTP debug fetches to a child. */
+  const scopeQuery = (): string =>
+    panelScope() !== 'local' ? `?scope=${encodeURIComponent(panelScope())}` : '';
   const availableScopes = (): Array<{ id: string; label: string }> => {
     const w = welcome();
     const local = { id: 'local', label: w?.recipe.name ?? 'parent' };
@@ -307,13 +331,17 @@ export function App() {
   };
 
   /** MCPL panel state — populated by 'mcpl-list' responses, which the server
-   *  also re-sends after every mutation so the panel auto-refreshes. */
+   *  also re-sends after every mutation so the panel auto-refreshes. The
+   *  `live` list is the scoped process's actually-loaded servers (recipe
+   *  opt-in + overlay) with connection status — per-scope truth the shared
+   *  registry file can't express. */
   const [mcplServers, setMcplServers] = createSignal<McplServerRow[]>([]);
+  const [mcplLive, setMcplLive] = createSignal<McplLiveRow[]>([]);
   const [mcplLoaded, setMcplLoaded] = createSignal(false);
   const [mcplConfigPath, setMcplConfigPath] = createSignal('');
   const refreshMcpl = (): void => {
     setMcplLoaded(false);
-    wire.send({ type: 'request-mcpl' });
+    wire.send({ type: 'request-mcpl', scope: panelScope() });
   };
 
   /** Context-settings panel state. The server BROADCASTS `settings-state` after
@@ -323,16 +351,19 @@ export function App() {
   const [settingsLoaded, setSettingsLoaded] = createSignal(false);
   const refreshSettings = (): void => {
     setSettingsLoaded(false);
-    wire.send({ type: 'request-settings' });
+    wire.send({ type: 'request-settings', scope: panelScope() });
   };
 
   /** Pins panel state — broadcast on change, like settings: pins alter the next
-   *  compile's fold plan, so operators must not hold divergent views. */
+   *  compile's fold plan, so operators must not hold divergent views. For
+   *  fleet-child scopes the snapshot also carries picker `candidates` (real
+   *  store ids from the child) — the local candidate list below only knows
+   *  the parent's conversation. */
   const [pinsState, setPinsState] = createSignal<PinsState | null>(null);
   const [pinsLoaded, setPinsLoaded] = createSignal(false);
   const refreshPins = (): void => {
     setPinsLoaded(false);
-    wire.send({ type: 'request-pins' });
+    wire.send({ type: 'request-pins', scope: panelScope() });
   };
 
   /** Workspace files panel state — mounts list + per-mount tree cache. */
@@ -368,9 +399,11 @@ export function App() {
     wire.send({ type: 'request-workspace-file', path, scope: panelScope() });
   };
 
-  /** Switch the shared panel scope. Invalidates cached lessons/files so the
-   *  new scope's data is re-fetched on next access. MCPL config is global,
-   *  so it doesn't follow scope. */
+  /** Switch the inspection scope. Every per-scope cache is invalidated; the
+   *  currently-visible tab re-fetches immediately and the rest lazy-load on
+   *  next open. Context / ContextDocument re-fetch reactively off their
+   *  `scope` prop, and the health poll picks the new scope up on its next
+   *  tick (forced immediately when the Health tab is open). */
   const changePanelScope = (scope: string): void => {
     if (scope === panelScope()) return;
     setPanelScope(scope);
@@ -380,10 +413,24 @@ export function App() {
     setMounts([]);
     setTreesByMount(new Map<string, FlatEntry[]>());
     setExpandedMounts(new Set<string>());
-    // Re-request whichever tab the operator is currently looking at; the
-    // others will lazy-load when they're opened.
-    if (sidebarTab() === 'lessons') refreshLessons();
-    if (sidebarTab() === 'files') refreshMounts();
+    setOpenFile(null);
+    setFileLoading(false);
+    setMcplLoaded(false);
+    setMcplServers([]);
+    setMcplLive([]);
+    setSettingsLoaded(false);
+    setSettingsState(null);
+    setPinsLoaded(false);
+    setPinsState(null);
+    setHealth(null);
+    setHealthErr(null);
+    const tab = sidebarTab();
+    if (tab === 'lessons') refreshLessons();
+    if (tab === 'files') refreshMounts();
+    if (tab === 'mcp') refreshMcpl();
+    if (tab === 'settings') refreshSettings();
+    if (tab === 'pins') refreshPins();
+    if (tab === 'health') void loadHealth(true);
   };
   /** Pending-token buffer for the active stream; flushes on newline or non-token event. */
   let streamTokenBuffer = '';
@@ -544,6 +591,12 @@ export function App() {
     }
     setProtoMismatch(null);
     setWelcome(msg);
+    // A scope pinned to a child that no longer exists (stopped, crashed,
+    // session switch) would leave every panel dead-ended on a name the
+    // fleet no longer knows. Fall back to the host.
+    if (panelScope() !== 'local' && !msg.childTrees.some((c) => c.name === panelScope())) {
+      changePanelScope('local');
+    }
     const key = `${msg.session.id}/${msg.branch.id}`;
     const entries = msg.messages.map(entryToMessage);
 
@@ -890,15 +943,17 @@ export function App() {
         finishStream,
         queueScroll,
         openQuitConfirm: (children) => setQuitConfirm(children),
+        currentScope: panelScope,
         setLessons: (loaded, moduleLoaded, list) => {
           setLessonsLoaded(loaded);
           setLessonsModuleLoaded(moduleLoaded);
           setLessons(list);
         },
-        setMcpl: (configPath, servers) => {
+        setMcpl: (configPath, servers, live) => {
           setMcplLoaded(true);
           setMcplConfigPath(configPath);
           setMcplServers(servers);
+          setMcplLive(live);
         },
         setSettings: (state) => {
           setSettingsLoaded(true);
@@ -946,9 +1001,14 @@ export function App() {
 
     // Health poll: durable-state alerts (quarantine, hard-down) must not
     // depend on being connected when the klaxon fired. 15s keeps the strip
-    // honest without meaningful load (counts-only JSON).
+    // honest without meaningful load (counts-only JSON). With the scope on a
+    // fleet child, loadHealth feeds the Health tab from that child and a
+    // second local fetch keeps the alert strip reconciled.
     void loadHealth();
-    const healthTimer = window.setInterval(() => void loadHealth(), 15_000);
+    const healthTimer = window.setInterval(() => {
+      void loadHealth();
+      if (panelScope() !== 'local') void reconcileLocalAlerts();
+    }, 15_000);
     onCleanup(() => window.clearInterval(healthTimer));
   });
 
@@ -1126,7 +1186,7 @@ export function App() {
               <MessageView msg={m} results={toolResults()} toolUseIds={toolUseIds()} />
             )}</For>
             </Show>}>
-              <ContextDocument agent={panelScope() === 'local' ? undefined : panelScope()} />
+              <ContextDocument scope={panelScope()} />
             </Show>
           </div>
 
@@ -1218,6 +1278,11 @@ export function App() {
               if (tab === 'pins' && !pinsLoaded()) refreshPins();
             }}
           />
+          <ScopeBar
+            scopes={availableScopes()}
+            scope={panelScope()}
+            onChange={changePanelScope}
+          />
           <div class="flex-1 min-h-0">
             <Show when={sidebarTab() === 'tree'}>
               <TreeSidebar
@@ -1237,9 +1302,6 @@ export function App() {
                 loaded={lessonsLoaded()}
                 moduleLoaded={lessonsModuleLoaded()}
                 lessons={lessons()}
-                scope={panelScope()}
-                scopes={availableScopes()}
-                onScopeChange={changePanelScope}
                 onRefresh={refreshLessons}
               />
             </Show>
@@ -1248,6 +1310,8 @@ export function App() {
                 loaded={mcplLoaded()}
                 configPath={mcplConfigPath()}
                 servers={mcplServers()}
+                live={mcplLive()}
+                readOnly={panelScope() !== 'local'}
                 onRefresh={refreshMcpl}
                 onAdd={(input) => wire.send({ type: 'mcpl-add', ...input })}
                 onRemove={(id) => wire.send({ type: 'mcpl-remove', id })}
@@ -1258,11 +1322,12 @@ export function App() {
               <SettingsPanel
                 loaded={settingsLoaded()}
                 state={settingsState()}
+                scope={panelScope()}
                 onRefresh={refreshSettings}
-                onApply={(patch) => wire.send({ type: 'settings-update', ...patch })}
+                onApply={(patch) => wire.send({ type: 'settings-update', scope: panelScope(), ...patch })}
                 onReset={(keys, persist) =>
-                  wire.send({ type: 'settings-reset', ...(keys ? { keys } : {}), persist })}
-                onCancelTransition={() => wire.send({ type: 'settings-cancel-transition' })}
+                  wire.send({ type: 'settings-reset', scope: panelScope(), ...(keys ? { keys } : {}), persist })}
+                onCancelTransition={() => wire.send({ type: 'settings-cancel-transition', scope: panelScope() })}
                 onDryContext={(ctx) => { setDryContext(ctx as DryContextData); setMainView('dry'); }}
               />
             </Show>
@@ -1271,14 +1336,16 @@ export function App() {
                 loaded={pinsLoaded()}
                 state={pinsState()}
                 agent={pinsState()?.agent}
-                candidates={messages
-                  .filter((m) => m.index !== undefined && m.id)
-                  .map<PinCandidate>((m) => ({
-                    id: m.id, index: m.index!, participant: m.participant, text: m.text ?? '',
-                  }))}
+                candidates={panelScope() === 'local'
+                  ? messages
+                      .filter((m) => m.index !== undefined && m.id)
+                      .map<PinCandidate>((m) => ({
+                        id: m.id, index: m.index!, participant: m.participant, text: m.text ?? '',
+                      }))
+                  : pinsState()?.candidates ?? []}
                 onRefresh={refreshPins}
-                onAdd={(input) => wire.send({ type: 'pin-add', ...input })}
-                onRemove={(pinId) => wire.send({ type: 'pin-remove', pinId })}
+                onAdd={(input) => wire.send({ type: 'pin-add', scope: panelScope(), ...input })}
+                onRemove={(pinId) => wire.send({ type: 'pin-remove', scope: panelScope(), pinId })}
               />
             </Show>
             <Show when={sidebarTab() === 'files'}>
@@ -1288,9 +1355,6 @@ export function App() {
                 mounts={mounts()}
                 treesByMount={treesByMount()}
                 expandedMounts={expandedMounts()}
-                scope={panelScope()}
-                scopes={availableScopes()}
-                onScopeChange={changePanelScope}
                 onRefreshMounts={refreshMounts}
                 onExpandMount={expandMount}
                 onCollapseMount={collapseMount}
@@ -1298,7 +1362,7 @@ export function App() {
               />
             </Show>
             <Show when={sidebarTab() === 'context'}>
-              <ContextPanel agent={panelScope() === 'local' ? undefined : panelScope()} />
+              <ContextPanel scope={panelScope()} />
             </Show>
             <Show when={sidebarTab() === 'health'}>
               <HealthPanel
@@ -1348,10 +1412,14 @@ interface HandlerHooks {
   queueScroll: () => void;
   /** Show the quit-confirm modal with the given list of running children. */
   openQuitConfirm: (children: string[]) => void;
+  /** The live inspection scope — scoped responses that don't match it are
+   *  dropped as stale (a slow child reply must not render under another
+   *  scope's header). Responses without a scope stamp (older host) pass. */
+  currentScope: () => string;
   /** Apply a lessons-list response from the server. */
   setLessons: (loaded: boolean, moduleLoaded: boolean, lessons: LessonRow[]) => void;
   /** Apply an mcpl-list response from the server. */
-  setMcpl: (configPath: string, servers: McplServerRow[]) => void;
+  setMcpl: (configPath: string, servers: McplServerRow[], live: McplLiveRow[]) => void;
   /** Apply a settings-state broadcast. */
   setSettings: (state: SettingsState) => void;
   /** Apply a pins-list broadcast. */
@@ -1368,6 +1436,12 @@ interface HandlerHooks {
   setBranchesList: (branches: BranchRow[], currentId: string) => void;
   /** React to a server-side branch switch (undo/redo/checkout). */
   onBranchChanged: (branch: { id: string; name: string }) => void;
+}
+
+/** True when a scope-stamped response belongs to a scope the operator has
+ *  already navigated away from. Unstamped responses (older host) pass. */
+function staleScope(msgScope: string | undefined, current: string): boolean {
+  return msgScope !== undefined && msgScope !== current;
 }
 
 function handleServerMessage(
@@ -1481,24 +1555,31 @@ function handleServerMessage(
       hooks.openQuitConfirm(msg.children);
       return;
     case 'lessons-list':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setLessons(true, msg.loaded, msg.lessons);
       return;
     case 'mcpl-list':
-      hooks.setMcpl(msg.configPath, msg.servers);
+      if (staleScope(msg.scope, hooks.currentScope())) return;
+      hooks.setMcpl(msg.configPath, msg.servers, msg.live ?? []);
       return;
     case 'settings-state':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setSettings(msg as unknown as SettingsState);
       return;
     case 'pins-list':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setPins(msg as unknown as PinsState);
       return;
     case 'workspace-mounts':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setMounts(true, msg.loaded, msg.mounts);
       return;
     case 'workspace-tree':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setMountTree(msg.mount, msg.entries);
       return;
     case 'workspace-file':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setOpenFile(msg);
       return;
     case 'error':
@@ -2055,6 +2136,40 @@ function SidebarTabs(props: {
         </button>
       )}</For>
     </div>
+  );
+}
+
+/**
+ * The one fleet-scope selector — a persistent dropdown under the sidebar
+ * tabs that every inspection panel (lessons, files, MCPL, context, settings,
+ * pins, health, recipe) follows. A dropdown rather than pill rows so the
+ * control's footprint is independent of fleet size, and it stays visible on
+ * every tab instead of being re-invented per panel. Hidden entirely when no
+ * fleet children exist — single-process mode has nothing to select.
+ */
+function ScopeBar(props: {
+  scopes: Array<{ id: string; label: string }>;
+  scope: string;
+  onChange: (scope: string) => void;
+}) {
+  return (
+    <Show when={props.scopes.length > 1}>
+      <div class="flex items-center gap-2 px-3 py-1.5 border-b border-neutral-800 bg-neutral-900/20 font-mono">
+        <span class="text-neutral-600 uppercase tracking-wider text-[10px] shrink-0" title="Which process the panels below inspect — the host or a fleet child">
+          inspecting
+        </span>
+        <select
+          class="flex-1 min-w-0 bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5
+                 text-[11px] text-neutral-100 focus:outline-none focus:ring-1 focus:ring-cyan-700"
+          value={props.scope}
+          onChange={(e) => props.onChange(e.currentTarget.value)}
+        >
+          <For each={props.scopes}>{(s) => (
+            <option value={s.id} selected={s.id === props.scope}>{s.label}</option>
+          )}</For>
+        </select>
+      </div>
+    </Show>
   );
 }
 

@@ -35,6 +35,11 @@ export interface PinsState {
   pinsSupported: boolean;
   levelHonored: boolean;
   deepestLevel?: number;
+  /** Picker candidates shipped by a fleet-child scope's snapshot — the
+   *  client has no window into a child's message store, so the child sends
+   *  recent real store ids along. Absent on local scope (the client builds
+   *  its candidate list from its own message window). */
+  candidates?: PinCandidate[];
 }
 
 /**

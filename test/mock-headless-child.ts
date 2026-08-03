@@ -83,6 +83,20 @@ function simulateFinalInference(text: string, emitIdleAfter: boolean): void {
 function dispatch(msg: Record<string, unknown>): void {
   const t = typeof msg.type === 'string' ? msg.type : '';
   if (t === 'subscribe') return;  // accept silently
+  if (t === 'panel-request') {
+    // Panel-op verbs for FleetModule.requestPanel tests:
+    //   op 'hang' → never answers (timeout path)
+    //   op 'fail' → ok:false with a status (error passthrough path)
+    //   anything else → ok:true echoing the params back
+    const op = typeof msg.op === 'string' ? msg.op : '';
+    if (op === 'hang') return;
+    if (op === 'fail') {
+      emit({ type: 'panel-response', corrId: msg.corrId, op, ok: false, error: 'mock failure', status: 418 });
+      return;
+    }
+    emit({ type: 'panel-response', corrId: msg.corrId, op, ok: true, data: { op, echo: msg.params ?? null } });
+    return;
+  }
   if (t === 'shutdown') {
     emit({ type: 'lifecycle', phase: 'exiting', reason: 'shutdown' });
     setTimeout(() => process.exit(0), 50);
