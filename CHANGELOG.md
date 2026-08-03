@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Changed
+
+- **Frontdesk agents ride the adaptive path.** `frontdesk` strategies now
+  default to adaptive resolution + kv-stable folding, same as
+  `autobiographical` (a recipe can pin `adaptiveResolution: false` to keep the
+  old hierarchical renderer). The hierarchical renderer reserves nothing for
+  the raw tail and cannot shed summary mass, so a long-lived frontdesk agent
+  eventually saturates its fixed context budget into a terminal
+  `UncoveredDropError` refusal loop — the 2026-08-03 boter clerk outage.
+  Details and deltas:
+  - Topic-aware chunking now rides context-manager's `chunkBoundaryHint` seam
+    (requires CM ≥0.6.3) instead of a fork of `rebuildChunks` that silently
+    bypassed chunk-record persistence and the fail-closed orphan guard.
+  - Existing frontdesk stores carry no chunk records (the fork never wrote
+    them); context-manager's `migrateChunkRecords` backfills them from L1
+    `sourceIds` on first load, so upgraded stores do not re-compress lived
+    history. First boot re-plans folds (one-time KV churn, possibly a burst of
+    L1 production for the un-summarized frontier).
+  - The salience-biased L1 emission order is retired (it was a hierarchical-
+    renderer concept); unanswered questions/@mentions are still preserved
+    verbatim through the compression prompt.
+  - Witnessed chunks now get the base witnessed compression prompt; the fork
+    predated witnessed prompts and overrode them.
+
 ### Added
 
 - **TUI: context budget gauge.** The status bar's `ctx:` readout and the fleet
