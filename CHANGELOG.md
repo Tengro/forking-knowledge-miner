@@ -222,8 +222,6 @@
   write, output, breakpoints, duration and verdict, with refusals and errors
   highlighted. Cumulative totals for the session remain in the Usage panel.
 
-## Unreleased
-
 ## 0.7.0 — 2026-07-26
 
 ### Added
@@ -243,8 +241,6 @@
   `/debug/context/makeup` this costs nothing and makes no `count_tokens` network
   call, so it is safe on the 15s health poll.
 
-## Unreleased
-
 ## 0.6.1 — 2026-07-26
 
 ### Fixed
@@ -258,8 +254,6 @@
   server-sourced rows are exactly those carrying a store `index`; it also gains a
   text/id filter. Caught by checking the endpoint against a real store before
   anyone used the panel.
-
-## Unreleased
 
 ## 0.6.0 — 2026-07-26
 
@@ -323,8 +317,6 @@
   the agent's thread and the agent does nothing else meanwhile, quotes the
   measured cost, and notes runs are serialized so a second click is refused
   rather than queueing another pause.
-
-## Unreleased
 
 ## 0.5.3 — 2026-07-26
 
@@ -447,8 +439,6 @@
 
 - `compressionMaxTokens` recipe passthrough — cap compression output for
   models with low output ceilings (2c78936).
-
-## Unreleased
 
 ### Fixed
 
