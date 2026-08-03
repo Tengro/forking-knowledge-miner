@@ -118,8 +118,9 @@ export class McplAdminModule implements Module {
       {
         name: 'mcpl_list',
         description:
-          'List all MCPL servers: id, live connection status, tool count, command/url, ' +
-          'and where each is defined (recipe/file vs your own agent overlay).',
+          'List all MCPL servers: connection/retry state, whether policy was established, ' +
+          'the effective grant, masked/denied capability paths, host-command authority, ' +
+          'tool count, target, and config source.',
         inputSchema: { type: 'object', properties: {} },
       },
       {
@@ -227,7 +228,19 @@ export class McplAdminModule implements Module {
 
   private handleList(): ToolResult {
     const framework = this.requireFramework();
-    const live = framework.listMcplServers();
+    // These fields land in agent-framework 0.8's MCPL grant work. Keep them
+    // optional here so connectome-host remains truthful ("unknown") if it is
+    // temporarily run against an older framework package during rollout.
+    const live = framework.listMcplServers() as Array<
+      ReturnType<AgentFramework['listMcplServers']>[number] & {
+        retrying?: boolean;
+        policyEstablished?: boolean;
+        effectiveGrant?: string[];
+        maskedCapabilities?: string[];
+        deniedCapabilities?: string[];
+        allowHostCommands?: boolean;
+      }
+    >;
     const overlay = readAgentOverlay(this.overlayPath);
     const fileServers = readMcplServersFile(this.configPath);
 
@@ -237,8 +250,19 @@ export class McplAdminModule implements Module {
         ? 'agent-overlay'
         : s.id in fileServers ? 'file/recipe' : 'recipe';
       const target = s.command ?? s.url ?? '?';
+      const connectionState = s.connected ? 'CONNECTED' : s.retrying ? 'RETRYING' : 'DISCONNECTED';
+      const policyState = s.policyEstablished === undefined
+        ? 'unknown'
+        : s.policyEstablished ? 'established' : 'not-established';
+      const hostCommands = s.allowHostCommands === undefined
+        ? 'unknown'
+        : s.allowHostCommands ? 'allow' : 'deny';
       lines.push(
-        `${s.id}: ${s.connected ? 'CONNECTED' : 'DISCONNECTED'} — ${s.toolCount} tools, ` +
+        `${s.id}: ${connectionState} — policy=${policyState}, ` +
+        `grant=${formatCapabilityList(s.effectiveGrant)}, ` +
+        `masked=${formatCapabilityList(s.maskedCapabilities)}, ` +
+        `denied=${formatCapabilityList(s.deniedCapabilities)}, ` +
+        `hostCommands=${hostCommands}; ${s.toolCount} tools, ` +
         `prefix=${s.toolPrefix}, source=${source}, ${target}`,
       );
     }
@@ -377,4 +401,9 @@ export class McplAdminModule implements Module {
 
     return ok(`Unloaded server "${id}" — its tools are gone from your toolset. ${persistNote}`);
   }
+}
+
+function formatCapabilityList(paths: string[] | undefined): string {
+  if (paths === undefined) return 'unknown';
+  return `[${paths.join(',')}]`;
 }

@@ -95,6 +95,11 @@ export interface RecipeStrategy {
   /** Override wording for the witnessed-record instruction ({targetTokens}
    *  substituted). */
   witnessedInstruction?: string;
+  /** Identity reminder appended to every compression/merge instruction.
+   *  For agents in multi-resident channels (and older models especially):
+   *  names the agent and directs attribution so pure-witness chunks don't
+   *  flip the summarizer into another speaker's identity. */
+  identityReminder?: string;
 }
 
 export interface RecipeAgent {
