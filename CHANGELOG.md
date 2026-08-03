@@ -6,7 +6,7 @@
 
 - **`BEDROCK_BASE_URL` env hook** for the bedrock provider — mirrors
   `ANTHROPIC_BASE_URL`, routing bedrock-runtime calls through an inference
-  gateway (gate.animalabs.ai/bedrock/&lt;credSet&gt;). The gate reads the agent
+  gateway (gate.animalabs.ai/bedrock/<credSet>). The gate reads the agent
   token from the SigV4 Credential (`AWS_ACCESS_KEY_ID` slot), discards the
   client signature, and re-signs with real AWS creds. First user: Princess,
   moved off the first-party Anthropic API (classifier "bio" false-positive
