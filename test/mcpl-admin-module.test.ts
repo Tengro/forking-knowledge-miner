@@ -15,8 +15,14 @@ import { readAgentOverlay, saveAgentOverlay } from '../src/mcpl-config.js';
 interface StubServer {
   id: string;
   connected: boolean;
+  retrying: boolean;
   toolPrefix: string;
   toolCount: number;
+  policyEstablished: boolean;
+  effectiveGrant: string[];
+  maskedCapabilities: string[];
+  deniedCapabilities: string[];
+  allowHostCommands: boolean;
   command?: string;
   url?: string;
 }
@@ -32,8 +38,14 @@ function makeStubFramework() {
       servers.set(config.id, {
         id: config.id,
         connected: true,
+        retrying: false,
         toolPrefix: config.toolPrefix ?? `mcpl--${config.id}`,
         toolCount: 1,
+        policyEstablished: true,
+        effectiveGrant: ['channels.incoming'],
+        maskedCapabilities: ['channels.streaming'],
+        deniedCapabilities: ['contextHooks.beforeInference.inject.system'],
+        allowHostCommands: false,
         command: config.command,
         url: config.url,
       });
@@ -49,8 +61,14 @@ function makeStubFramework() {
       servers.set(id, {
         id,
         connected: true,
+        retrying: false,
         toolPrefix: `mcpl--${id}`,
         toolCount: 1,
+        policyEstablished: true,
+        effectiveGrant: ['channels.incoming'],
+        maskedCapabilities: ['channels.streaming'],
+        deniedCapabilities: ['contextHooks.beforeInference.inject.system'],
+        allowHostCommands: false,
         command: config?.command ?? prev?.command,
       });
     },
@@ -207,6 +225,11 @@ describe('mcpl_list', () => {
     const text = String(result.data);
     expect(text).toContain('discord: CONNECTED');
     expect(text).toContain('mytool: CONNECTED');
+    expect(text).toContain('policy=established');
+    expect(text).toContain('grant=[channels.incoming]');
+    expect(text).toContain('masked=[channels.streaming]');
+    expect(text).toContain('denied=[contextHooks.beforeInference.inject.system]');
+    expect(text).toContain('hostCommands=deny');
     expect(text).toContain('source=agent-overlay');
     expect(text).toContain('gone: UNLOADED');
   });

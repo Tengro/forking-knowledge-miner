@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **`mcpl_list` reports the live MCPL policy boundary.** Each server now shows
+  connected/retrying state, whether its initial policy was established, its
+  effective grant, host-masked and deny-by-default capability paths, and the
+  separate host-owned `host/command` authority. During a rolling upgrade,
+  fields unavailable from an older agent-framework render as `unknown` rather
+  than as a misleading empty grant.
+
 ## 0.7.3 — 2026-08-01
 
 ### Changed
