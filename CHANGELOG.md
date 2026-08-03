@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### Added
+
+- **TUI: context budget gauge.** The status bar's `ctx:` readout and the fleet
+  tree's per-agent readouts show `142k/180k` against the *live* runtime budget
+  (runtime overrides win over the recipe), and the status segment goes yellow at
+  75% / red at 90% — "how close to compression/trouble" at a glance instead of a
+  bare number.
+- **TUI: fleet view viewport.** The tree now scrolls with the cursor
+  (`┈ N lines above/below ┈` markers) instead of clipping past the bottom of the
+  terminal — previously a large fleet let the cursor walk below the fold and
+  Del:stop targeted rows the operator couldn't see.
+- **TUI: fleet view opens with a summary header** — agent counts
+  (running/done/failed/cancelled across local subagents *and* fleet children),
+  children up/crashed, session cost — plus the active ops alerts in full (the
+  status bar only has room for a count).
+- **TUI: event timestamps.** Alerts, tool batches, subagent results, wake
+  triggers, branch switches, errors and user messages get an `HH:MM` prefix, so
+  scrollback read an hour later still answers "when".
+- **TUI: root-agent tool completions are visible.** Verbose shows every
+  `✓ tool (1.2s)`; terse shows the slow ones (≥2s). Slow *running* tools show a
+  live elapsed in the status bar after 5s — "still executing" and "stuck" no
+  longer look identical.
+- **TUI: the status bar names the worst active alert** (`⚠ 2 ·
+  compression-quarantine`), with quarantine and inference-exhausted outranking
+  the merely-recent.
+
+### Changed
+
+- **TUI: thinking honors the Ctrl+V verbose toggle.** Terse mode collapses live
+  thinking to a counting one-liner (`💭 thinking… ~1.2k tok`) and replayed
+  history thinking to one truncated line per block — the toggle's label always
+  claimed this.
+- **TUI: session-history replay caps at the last 50 messages** (marker points at
+  the web UI for the rest) instead of flooding scrollback with the whole session.
+- **TUI: elapsed times are humane everywhere** — `5m48s`, not `348s`; the fleet
+  tree and both peek views now agree.
+- **TUI: peek-proc renders child `ops:alert` events properly** (red `⚠ kind:
+  message`, cyan for `-clear`) instead of a dim `· ops:alert` dot line, and no
+  longer prints dot lines for per-block/per-round bookkeeping events.
+- **TUI: the status-left segment truncates to fit** the terminal width instead of
+  shoving the tokens/mem segment off the row.
+
+### Fixed
+
+- **TUI: "Branch switched" announcements survive.** The line was printed *before*
+  `refreshFromStore()` cleared the scrollbox, so it was destroyed unread.
+
 ### Upgrade notes
 
 - **subagents/lessons/retrieval are now opt-in** (they were opt-out, and
