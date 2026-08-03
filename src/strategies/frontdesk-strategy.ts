@@ -1,29 +1,15 @@
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import type {
   AutobiographicalConfig,
+  Chunk,
   ContextEntry,
   MessageStoreView,
   ContextLogView,
   TokenBudget,
   StoredMessage,
-  SummaryEntry,
 } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { formatZonedTime, resolveTimeZone } from '@animalabs/agent-framework';
-
-// Structural mirror of AutobiographicalStrategy's internal Chunk.
-// Kept inline because @animalabs/context-manager does not currently export it.
-interface Chunk {
-  index: number;
-  startIndex: number;
-  endIndex: number;
-  messages: StoredMessage[];
-  tokens: number;
-  compressed: boolean;
-  diary?: string;
-  summaryId?: string;
-  phaseType?: string;
-}
 
 export type FrontdeskStrategyOptions = Partial<AutobiographicalConfig> & { timeZone?: string };
 
@@ -35,10 +21,22 @@ export type FrontdeskStrategyOptions = Partial<AutobiographicalConfig> & { timeZ
  *  1. Provenance wrapping — prepends a `[zulip · #channel · topic · @user · HH:MM · msg-id]`
  *     header to each MCPL-originated entry so the agent knows the message came from a
  *     channel and which reply path to use.
- *  2. Topic-aware compression — chunk boundaries prefer Zulip-topic transitions and the
- *     compression prompt instructs per-topic structure.
- *  3. Question/mention salience — unanswered user questions and @mentions are preserved
- *     verbatim longer (both during compression and during L1 selection under budget).
+ *  2. Topic-aware compression — chunk boundaries close at Zulip-topic transitions
+ *     (via the base chunker's `chunkBoundaryHint` seam) and the compression prompt
+ *     instructs per-topic structure.
+ *  3. Question/mention salience — unanswered user questions and @mentions are named
+ *     verbatim in the compression prompt so summaries preserve them.
+ *
+ * History note: through conhost 0.7.x this class forked the whole of
+ * `rebuildChunks` for feature 2 — written against a pre-chunk-persistence
+ * base, silently bypassing chunk records and the fail-closed orphan guard —
+ * and biased the hierarchical renderer's L1 selection for feature 3.
+ * Frontdesk agents now ride the adaptive path (see framework-strategy.ts
+ * defaults): chunking goes through the base implementation with a boundary
+ * hint, and salient content survives through the compression prompt rather
+ * than selection-order bias. Stores created by the fork carry no chunk
+ * records; context-manager's `migrateChunkRecords` backfills them from L1
+ * `sourceIds` on first load.
  */
 export class FrontdeskStrategy extends AutobiographicalStrategy {
   override readonly name: string = 'frontdesk';
@@ -162,77 +160,13 @@ export class FrontdeskStrategy extends AutobiographicalStrategy {
   // ==========================================================================
 
   /**
-   * Override rebuildChunks to additionally close chunk boundaries at Zulip-topic
-   * transitions. Falls back to base size/count behaviour when topic metadata is absent.
+   * Close chunk boundaries at Zulip-topic transitions, so summaries of
+   * unrelated topics are not fused. Rides the base chunker (context-manager
+   * ≥0.6.3): record persistence, minimum-size and tool-pairing guards all
+   * apply to hinted closes.
    */
-  protected override rebuildChunks(store: MessageStoreView): void {
-    const messagesToChunk = this.getCompressibleMessages(store);
-
-    const existingCompressed = new Map<string, Chunk>();
-    for (const chunk of this.chunks as unknown as Chunk[]) {
-      if (chunk.compressed) {
-        existingCompressed.set(this.chunkKey(chunk as never), chunk);
-      }
-    }
-
-    this.chunks = [];
-    this.compressionQueue = [];
-
-    let currentChunk: StoredMessage[] = [];
-    let currentTokens = 0;
-    let chunkFilteredStart = 0;
-    const MIN_CHUNK = 4;
-
-    const push = (startIdx: number, endIdx: number, msgs: StoredMessage[], tokens: number) => {
-      const chunk = this.createChunk(
-        this.chunks.length,
-        startIdx,
-        endIdx,
-        msgs,
-        tokens,
-        existingCompressed as never,
-      );
-      this.chunks.push(chunk);
-      if (!chunk.compressed) this.compressionQueue.push(chunk.index);
-    };
-
-    for (let i = 0; i < messagesToChunk.length; i++) {
-      const msg = messagesToChunk[i];
-      let msgTokens = store.estimateTokens(msg);
-      if (this.config.attachmentsIgnoreSize) {
-        msgTokens = this.estimateTextOnlyTokens(msg);
-      }
-
-      // Topic boundary: close current chunk BEFORE adding msg when topic changes
-      // and the chunk has at least MIN_CHUNK messages. This keeps summaries of
-      // unrelated topics from being merged.
-      if (
-        currentChunk.length >= MIN_CHUNK &&
-        this.isTopicBoundary(currentChunk[currentChunk.length - 1], msg)
-      ) {
-        push(chunkFilteredStart, i, currentChunk, currentTokens);
-        currentChunk = [];
-        currentTokens = 0;
-        chunkFilteredStart = i;
-      }
-
-      currentChunk.push(msg);
-      currentTokens += msgTokens;
-
-      const shouldClose =
-        currentTokens >= this.config.targetChunkTokens && currentChunk.length >= MIN_CHUNK;
-
-      if (shouldClose) {
-        push(chunkFilteredStart, i + 1, currentChunk, currentTokens);
-        currentChunk = [];
-        currentTokens = 0;
-        chunkFilteredStart = i + 1;
-      }
-    }
-
-    if (currentChunk.length >= MIN_CHUNK) {
-      push(chunkFilteredStart, messagesToChunk.length, currentChunk, currentTokens);
-    }
+  protected override chunkBoundaryHint(prev: StoredMessage, next: StoredMessage): boolean {
+    return this.isTopicBoundary(prev, next);
   }
 
   protected isTopicBoundary(prev: StoredMessage, curr: StoredMessage): boolean {
@@ -255,6 +189,11 @@ export class FrontdeskStrategy extends AutobiographicalStrategy {
   // ==========================================================================
 
   protected override getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
+    // Witnessed chunks keep the base treatment (recipe-configurable
+    // witnessed prompt); the old fork predated it and steamrolled it.
+    if (this.chunkIsWitnessed(chunk)) {
+      return super.getCompressionInstruction(chunk, targetTokens);
+    }
     const topics = new Set<string>();
     for (const m of chunk.messages) {
       const t = this.extractTopicKey(m);
@@ -289,43 +228,13 @@ export class FrontdeskStrategy extends AutobiographicalStrategy {
   }
 
   // ==========================================================================
-  // Feature 3b: Salience-biased L1 selection
+  // Salience tracking (feeds the compression instruction)
   // ==========================================================================
-
-  protected override selectL1Summaries(
-    shownL1: SummaryEntry[],
-    budget: number,
-    maxTokens: number,
-  ): { selected: SummaryEntry[]; tokensUsed: number } {
-    if (shownL1.length === 0) return { selected: [], tokensUsed: 0 };
-
-    const isSalient = (s: SummaryEntry): boolean =>
-      s.sourceIds.some((id) => this.salientSourceIds.has(id));
-
-    const salient: SummaryEntry[] = [];
-    const routine: SummaryEntry[] = [];
-    for (const s of shownL1) {
-      (isSalient(s) ? salient : routine).push(s);
-    }
-
-    const selected: SummaryEntry[] = [];
-    let used = 0;
-
-    for (const group of [salient, routine]) {
-      for (const s of group) {
-        if (used + s.tokens > budget) break;
-        if (used + s.tokens > maxTokens) break;
-        selected.push(s);
-        used += s.tokens;
-      }
-    }
-
-    return { selected, tokensUsed: used };
-  }
-
-  // ==========================================================================
-  // Salience tracking (shared by 3a and 3b)
-  // ==========================================================================
+  // The pre-adaptive frontdesk also overrode the hierarchical renderer's
+  // selectL1Summaries to emit salient L1s first under budget pressure. Under
+  // adaptive resolution the picker selects a coverage frontier — emission
+  // order is not budget-competitive — so that bias is retired; salient
+  // content survives because getCompressionInstruction names it verbatim.
 
   /**
    * Recompute which user messages are "unanswered questions or mentions":
