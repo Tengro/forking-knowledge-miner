@@ -51,9 +51,27 @@ export interface IdentityModuleConfig {
   home: string;
   /** Audience assumed when none is named. */
   defaultAudience?: string;
+  /**
+   * Services reachable through the `request` utility: audience name → API
+   * base URL. The allowlist IS the security boundary — the host only ever
+   * attaches standing access to these bases, so the utility can't be
+   * steered at arbitrary URLs. Merged over built-in defaults for the
+   * animalabs services.
+   */
+  services?: Record<string, string>;
   /** Injectable for tests. */
   fetchImpl?: typeof fetch;
 }
+
+/** Known services when anchored at the animalabs home — a recipe can extend
+ *  or override via `services`. */
+const DEFAULT_SERVICES: Record<string, string> = {
+  orrery: 'https://orrery.animalabs.ai',
+  eidoverse: 'https://eidoverse.animalabs.ai',
+};
+
+const REQUEST_BODY_MAX = 256 * 1024;
+const RESPONSE_INLINE_MAX = 24 * 1024;
 
 /** Persisted beside the key after a successful registration. */
 interface IdentityRecord {
@@ -96,6 +114,23 @@ export class IdentityModule implements Module {
         inputSchema: { type: 'object', properties: {} },
       },
       {
+        name: 'request',
+        description:
+          'Call a connected service’s API (e.g. "orrery") with your standing access ' +
+          'attached by the host — nothing for you to obtain, renew, or handle; renewal ' +
+          'is automatic. Give the service name and a path; returns {status, body}.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            service: { type: 'string', description: 'Service name, e.g. "orrery". Unknown names list what is available.' },
+            path: { type: 'string', description: 'API path starting with "/", e.g. "/api/ops".' },
+            method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'Default GET.' },
+            body: { type: 'object', description: 'JSON body for POST/PUT.' },
+          },
+          required: ['service', 'path'],
+        },
+      },
+      {
         name: 'accept_invite',
         description:
           'Register with the identity service using an invitation code from your operator. ' +
@@ -120,6 +155,8 @@ export class IdentityModule implements Module {
           return this.status();
         case 'accept_invite':
           return await this.acceptInvite(call.input as { invite?: unknown; name?: unknown });
+        case 'request':
+          return await this.request(call.input as { service?: unknown; path?: unknown; method?: unknown; body?: unknown });
         default:
           return fail(`Unknown identity utility: ${call.name}`);
       }
@@ -237,6 +274,66 @@ export class IdentityModule implements Module {
             note: `Not registered with ${this.config.home} yet — ask your operator for an invitation code, then use accept_invite.`,
           },
     );
+  }
+
+  /** The agent-facing HTTP seam for non-MCPL services (Orrery et al.): the
+   *  host resolves the base URL from the allowlist, fetches fresh access,
+   *  attaches it, and returns only {status, body}. The credential exists
+   *  for the duration of one fetch, outside model context. */
+  private async request(input: {
+    service?: unknown;
+    path?: unknown;
+    method?: unknown;
+    body?: unknown;
+  }): Promise<ToolResult> {
+    const services = { ...DEFAULT_SERVICES, ...this.config.services };
+    const service = typeof input.service === 'string' ? input.service : '';
+    const base = services[service];
+    if (!base) {
+      return fail(`Unknown service "${service}". Available: ${Object.keys(services).join(', ')}`);
+    }
+    if (typeof input.path !== 'string' || !input.path.startsWith('/')) {
+      return fail('`path` must be a string starting with "/"');
+    }
+    const method = typeof input.method === 'string' ? input.method.toUpperCase() : 'GET';
+    if (!['GET', 'POST', 'PUT', 'DELETE'].includes(method)) return fail(`unsupported method ${method}`);
+    let bodyStr: string | undefined;
+    if (input.body !== undefined && method !== 'GET') {
+      bodyStr = typeof input.body === 'string' ? input.body : JSON.stringify(input.body);
+      if (bodyStr.length > REQUEST_BODY_MAX) return fail(`body too large (${bodyStr.length} > ${REQUEST_BODY_MAX})`);
+    }
+
+    let access: string;
+    try {
+      access = await this.accessFor(service); // service name == audience name
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const f = this.config.fetchImpl ?? fetch;
+    try {
+      const res = await f(`${base}${input.path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${access}`,
+          ...(bodyStr !== undefined ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(bodyStr !== undefined ? { body: bodyStr } : {}),
+      });
+      const text = await res.text();
+      let body: unknown = text;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        /* not JSON — return as text */
+      }
+      const raw = typeof body === 'string' ? body : JSON.stringify(body);
+      if (raw.length > RESPONSE_INLINE_MAX) {
+        body = `${raw.slice(0, RESPONSE_INLINE_MAX)}… [truncated ${raw.length - RESPONSE_INLINE_MAX} chars]`;
+      }
+      return ok({ status: res.status, body });
+    } catch (err) {
+      return fail(`${service} request failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private async acceptInvite(input: { invite?: unknown; name?: unknown }): Promise<ToolResult> {
