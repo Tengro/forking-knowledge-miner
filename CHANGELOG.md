@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.4 — 2026-08-03
+
 ### Changed
 
 - **Frontdesk agents ride the adaptive path.** `frontdesk` strategies now
