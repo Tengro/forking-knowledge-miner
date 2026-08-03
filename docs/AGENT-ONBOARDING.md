@@ -257,7 +257,8 @@ ln -sfn ../../../connectome-local/context-manager/node_modules/@animalabs/chroni
     }
   },
   "modules": { "webui": { "port": 7343, "host": "127.0.0.1",
-                          "basicAuth": { "username": "${WEBUI_USER}", "password": "${WEBUI_PASS}" } }
+                          "basicAuth": { "username": "${WEBUI_USER}", "password": "${WEBUI_PASS}" } },
+               "subagents": false, "lessons": false, "retrieval": false
                /* + wake policies, workspace mounts (files/, notes/) */ },
   "mcpServers": {
     "shell":   { /* terminal-sessions stdio server; env: SESSION_SERVER_TOKEN, SESSION_SERVER_PORT */ },
@@ -270,6 +271,24 @@ ln -sfn ../../../connectome-local/context-manager/node_modules/@animalabs/chroni
 Use `"cacheTtl": "1h"` for Connectome deployments. This is also the runtime
 default when the field is omitted. Set `"5m"` only for intentionally rapid
 workloads whose cache is normally reused within five minutes.
+
+**`subagents`/`lessons`/`retrieval` are NOT part of the standard recipe.**
+All three are opt-in. RetrievalModule in particular injects context-dependent
+content into every compile (and spends up to two configured retrieval-model calls), so it must
+be an explicit opt-in for agents that actually curate a lesson library.
+Current host code defaults all three to off, but keep the explicit `false`
+entries in the recipe anyway — older host checkouts treated these as opt-out,
+and an accidentally-enabled RetrievalModule has caused severe prompt-cache
+churn in the field.
+
+**Memory defaults.** Current host code defaults an omitted/partial `strategy`
+to the fleet-standard shape: autobiographical + `adaptiveResolution: true` +
+`foldingStrategy: "kv-stable"` + same-model compression (`compressionModel`
+falls back to `agent.model`) + `summaryParticipant` = `agent.name`. Keep the
+skeleton's explicit values anyway: older host checkouts default folding to
+`flat-profile` and summary voice to the literal `'Claude'` (the stranger's-voice
+hazard), and explicit values survive host downgrades and copy-paste to other
+deployments.
 
 **`.env`** (`chmod 600`). Common vars:
 

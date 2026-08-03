@@ -1,0 +1,88 @@
+/**
+ * Standard-recipe memory defaults (buildFrameworkStrategy).
+ *
+ * A recipe that omits strategy tuning must get the fleet-standard shape:
+ * autobiographical + adaptiveResolution + kv-stable folding + same-model
+ * compression + summaries voiced as the agent itself. Explicit recipe values
+ * always win. DEFAULT_RECIPE must not enable the opt-in modules
+ * (subagents/lessons/retrieval).
+ */
+import { describe, expect, test } from 'bun:test';
+import { buildFrameworkStrategy } from '../src/framework-strategy.js';
+import { DEFAULT_RECIPE, validateRecipe } from '../src/recipe.js';
+
+function recipe(agent: Record<string, unknown> = {}) {
+  return validateRecipe({
+    name: 'framework-strategy-defaults',
+    agent: {
+      systemPrompt: 'sys',
+      ...agent,
+    },
+  });
+}
+
+function configView(strategy: object): Record<string, unknown> {
+  return (strategy as { config?: Record<string, unknown> }).config ?? {};
+}
+
+describe('standard-recipe memory defaults', () => {
+  test('omitted strategy gets kv-stable folding, same-model compression, and agent-voiced summaries', () => {
+    const strategy = buildFrameworkStrategy(
+      recipe({ name: 'Mira' }),
+      'some-model',
+      'America/Los_Angeles',
+    );
+    const config = configView(strategy);
+    expect(config.adaptiveResolution).toBe(true);
+    expect(config.foldingStrategy).toBe('kv-stable');
+    expect(config.compressionModel).toBe('some-model');
+    expect(config.summaryParticipant).toBe('Mira');
+  });
+
+  test('explicit recipe values override the defaults', () => {
+    const strategy = buildFrameworkStrategy(
+      recipe({
+        name: 'Mira',
+        strategy: {
+          type: 'autobiographical',
+          foldingStrategy: 'flat-profile',
+          compressionModel: 'pinned-model',
+          summaryParticipant: 'Someone Else',
+        },
+      }),
+      'some-model',
+      'America/Los_Angeles',
+    );
+    const config = configView(strategy);
+    expect(config.foldingStrategy).toBe('flat-profile');
+    expect(config.compressionModel).toBe('pinned-model');
+    expect(config.summaryParticipant).toBe('Someone Else');
+  });
+
+  test('adaptiveResolution opt-out leaves foldingStrategy unset', () => {
+    const strategy = buildFrameworkStrategy(
+      recipe({ strategy: { type: 'autobiographical', adaptiveResolution: false } }),
+      'some-model',
+      'America/Los_Angeles',
+    );
+    const config = configView(strategy);
+    expect(config.adaptiveResolution).toBe(false);
+    expect(config.foldingStrategy).toBeUndefined();
+  });
+
+  test("without an agent name the summary voice falls back to the library's 'Claude' default", () => {
+    const strategy = buildFrameworkStrategy(
+      recipe(),
+      'some-model',
+      'America/Los_Angeles',
+    );
+    expect(configView(strategy).summaryParticipant).toBe('Claude');
+  });
+
+  test('DEFAULT_RECIPE does not enable the opt-in modules', () => {
+    const modules = DEFAULT_RECIPE.modules ?? {};
+    expect(modules).not.toHaveProperty('subagents');
+    expect(modules).not.toHaveProperty('lessons');
+    expect(modules).not.toHaveProperty('retrieval');
+  });
+});

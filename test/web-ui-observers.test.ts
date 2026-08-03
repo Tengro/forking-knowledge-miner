@@ -287,7 +287,7 @@ describe('WebUiModule observer flow (e2e)', () => {
 
   test('grant appears (hot-reload): static public, observer WS flow end-to-end', async () => {
     saveObserversFile(observersPath, {
-      observers: [{ key: kp.id, label: 'e2e-device', scopes: ['health', 'ops'] }],
+      observers: [{ key: kp.id, label: 'e2e-device', scopes: ['health', 'ops', 'debug'] }],
     });
     await new Promise((r) => setTimeout(r, 3600)); // registry poll is 3s
 
@@ -319,7 +319,7 @@ describe('WebUiModule observer flow (e2e)', () => {
     ws.send(JSON.stringify({ type: 'observer-hello', identity: helloFor(kp, host) }));
     const ack = await got('observer-ack');
     expect(ack.label).toBe('e2e-device');
-    expect((ack.scopes as string[]).sort()).toEqual(['health', 'ops']);
+    expect((ack.scopes as string[]).sort()).toEqual(['debug', 'health', 'ops']);
 
     // Read-only: mutating messages are refused.
     ws.send(JSON.stringify({ type: 'user-message', content: 'hi' }));
@@ -340,11 +340,14 @@ describe('WebUiModule observer flow (e2e)', () => {
     });
     expect(String(branchErr.message)).toContain('forbidden');
 
-    // Session cookie: health allowed, debug denied (not in scopes).
+    // Session cookie: ordinary debug is allowed by scope, but retrieval traces
+    // remain operator-only because they can expose lessons and opt-in inputs.
     const cookie = `fkm_obs=${ack.sessionToken}`;
-    // healthz returns 503 (app not bound in this harness) — auth passed.
+    // 503 means authorization passed but this harness has no bound app.
     expect((await fetch(`${base()}/healthz`, { headers: { cookie } })).status).toBe(503);
-    expect((await fetch(`${base()}/debug/context`, { headers: { cookie } })).status).toBe(401);
+    expect((await fetch(`${base()}/debug/context`, { headers: { cookie } })).status).toBe(503);
+    expect((await fetch(`${base()}/debug/retrieval`, { headers: { cookie } })).status).toBe(401);
+    expect((await fetch(`${base()}/debug/retrieval/view`, { headers: { cookie } })).status).toBe(401);
     // Basic auth still works for everything.
     expect((await fetch(`${base()}/healthz`, { headers: { authorization: BASIC } })).status).toBe(503);
 

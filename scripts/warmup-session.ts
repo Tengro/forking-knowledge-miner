@@ -42,7 +42,7 @@ import { resolve } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
 import { AutobiographicalStrategy } from '@animalabs/agent-framework';
-import { Membrane, AnthropicAdapter, type NormalizedResponse } from '@animalabs/membrane';
+import { Membrane, AnthropicAdapter, BedrockAdapter, type NormalizedResponse } from '@animalabs/membrane';
 import { SessionManager } from '../src/session-manager.js';
 import { resolveAgentName } from '../src/agent-name.js';
 
@@ -181,7 +181,13 @@ function formatDuration(sec: number): string {
 
 async function main() {
   const opts = parseArgs(process.argv);
-  if (!process.env.ANTHROPIC_API_KEY) {
+  const bedrockModel = /^([a-z]{2,6}\.)?anthropic\./.test(opts.model);
+  if (bedrockModel) {
+    if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+      console.error('Bedrock model id — set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_REGION)');
+      process.exit(1);
+    }
+  } else if (!process.env.ANTHROPIC_API_KEY) {
     console.error('Set ANTHROPIC_API_KEY');
     process.exit(1);
   }
@@ -218,8 +224,16 @@ async function main() {
   // -- Membrane with token-spend hook --
   const price = priceOf(opts.model);
   const spend: Spend = { inputTokens: 0, outputTokens: 0, cost: 0 };
-  const adapter = new AnthropicAdapter({ apiKey: process.env.ANTHROPIC_API_KEY });
+  // Bedrock model ids (anthropic.* / <region>.anthropic.*) route through the
+  // BedrockAdapter with AWS_* env creds — legacy Claude models (revival
+  // sessions) exist nowhere else. Caching off: legacy models reject
+  // cache_control outright.
+  const isBedrock = /^([a-z]{2,6}\.)?anthropic\./.test(opts.model);
+  const adapter = isBedrock
+    ? new BedrockAdapter()
+    : new AnthropicAdapter({ apiKey: process.env.ANTHROPIC_API_KEY });
   const membrane = new Membrane(adapter, {
+    ...(isBedrock ? { defaultPromptCaching: false } : {}),
     // Imported sessions store assistant turns under participant `agentName`.
     // Membrane's default assistantParticipant is 'Claude'; if that disagrees
     // with the stored participant every assistant message maps to role

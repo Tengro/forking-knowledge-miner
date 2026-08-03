@@ -29,12 +29,7 @@ A recipe is a JSON file that configures everything domain-specific:
     "model": "claude-opus-4-6",
     "timezone": "America/Los_Angeles",
     "systemPrompt": "You are a ...",
-    "maxTokens": 16384,
-    "strategy": {
-      "type": "autobiographical",
-      "headWindowTokens": 4000,
-      "recentWindowTokens": 30000
-    }
+    "maxTokens": 16384
   },
   "mcpServers": {
     "my-server": {
@@ -44,9 +39,6 @@ A recipe is a JSON file that configures everything domain-specific:
     }
   },
   "modules": {
-    "subagents": true,
-    "lessons": true,
-    "retrieval": true,
     "wake": true,
     "files": { "namespace": "products" }
   },
@@ -59,6 +51,14 @@ A recipe is a JSON file that configures everything domain-specific:
 `agent.timezone` is an IANA zone used only for times rendered to the agent.
 Chronicle and MCPL protocol timestamps remain epoch/UTC. If the recipe omits
 it, `AGENT_TIMEZONE` is used, then the process timezone.
+
+**Memory defaults**: `agent.strategy` may be omitted entirely. The default is
+the autobiographical memory strategy with adaptive resolution, **KV-stable
+folding** (compile plans that preserve prompt-cache prefixes), compression by
+the agent's own model, and summaries voiced as the agent itself
+(`summaryParticipant` defaults to `agent.name`). Set a `strategy` block only
+to tune windows/budgets or opt into a different strategy type — see
+`docs/AGENT-ONBOARDING.md` for sizing guidance on long-lived agents.
 
 ### Recipe loading
 
@@ -122,12 +122,22 @@ subscription credits at a higher rate when applied.
 
 - **Web UI**: browser operator console (`modules.webui`) — live chat with full interiority (thinking, tool calls, streaming), agent/fleet tree, context makeup + compression coverage, call ledger with cache verdicts and billing-grade costs, health/ops alerts, Chronicle branch tree, lessons, MCPL config, workspace files; scoped read-only observer access via device keys
 - **TUI + readline modes**: OpenTUI interactive terminal or `--no-tui` for pipes/CI
-- **Subagent forking**: Spawn/fork parallel agents with fleet tree view (Tab to toggle)
-- **Persistent lessons**: Knowledge store with confidence scores, tags, and semantic retrieval
+- **Subagent forking** (opt-in, `modules.subagents`): Spawn/fork parallel agents with fleet tree view (Tab to toggle)
+- **Persistent lessons** (opt-in, `modules.lessons`): Knowledge store with confidence scores and tags. Automatic retrieval-injection of lessons into context (`modules.retrieval`) is a separate opt-in — it adds per-turn context churn and retrieval-model calls, so enable it only for agents that actually curate a lesson library
 - **Time-travel**: Chronicle-backed undo/redo, named checkpoints, branch exploration
 - **Session management**: Isolated sessions with auto-naming
 - **MCPL support**: Connect any MCP/MCPL server; wake subscriptions for selective event triggering
 - **File products**: Write reports and documents, materialize to disk
+
+For `openai-responses` and `openai-codex`, an object-valued
+`modules.retrieval` can set `reasoningEffort` (`none`, `minimal`, `low`,
+`medium`, `high`, `xhigh`, or `max`) independently of the primary agent.
+Retrieval calls are independent one-shot requests, so there is no separate
+retrieval reasoning-context setting. When `reasoningEffort` is configured,
+`model` must also be set explicitly: the historical retrieval default is a
+Claude model and cannot be sent through an OpenAI adapter. Anthropic/Claude
+uses different native thinking controls and does not accept this OpenAI-shaped
+option.
 
 ## Prerequisites
 
@@ -175,6 +185,7 @@ non-loopback binds require basic-auth credentials. Build the SPA bundle once wit
 - Ops alerts (compression quarantine, refusal streaks, inference-exhausted) render as persistent banner rows
 - Usage panel: per-agent costs and a billing-grade call ledger with cache verdicts
 - `/curve` — compression-curve visualization; `/healthz` — liveness JSON for doctor/fleet tooling
+- `/debug/retrieval/view` — operator-only per-run lesson selection viewer (see `docs/retrieval-traces.md`)
 - Read-only observer access via Ed25519 device keys with per-grant scopes (see `docs/webui-deployment.md`)
 
 For SPA development: `cd web && bun run dev` proxies the Vite dev server onto a

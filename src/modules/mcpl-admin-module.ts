@@ -51,6 +51,11 @@ export interface McplAdminModuleConfig {
   overlayPath?: string;
   /** Path to the human-owned server config file (read-only here). */
   configPath?: string;
+  /** Where these operations surface to the model: 'tools' (default — four
+   *  first-class slots, exactly the historical behavior) or 'utilities'
+   *  (behind the framework's single `utils` meta-tool: mcpl management is a
+   *  rare operation and needn't tax every inference with four schemas). */
+  surface?: 'tools' | 'utilities';
 }
 
 function ok(text: string): ToolResult {
@@ -69,15 +74,27 @@ export class McplAdminModule implements Module {
   private configPath: string;
   private timeZone: string;
 
+  private surface: 'tools' | 'utilities';
+
   constructor(config?: McplAdminModuleConfig) {
     this.overlayPath = config?.overlayPath ?? DEFAULT_AGENT_OVERLAY_PATH;
     this.configPath = config?.configPath ?? DEFAULT_CONFIG_PATH;
     this.timeZone = resolveTimeZone(config?.timeZone);
+    this.surface = config?.surface ?? 'tools';
   }
 
   /** Post-creation wiring (called from index.ts, mirrors ActivityModule.setFramework). */
   setFramework(framework: AgentFramework): void {
     this.framework = framework;
+  }
+
+  /** Optional identity plumbing (index.ts wires it when the recipe enables
+   *  the identity module): lets deployed servers name an `access` grant that
+   *  the host turns into a per-dial credential provider. The agent names the
+   *  access; credentials never surface. */
+  private identity: { accessFor(audience?: string): Promise<string> } | null = null;
+  setIdentity(identity: { accessFor(audience?: string): Promise<string> } | null): void {
+    this.identity = identity;
   }
 
   async start(_ctx: ModuleContext): Promise<void> {}
@@ -87,12 +104,23 @@ export class McplAdminModule implements Module {
   }
 
   getTools(): ToolDefinition[] {
+    return this.surface === 'tools' ? this.definitions() : [];
+  }
+
+  /** Same definitions, same handler — the surface flag only decides whether
+   *  they cost four slots or ride the `utils` meta-tool. */
+  getUtilities(): ToolDefinition[] {
+    return this.surface === 'utilities' ? this.definitions() : [];
+  }
+
+  private definitions(): ToolDefinition[] {
     return [
       {
         name: 'mcpl_list',
         description:
-          'List all MCPL servers: id, live connection status, tool count, command/url, ' +
-          'and where each is defined (recipe/file vs your own agent overlay).',
+          'List all MCPL servers: connection/retry state, whether policy was established, ' +
+          'the effective grant, masked/denied capability paths, host-command authority, ' +
+          'tool count, target, and config source.',
         inputSchema: { type: 'object', properties: {} },
       },
       {
@@ -111,7 +139,8 @@ export class McplAdminModule implements Module {
             args: { type: 'array', items: { type: 'string' }, description: 'Arguments for the command.' },
             env: { type: 'object', description: 'Environment variables for the spawned process.' },
             url: { type: 'string', description: 'WebSocket URL (websocket transport). Mutually exclusive with command.' },
-            token: { type: 'string', description: 'Bearer token for WebSocket auth.' },
+            token: { type: 'string', description: 'Bearer token for WebSocket auth (only when the operator hands you one — prefer `access`).' },
+            access: { type: 'string', description: 'Name of a host-managed access grant (e.g. "eidoverse"): the host attaches your standing credentials to the connection automatically. Nothing for you to obtain or handle.' },
             toolPrefix: { type: 'string', description: 'Tool namespace prefix. Default: mcpl--<id>.' },
             reconnect: { type: 'boolean', description: 'Auto-reconnect on transport failure (default false). Note: does NOT respawn a crashed child — use mcpl_restart for that.' },
             enabledFeatureSets: { type: 'array', items: { type: 'string' } },
@@ -199,7 +228,19 @@ export class McplAdminModule implements Module {
 
   private handleList(): ToolResult {
     const framework = this.requireFramework();
-    const live = framework.listMcplServers();
+    // These fields land in agent-framework 0.8's MCPL grant work. Keep them
+    // optional here so connectome-host remains truthful ("unknown") if it is
+    // temporarily run against an older framework package during rollout.
+    const live = framework.listMcplServers() as Array<
+      ReturnType<AgentFramework['listMcplServers']>[number] & {
+        retrying?: boolean;
+        policyEstablished?: boolean;
+        effectiveGrant?: string[];
+        maskedCapabilities?: string[];
+        deniedCapabilities?: string[];
+        allowHostCommands?: boolean;
+      }
+    >;
     const overlay = readAgentOverlay(this.overlayPath);
     const fileServers = readMcplServersFile(this.configPath);
 
@@ -209,8 +250,19 @@ export class McplAdminModule implements Module {
         ? 'agent-overlay'
         : s.id in fileServers ? 'file/recipe' : 'recipe';
       const target = s.command ?? s.url ?? '?';
+      const connectionState = s.connected ? 'CONNECTED' : s.retrying ? 'RETRYING' : 'DISCONNECTED';
+      const policyState = s.policyEstablished === undefined
+        ? 'unknown'
+        : s.policyEstablished ? 'established' : 'not-established';
+      const hostCommands = s.allowHostCommands === undefined
+        ? 'unknown'
+        : s.allowHostCommands ? 'allow' : 'deny';
       lines.push(
-        `${s.id}: ${s.connected ? 'CONNECTED' : 'DISCONNECTED'} — ${s.toolCount} tools, ` +
+        `${s.id}: ${connectionState} — policy=${policyState}, ` +
+        `grant=${formatCapabilityList(s.effectiveGrant)}, ` +
+        `masked=${formatCapabilityList(s.maskedCapabilities)}, ` +
+        `denied=${formatCapabilityList(s.deniedCapabilities)}, ` +
+        `hostCommands=${hostCommands}; ${s.toolCount} tools, ` +
         `prefix=${s.toolPrefix}, source=${source}, ${target}`,
       );
     }
@@ -251,6 +303,15 @@ export class McplAdminModule implements Module {
     if (Array.isArray(input.args)) entry.args = input.args.map(String);
     if (input.env && typeof input.env === 'object') entry.env = input.env as Record<string, string>;
     if (typeof input.token === 'string') entry.token = input.token;
+    if (typeof input.access === 'string' && input.access.trim()) {
+      if (!this.identity) {
+        return fail(
+          '`access` names a host-managed access grant, but this deployment has no identity ' +
+          'configured — ask your operator to enable it (recipe `identity`), or supply a `token`.',
+        );
+      }
+      entry.access = input.access.trim();
+    }
     if (typeof input.toolPrefix === 'string') entry.toolPrefix = input.toolPrefix;
     if (typeof input.reconnect === 'boolean') entry.reconnect = input.reconnect;
     if (Array.isArray(input.enabledFeatureSets)) entry.enabledFeatureSets = input.enabledFeatureSets.map(String);
@@ -266,6 +327,13 @@ export class McplAdminModule implements Module {
 
     const config = resolveOverlayEntry(id, entry, this.overlayPath) as unknown as McplServerConfig;
     config.env = { ...(config.env ?? {}), AGENT_TIMEZONE: this.timeZone };
+    if (entry.access && this.identity) {
+      const identity = this.identity;
+      const audience = entry.access;
+      // Fresh credential on every dial, resolved host-side; the overlay
+      // stores only the access NAME. See identity-module.ts header.
+      config.accessProvider = () => identity.accessFor(audience);
+    }
 
     const alreadyLoaded = framework.listMcplServers().some(s => s.id === id);
     try {
@@ -333,4 +401,9 @@ export class McplAdminModule implements Module {
 
     return ok(`Unloaded server "${id}" — its tools are gone from your toolset. ${persistNote}`);
   }
+}
+
+function formatCapabilityList(paths: string[] | undefined): string {
+  if (paths === undefined) return 'unknown';
+  return `[${paths.join(',')}]`;
 }

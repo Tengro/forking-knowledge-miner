@@ -36,6 +36,7 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'summaryContextLabel',
   'witnessedBeforeSequence',
   'witnessedInstruction',
+  'identityReminder',
 ];
 
 export function buildFrameworkStrategy(
@@ -86,6 +87,27 @@ export function buildFrameworkStrategy(
   // opts out; frontdesk keeps its historical hierarchical renderer default.
   if (strategyType === 'autobiographical' && autobiographicalOpts.adaptiveResolution === undefined) {
     autobiographicalOpts.adaptiveResolution = true;
+  }
+
+  // Reasonable memory defaults for recipes that omit strategy tuning:
+  //
+  // - foldingStrategy 'kv-stable': the library's own fallback is
+  //   'flat-profile', which replans compile layouts without regard for
+  //   prompt-cache stability. Long-lived agents want cache-stable folds by
+  //   default; recipes can still pin 'flat-profile'/'oldest-first' explicitly.
+  //   (Only meaningful under adaptive resolution, so gate on it.)
+  // - summaryParticipant <agent name>: the library falls back to the literal
+  //   'Claude', which voices self-recollections as a stranger for any agent
+  //   not named Claude. Summaries should speak as the agent itself.
+  if (
+    strategyType === 'autobiographical' &&
+    autobiographicalOpts.adaptiveResolution !== false &&
+    autobiographicalOpts.foldingStrategy === undefined
+  ) {
+    autobiographicalOpts.foldingStrategy = 'kv-stable';
+  }
+  if (autobiographicalOpts.summaryParticipant === undefined && recipe.agent.name) {
+    autobiographicalOpts.summaryParticipant = recipe.agent.name;
   }
 
   return strategyType === 'passthrough'

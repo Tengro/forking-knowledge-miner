@@ -37,6 +37,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
+import { buildRetrievalModuleConfig } from './retrieval-config.js';
 import type { RecipeWorkspaceMount } from './recipe.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
@@ -46,6 +47,7 @@ import { SubscriptionGcModule } from './modules/subscription-gc-module.js';
 import { ChannelModeModule } from './modules/channel-mode-module.js';
 import { WebUiModule } from './modules/web-ui-module.js';
 import { ObserversModule } from './modules/observers-module.js';
+import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
 import { TtsRelayModule } from './modules/tts-relay-module.js';
 import { loadMcplServers, applyAgentOverlay, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
@@ -62,7 +64,7 @@ import {
   parseRecipeArg,
 } from './recipe.js';
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
-import { buildFrameworkAgentConfig } from './framework-agent-config.js';
+import { buildFrameworkAgentConfig, membraneCachingOverride } from './framework-agent-config.js';
 import { buildFrameworkStrategy } from './framework-strategy.js';
 import { loadExtensions } from './extensions.js';
 
@@ -146,6 +148,11 @@ async function resolveRecipe(): Promise<Recipe> {
 // Framework factory
 // ---------------------------------------------------------------------------
 
+function resolveModel(recipe: Recipe): string {
+  return config.model || recipe.agent.model ||
+    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+}
+
 async function createFramework(
   membrane: Membrane,
   storePath: string,
@@ -154,8 +161,7 @@ async function createFramework(
   settingsModule: SettingsModule,
   callLedger: CallLedger | null,
 ): Promise<AgentFramework> {
-  const model = config.model || recipe.agent.model ||
-    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+  const model = resolveModel(recipe);
   const modules = recipe.modules ?? {};
   const timeZone = resolveTimeZone(recipe.agent.timezone);
 
@@ -169,9 +175,10 @@ async function createFramework(
   // adapter can read its state for cross-cutting concerns like reasoning).
   const moduleInstances: Module[] = [new TuiModule(), new TimeModule(timeZone), settingsModule];
 
-  // Subagents
+  // Subagents. OPT-IN — not part of the standard recipe; enable explicitly
+  // via modules.subagents when an agent should fork parallel workers.
   let subagentModule: SubagentModule | null = null;
-  if (modules.subagents !== false) {
+  if (modules.subagents) {
     const subagentConfig = typeof modules.subagents === 'object' ? modules.subagents : {};
     subagentModule = new SubagentModule({
       parentAgentName: agentName,
@@ -181,9 +188,10 @@ async function createFramework(
     moduleInstances.push(subagentModule);
   }
 
-  // Lessons
+  // Lessons. OPT-IN — not part of the standard recipe; enable explicitly via
+  // modules.lessons for agents that curate a lesson library.
   let lessonsModule: LessonsModule | null = null;
-  if (modules.lessons !== false) {
+  if (modules.lessons) {
     const globalLessonsPath = resolve(join(storePath, '..', '..', 'lessons.json'));
     lessonsModule = new LessonsModule({ globalPath: globalLessonsPath });
     moduleInstances.push(lessonsModule);
@@ -219,14 +227,14 @@ async function createFramework(
     moduleInstances.push(new FleetModule(fleetModuleConfig));
   }
 
-  // Retrieval (requires lessons)
-  if (modules.retrieval !== false && lessonsModule) {
-    const retrievalConfig = typeof modules.retrieval === 'object' ? modules.retrieval : {};
-    moduleInstances.push(new RetrievalModule({
-      membrane,
-      retrievalModel: retrievalConfig.model,
-      maxInjectedLessons: retrievalConfig.maxInjected,
-    }));
+  // Retrieval (requires lessons). OPT-IN — not part of the standard recipe:
+  // it injects context-dependent content into every compile (plus up to two
+  // configured retrieval-model calls), which adds per-turn context churn.
+  // Enable explicitly only when an agent actually curates a lesson library.
+  if (modules.retrieval && lessonsModule) {
+    moduleInstances.push(new RetrievalModule(
+      buildRetrievalModuleConfig(membrane, modules.retrieval, recipe.agent.provider),
+    ));
   }
 
   // Gate config — core AF EventGate feature.
@@ -332,9 +340,25 @@ async function createFramework(
   // MCPL self-administration — opt-in per recipe (grants the agent the
   // ability to spawn arbitrary commands via mcpl_deploy; see recipe.ts).
   let mcplAdminModule: McplAdminModule | null = null;
-  if (modules.mcplAdmin === true) {
-    mcplAdminModule = new McplAdminModule({ timeZone });
+  if (modules.mcplAdmin === true || typeof modules.mcplAdmin === 'object') {
+    const surface = typeof modules.mcplAdmin === 'object' ? modules.mcplAdmin.surface : undefined;
+    mcplAdminModule = new McplAdminModule({ timeZone, ...(surface ? { surface } : {}) });
     moduleInstances.push(mcplAdminModule);
+  }
+
+  // Archipelago identity — opt-in per recipe. Utilities-only: enrollment is
+  // one-time and token refresh is rare, so it costs no tool slots (see
+  // identity-module.ts header). Keypair lives at the dataDir level — an
+  // identity belongs to the deployment, not the session.
+  let identityModule: IdentityModule | null = null;
+  if (modules.identity !== undefined && modules.identity !== false) {
+    const idCfg = typeof modules.identity === 'object' ? modules.identity : {};
+    identityModule = new IdentityModule({
+      keyPath: process.env.IDENTITY_KEY_FILE || resolve(config.dataDir, 'identity-key.pem'),
+      home: idCfg.home ?? process.env.IDENTITY_HOME ?? 'id.animalabs.ai',
+      ...(idCfg.audience ? { defaultAudience: idCfg.audience } : {}),
+    });
+    moduleInstances.push(identityModule);
   }
 
   // Web admin UI — opt-in per recipe
@@ -356,7 +380,10 @@ async function createFramework(
       ...(callLedger ? { callLedger } : {}),
     });
     moduleInstances.push(webUiModule);
-    moduleInstances.push(new ObserversModule({ path: observersPath }));
+    moduleInstances.push(new ObserversModule({
+      path: observersPath,
+      ...(webuiConfig.observersSurface ? { surface: webuiConfig.observersSurface } : {}),
+    }));
   }
 
   // TTS relay tap — opt-in per recipe. Pure trace-bus consumer: mirrors the
@@ -415,6 +442,7 @@ async function createFramework(
       if (recipeEntry.url !== undefined) merged.url = recipeEntry.url;
       if (recipeEntry.transport !== undefined) merged.transport = recipeEntry.transport;
       if (recipeEntry.token !== undefined) merged.token = recipeEntry.token;
+      if (recipeEntry.access !== undefined) merged.access = recipeEntry.access;
       allServers.push(merged as { id: string; command?: string; url?: string; [k: string]: unknown });
     } else if (recipeEntry.command || recipeEntry.url) {
       // Recipe-defined server (not in the file config). Spread ALL recipe fields
@@ -426,12 +454,30 @@ async function createFramework(
   // Apply the agent overlay (mcpl-servers.agent.json): servers the agent
   // deployed for itself load unconditionally (no recipe opt-in), and
   // tombstones suppress recipe/file servers the agent unloaded.
-  const finalServers = applyAgentOverlay(allServers, DEFAULT_AGENT_OVERLAY_PATH).map((server) => ({
-    ...server,
-    // Stdio MCPL children inherit a single agent-facing wall clock. Protocol
-    // timestamps remain UTC; only their rendered text uses this setting.
-    env: { ...(server.env ?? {}), AGENT_TIMEZONE: timeZone },
-  }));
+  const finalServers = applyAgentOverlay(allServers, DEFAULT_AGENT_OVERLAY_PATH).map((server) => {
+    const withEnv: { id: string; command?: string; url?: string; [k: string]: unknown } = {
+      ...server,
+      // Stdio MCPL children inherit a single agent-facing wall clock. Protocol
+      // timestamps remain UTC; only their rendered text uses this setting.
+      env: { ...(server.env ?? {}), AGENT_TIMEZONE: timeZone },
+    };
+    // `access` is a declarative name (recipe/file/overlay); the credential
+    // provider it implies is attached HERE, at load time — fresh credential
+    // per dial via the identity module, never serialized, never in model
+    // context (see identity-module.ts header).
+    if (typeof withEnv.access === 'string' && withEnv.access) {
+      if (identityModule) {
+        const identity = identityModule;
+        const audience = withEnv.access as string;
+        withEnv.accessProvider = () => identity.accessFor(audience);
+      } else {
+        console.error(
+          `[mcpl] server "${server.id}": access "${withEnv.access}" declared but the recipe has no identity module — connecting without credentials`,
+        );
+      }
+    }
+    return withEnv;
+  });
 
   // No server augmentation needed — gate is wired via FrameworkConfig.gate
 
@@ -513,6 +559,7 @@ agents: [agentConfig],
 
   if (mcplAdminModule) {
     mcplAdminModule.setFramework(framework);
+    if (identityModule) mcplAdminModule.setIdentity(identityModule);
   }
 
   if (workspaceModule) {
@@ -827,13 +874,18 @@ async function main() {
         xTitle: recipe.agent.name ?? recipe.name,
       })
     : undefined;
-  // Bedrock: legacy Claude models (3.5 Sonnet 0620/1022, Opus 3) that have
-  // left the Anthropic API but survive on AWS. The adapter reads AWS_* env
-  // vars (AWS_REGION defaults us-west-2) and maps standard Claude model IDs
-  // to Bedrock IDs (explicit map + `anthropic.<id>-v1:0` fallback). Uses the
-  // Anthropic-native message shape, so NativeFormatter applies unchanged.
-  // No CallLedger: prompt caching is rejected outright by legacy Bedrock
-  // models (tested 2026-07-21). Wrapped for llm-calls.jsonl visibility.
+  // Bedrock: an alternate Claude transport. (Historically for models that
+  // left the direct API — as of 2026-07-31 every 3.5-era id and opus-4-0514
+  // are EOL on Bedrock too, so what actually runs here is the 4-era via
+  // inference profiles.) The adapter reads AWS_* env vars (AWS_REGION
+  // defaults us-west-2) and maps standard Claude model IDs to Bedrock IDs.
+  // Uses the Anthropic-native message shape, so NativeFormatter applies
+  // unchanged. Prompt caching is model-gated
+  // (bedrockModelSupportsPromptCaching): pre-GA families (Claude 3,
+  // 3.5 Sonnet) off, everything currently invokable caches — verified by
+  // live probe 2026-07-31. Still no CallLedger — it's
+  // anthropic-transport-only for now; cache metrics are visible in
+  // llm-calls.jsonl via the logging wrapper.
   const bedrockAdapter = provider === 'bedrock'
     ? new LoggingBedrockAdapter({}, llmLogPath)
     : undefined;
@@ -915,10 +967,13 @@ async function main() {
       : recipe.agent.formatter === 'anthropic-xml'
         ? new AnthropicXmlFormatter()
         : new NativeFormatter(),
-    // Bedrock legacy Claude models 400 on any cache_control block
-    // ("your request did not allow prompt caching") — suppress the
-    // historical promptCaching=true default on that transport.
-    ...(provider === 'bedrock' ? { defaultPromptCaching: false } : {}),
+    // Caching default for internal callers (autobio compression,
+    // executeMerge), which read Membrane's defaultPromptCaching rather
+    // than the per-agent flag. Applies on EVERY provider whenever the
+    // recipe/model resolves an explicit answer — an Anthropic recipe with
+    // promptCaching:false must disable internal calls too, and on bedrock
+    // the model gate decides (see bedrockModelSupportsPromptCaching).
+    ...membraneCachingOverride(recipe, resolveModel(recipe)),
     // Anchor the assistant role for internal callers that don't set
     // request.assistantParticipant themselves (autobio compression,
     // executeMerge). Mismatch here flips stored assistant turns to

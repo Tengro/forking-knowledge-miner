@@ -37,6 +37,10 @@ import {
 export interface ObserversModuleConfig {
   /** Absolute path to the grant file (same one the webui watches). */
   path: string;
+  /** 'tools' (default) or 'utilities' — grant edits are rare; behind the
+   *  `utils` meta-tool they stop costing three schemas per inference. The
+   *  consent semantics are unchanged either way: the agent holds the pen. */
+  surface?: 'tools' | 'utilities';
 }
 
 export class ObserversModule implements Module {
@@ -48,6 +52,14 @@ export class ObserversModule implements Module {
   async stop(): Promise<void> {}
 
   getTools(): ToolDefinition[] {
+    return (this.config.surface ?? 'tools') === 'tools' ? this.definitions() : [];
+  }
+
+  getUtilities(): ToolDefinition[] {
+    return this.config.surface === 'utilities' ? this.definitions() : [];
+  }
+
+  private definitions(): ToolDefinition[] {
     return [
       {
         name: 'get',

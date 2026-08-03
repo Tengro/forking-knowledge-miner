@@ -27,6 +27,14 @@ export interface ServerFileEntry {
   disabledTools?: string[];
   /** @deprecated One-time migration input for legacy installations. */
   channelSubscription?: 'auto' | 'manual' | string[];
+  /**
+   * Name of a network access grant (an archipelago audience, e.g.
+   * "eidoverse"). Purely declarative here: at load/deploy time the host
+   * attaches a credential provider that fetches something fresh on every
+   * dial via the identity module. The agent (and this file) never holds a
+   * credential — `access` is a name, not a secret.
+   */
+  access?: string;
 }
 
 export interface McplServersFile {

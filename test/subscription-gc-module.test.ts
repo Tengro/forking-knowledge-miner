@@ -291,3 +291,155 @@ describe('system pins (pin_channel_idle_limit)', () => {
     expect(bad2.success).toBe(false);
   });
 });
+
+describe('close provenance + explicit-open protection (issue #5)', () => {
+  test('closes carry source subscription-gc; default budget certifies no lease', async () => {
+    const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
+    const { ctx, toolCalls } = mockCtx();
+    await m.start(ctx);
+
+    await m.onProcess(ambient('c1', 'abcdefghijkl'), PS); // 12 > 10 → close
+    expect(toolCalls.length).toBe(1);
+    expect(toolCalls[0].input.source).toBe('subscription-gc');
+    expect(toolCalls[0].input.overrideExplicitOpen).toBe(false);
+
+    await m.stop();
+  });
+
+  test('a configured numeric budget is an explicit lease: overrideExplicitOpen true', async () => {
+    const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
+    const { ctx, toolCalls } = mockCtx();
+    await m.start(ctx);
+
+    await m.handleToolCall({
+      id: 't1',
+      name: 'set_channel_idle_limit',
+      input: { channelId: 'discord:g1:c1', limit: 8 },
+    });
+    await m.onProcess(ambient('c1', 'abcdefghij'), PS); // 10 > 8 → close under lease
+    expect(toolCalls.length).toBe(1);
+    expect(toolCalls[0].input.overrideExplicitOpen).toBe(true);
+
+    await m.stop();
+  });
+
+  test('a structural explicit-open refusal stands down without a retry loop', async () => {
+    const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
+    const { ctx, toolCalls, getState } = mockCtx();
+    (ctx as unknown as { callTool: unknown }).callTool = async (call: { name: string; input: Record<string, unknown> }) => {
+      toolCalls.push(call);
+      return {
+        success: false,
+        isError: false,
+        error: 'explicitly opened',
+        data: { refusal: 'explicit-open' },
+      };
+    };
+    await m.start(ctx);
+
+    const r = await m.onProcess(ambient('c1', 'abcdefghijkl'), PS); // 12 > 10
+    expect(toolCalls.length).toBe(1);
+    // No context spam, no counter restore: the janitor stands down and the
+    // next attempt is at least a full budget away.
+    expect(r.addMessages).toBeUndefined();
+    const counters = (getState() as { counters: Record<string, number> }).counters;
+    expect(counters['discord:g1:c1']).toBeUndefined();
+
+    // Next ambient message counts from zero rather than instantly re-firing.
+    await m.onProcess(ambient('c1', 'ab'), PS);
+    expect(toolCalls.length).toBe(1);
+
+    await m.stop();
+  });
+
+  test('a successful close emits a privacy-minimal ops receipt when notifyOps exists', async () => {
+    const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
+    const { ctx } = mockCtx();
+    const receipts: Array<{ kind: string; agent: string; message: string; data?: Record<string, unknown> }> = [];
+    // The mock is deliberately `this`-sensitive, like the real
+    // ModuleContextImpl.notifyOps (which reads this.registry): a detached
+    // `const f = ctx.notifyOps; f(...)` throws here instead of passing —
+    // the exact bug class Sol caught in the first revision.
+    Object.assign(ctx as object, {
+      getAgents: () => [{ name: 'mythos' }],
+      _receipts: receipts,
+      notifyOps(
+        this: { _receipts: typeof receipts },
+        kind: string,
+        agent: string,
+        message: string,
+        data?: Record<string, unknown>,
+      ) {
+        this._receipts.push({ kind, agent, message, data });
+      },
+    });
+    await m.start(ctx);
+
+    await m.onProcess(ambient('c1', 'abcdefghijkl'), PS);
+    expect(receipts.length).toBe(1);
+    expect(receipts[0].kind).toBe('subscription-gc-close');
+    expect(receipts[0].agent).toBe('mythos');
+    expect(receipts[0].data).toMatchObject({
+      channelId: 'discord:g1:c1',
+      limitChars: 10,
+      decisionSource: 'subscription-gc',
+      lease: 'default',
+    });
+    // Privacy-minimal: the receipt names ids and thresholds, never content.
+    expect(receipts[0].message).not.toContain('abcdef');
+
+    await m.stop();
+  });
+
+  test('a configured-budget close reports lease configured-budget, claiming no actor', async () => {
+    const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
+    const { ctx } = mockCtx();
+    const receipts: Array<{ message: string; data?: Record<string, unknown> }> = [];
+    Object.assign(ctx as object, {
+      getAgents: () => [{ name: 'mythos' }],
+      _receipts: receipts,
+      notifyOps(
+        this: { _receipts: typeof receipts },
+        _kind: string,
+        _agent: string,
+        message: string,
+        data?: Record<string, unknown>,
+      ) {
+        this._receipts.push({ message, data });
+      },
+    });
+    await m.start(ctx);
+
+    await m.handleToolCall({
+      id: 't1',
+      name: 'set_channel_idle_limit',
+      input: { channelId: 'discord:g1:c1', limit: 8 },
+    });
+    await m.onProcess(ambient('c1', 'abcdefghij'), PS); // 10 > 8
+    expect(receipts.length).toBe(1);
+    // The override state records no actor (agent, operator, or imported are
+    // all possible) — the receipt must not claim 'agent-set'.
+    expect(receipts[0].data?.lease).toBe('configured-budget');
+    expect(receipts[0].message).toContain('configured per-channel budget');
+    expect(receipts[0].message).not.toContain('agent-set');
+
+    await m.stop();
+  });
+
+  test('an ordinary close failure still restores the counter for retry', async () => {
+    const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
+    const { ctx, toolCalls, getState } = mockCtx();
+    (ctx as unknown as { callTool: unknown }).callTool = async (call: { name: string; input: Record<string, unknown> }) => {
+      toolCalls.push(call);
+      return { success: false, error: 'server unreachable', isError: true };
+    };
+    await m.start(ctx);
+
+    await m.onProcess(ambient('c1', 'abcdefghijkl'), PS);
+    expect(toolCalls.length).toBe(1);
+    const counters = (getState() as { counters: Record<string, number> }).counters;
+    expect(counters['discord:g1:c1']).toBe(12);
+
+    await m.stop();
+  });
+});

@@ -71,16 +71,19 @@ export interface RecipeStrategy {
   /** kv-stable: quality-gap override threshold (§13.4). Default 0.35. */
   kvStableQualityGapRatio?: number;
   compressionSlackRatio?: number;
+  /** Adaptive-resolution fold planner. The host defaults this to 'kv-stable'
+   *  (cache-stable compile plans; see buildFrameworkStrategy) — set explicitly
+   *  only to opt into the legacy planners. */
   foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
   speculativeProduction?: boolean;
   /** L1 production holdback: keep the newest N closed chunks out of the
    *  speculative compression queue (default 1); demand still overrides. */
   l1HoldbackChunks?: number;
-  // Self-voice / compression framing. When the agent's name differs from
-  // 'Claude' (the strategy default for summaryParticipant), these MUST be set
-  // (especially summaryParticipant: <agent.name>) — otherwise self-recollections
-  // are stored under a stranger's participant and surface in the compiled prompt
-  // as another voice speaking in first person about the agent.
+  // Self-voice / compression framing. The host defaults summaryParticipant to
+  // `agent.name` (buildFrameworkStrategy), so self-recollections speak as the
+  // agent itself. Set explicitly only to voice summaries as someone else —
+  // a mismatched participant surfaces in the compiled prompt as another voice
+  // speaking in first person about the agent.
   summaryParticipant?: string;
   summarySystemPrompt?: string;
   summaryUserPrompt?: string;
@@ -92,6 +95,11 @@ export interface RecipeStrategy {
   /** Override wording for the witnessed-record instruction ({targetTokens}
    *  substituted). */
   witnessedInstruction?: string;
+  /** Identity reminder appended to every compression/merge instruction.
+   *  For agents in multi-resident channels (and older models especially):
+   *  names the agent and directs attribution so pure-witness chunks don't
+   *  flip the summarizer into another speaker's identity. */
+  identityReminder?: string;
 }
 
 export interface RecipeAgent {
@@ -121,8 +129,18 @@ export interface RecipeAgent {
    *  ContextManager default (100k) applies. Raise for large-context models. */
   contextBudgetTokens?: number;
   /** Prompt-cache TTL ('5m' | '1h') forwarded to the provider. Defaults to
-   *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads. */
+   *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads.
+   *  Not forwarded on bedrock — that transport only has the default 5m
+   *  cache and rejects the ttl field. */
   cacheTtl?: '5m' | '1h';
+  /**
+   * Explicit prompt-caching override. Unset means provider-appropriate
+   * default: on for everything except bedrock models that predate caching
+   * support there (see bedrockModelSupportsPromptCaching). Set false if a
+   * transport/account rejects cache_control markers — AWS's "your request
+   * did not allow prompt caching" can also be account/region-dependent.
+   */
+  promptCaching?: boolean;
   /**
    * Same-round routing policy for ordinary text emitted beside think().
    * Omitted preserves the compatibility carry-forward in Agent Framework.
@@ -150,6 +168,13 @@ export interface RecipeAgent {
   thinking?: {
     enabled: boolean;
     budgetTokens?: number;
+    /** 'enabled' (explicit budget, legacy) or 'adaptive' (model-managed;
+     * required by opus-4-7+ / fable-5 era models). */
+    type?: 'enabled' | 'adaptive';
+    /** 'summarized' returns readable reasoning summaries in `thinking`;
+     * 'omitted' returns empty text + signature only. Models 4.7+ default
+     * to 'omitted' server-side. */
+    display?: 'summarized' | 'omitted';
   };
   /** OpenAI Responses settings. Reasoning applies to both OpenAI providers;
    * compaction and serviceTier are API-key transport settings. */
@@ -188,6 +213,12 @@ export interface RecipeMcpServer {
   transport?: 'stdio' | 'websocket';
   /** Bearer token for WebSocket auth (appended as ?token= query param). */
   token?: string;
+  /**
+   * Name of a host-managed access grant (archipelago audience, e.g.
+   * "eidoverse"). Requires the `identity` module. The host resolves fresh
+   * credentials per dial; neither the recipe nor the agent holds one.
+   */
+  access?: string;
   toolPrefix?: string;
   enabledFeatureSets?: string[];
   disabledFeatureSets?: string[];
@@ -382,9 +413,32 @@ export interface RecipeWorkspaceMount {
 }
 
 export interface RecipeModules {
+  /**
+   * Subagent forking (spawn/fork parallel agents). OPT-IN — defaults to off
+   * and is not part of the standard recipe.
+   */
   subagents?: boolean | { defaultModel?: string; defaultMaxTokens?: number };
+  /**
+   * Lesson library (persistent knowledge store + lesson tools). OPT-IN —
+   * defaults to off and is not part of the standard recipe.
+   */
   lessons?: boolean;
-  retrieval?: boolean | { model?: string; maxInjected?: number };
+  /**
+   * Lesson retrieval-injection (requires `lessons`). OPT-IN — defaults to off
+   * and is deliberately not part of the standard recipe: it injects
+   * context-dependent content into every compile and spends up to two
+   * configured retrieval-model calls. Enable only for agents that actually
+   * curate a lesson library.
+   */
+  retrieval?: boolean | {
+    model?: string;
+    maxInjected?: number;
+    /**
+     * Optional OpenAI Responses/Codex reasoning effort for both retrieval calls.
+     * Requires an explicit retrieval model.
+     */
+    reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  };
   wake?: boolean | import('@animalabs/agent-framework').GateConfig;
   workspace?: boolean | { mounts: RecipeWorkspaceMount[]; configMount?: boolean };
   /**
@@ -404,8 +458,23 @@ export interface RecipeModules {
    *
    * SECURITY: `mcpl_deploy` spawns arbitrary commands as the host user —
    * enabling this module means trusting the agent with code execution.
+   *
+   * `{ surface: 'utilities' }` keeps the module but parks its four tools
+   * behind the framework's single `utils` meta-tool (mcpl management is
+   * rare; it needn't cost four schemas on every inference). `true` keeps
+   * the historical first-class surface.
    */
-  mcplAdmin?: boolean;
+  mcplAdmin?: boolean | { surface?: 'tools' | 'utilities' };
+
+  /**
+   * The agent's own archipelago-home identity (connectome docs/home-node.md):
+   * an ed25519 keypair in the data dir, enrolled at the home node via an
+   * operator invite, exchanged for fresh aid1 audience tokens on demand.
+   * Utilities-only (`utils run identity--status/enroll/token`) — costs no
+   * tool slots. `home` defaults to id.animalabs.ai; `audience` is the
+   * default for `token` calls.
+   */
+  identity?: boolean | { home?: string; audience?: string };
   /**
    * Cross-process child fleet.  When true (shorthand), FleetModule is attached
    * with no pre-configured children.  When an object, declares children the
@@ -485,6 +554,13 @@ export interface RecipeModules {
 export interface RecipeWebUi {
   port?: number;
   host?: string;
+  /**
+   * Where the observer grant tools (observers--get/grant/revoke) surface:
+   * 'tools' (default, historical) or 'utilities' (behind the `utils`
+   * meta-tool — grant edits are rare). Consent semantics unchanged: the
+   * agent holds the pen either way.
+   */
+  observersSurface?: 'tools' | 'utilities';
   /**
    * Basic-Auth credentials. Required whenever the bind host is non-loopback
    * (which is the default). `${VAR}`-substitutable from .env.
@@ -651,13 +727,13 @@ export const DEFAULT_RECIPE: Recipe = {
       'You are a helpful assistant. You have access to tools provided by connected MCP servers.',
       'Use them to help the user with their tasks.',
       '',
-      'You can fork subagents for parallel work, create persistent notes, and write files to `products/` as outputs of your work.',
+      'You can create persistent notes and write files to `products/` as outputs of your work.',
     ].join('\n'),
   },
   modules: {
-    subagents: true,
-    lessons: true,
-    retrieval: true,
+    // subagents + lessons + retrieval deliberately omitted — all opt-in only
+    // (retrieval additionally adds per-turn context churn + retrieval-model costs);
+    // see the RecipeModules field docs.
     wake: true,
     workspace: true,
   },
@@ -914,6 +990,12 @@ export function validateRecipe(raw: unknown): Recipe {
   }
   agent.cacheTtl ??= '1h';
 
+  if (agent.promptCaching !== undefined && typeof agent.promptCaching !== 'boolean') {
+    throw new Error(
+      `Recipe agent.promptCaching must be a boolean, got ${JSON.stringify(agent.promptCaching)}.`,
+    );
+  }
+
   if (
     agent.sameRoundThinkTextPolicy !== undefined &&
     agent.sameRoundThinkTextPolicy !== 'public' &&
@@ -937,6 +1019,12 @@ export function validateRecipe(raw: unknown): Recipe {
     }
     if (thinking.budgetTokens !== undefined && (typeof thinking.budgetTokens !== 'number' || thinking.budgetTokens <= 0)) {
       throw new Error('Recipe agent.thinking.budgetTokens must be a positive number.');
+    }
+    if (thinking.type !== undefined && thinking.type !== 'enabled' && thinking.type !== 'adaptive') {
+      throw new Error('Recipe agent.thinking.type must be "enabled" or "adaptive".');
+    }
+    if (thinking.display !== undefined && thinking.display !== 'summarized' && thinking.display !== 'omitted') {
+      throw new Error('Recipe agent.thinking.display must be "summarized" or "omitted".');
     }
     if (thinking.enabled === true && typeof thinking.budgetTokens === 'number' && typeof agent.maxTokens === 'number') {
       if (thinking.budgetTokens >= agent.maxTokens) {
@@ -1178,6 +1266,43 @@ export function validateRecipe(raw: unknown): Recipe {
         if (m.mode !== undefined && m.mode !== 'read-write' && m.mode !== 'read-only') {
           throw new Error(`workspace.mounts[${i}].mode must be "read-write" or "read-only"`);
         }
+      }
+    }
+
+    // Validate retrieval provider reasoning when configured.
+    const retrieval = mods.retrieval;
+    if (retrieval !== undefined && typeof retrieval !== 'boolean') {
+      if (!retrieval || typeof retrieval !== 'object' || Array.isArray(retrieval)) {
+        throw new Error('Recipe modules.retrieval must be a boolean or object.');
+      }
+      const retrievalConfig = retrieval as Record<string, unknown>;
+      if (retrievalConfig.reasoningContext !== undefined) {
+        throw new Error(
+          'modules.retrieval.reasoningContext is not supported: retrieval model calls ' +
+          'are independent one-shot requests with no earlier reasoning items.',
+        );
+      }
+      const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+      if (retrievalConfig.reasoningEffort !== undefined &&
+          (typeof retrievalConfig.reasoningEffort !== 'string'
+            || !efforts.includes(retrievalConfig.reasoningEffort))) {
+        throw new Error(`Invalid modules.retrieval.reasoningEffort ${JSON.stringify(retrievalConfig.reasoningEffort)}.`);
+      }
+      if (retrievalConfig.reasoningEffort !== undefined
+          && agent.provider !== 'openai-responses'
+          && agent.provider !== 'openai-codex') {
+        throw new Error(
+          'modules.retrieval.reasoningEffort requires agent.provider ' +
+          '"openai-responses" or "openai-codex".',
+        );
+      }
+      if (retrievalConfig.reasoningEffort !== undefined
+          && (typeof retrievalConfig.model !== 'string'
+            || !retrievalConfig.model.trim())) {
+        throw new Error(
+          'modules.retrieval.model must be a non-empty string when ' +
+          'modules.retrieval.reasoningEffort is configured.',
+        );
       }
     }
 

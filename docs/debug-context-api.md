@@ -75,8 +75,8 @@ The trade-off is fidelity: the default response **omits the dynamically
 gathered injections** (lessons, retrieval results, MCPL `beforeInference`
 context), because gathering those is *not* free or transparent:
 
-- module `gatherContext` can run inference — e.g. the retrieval module makes
-  Haiku calls, which cost tokens and add latency;
+- module `gatherContext` can run inference — e.g. the retrieval module makes configured model calls, which cost tokens and add
+  latency;
 - MCPL `beforeInference` hooks are arbitrary RPCs to external servers with
   side effects, and a preview never sends the paired `afterInference`, which
   can leave a stateful server half-open.

@@ -38,6 +38,7 @@ const BASIC_USER = 'admin';
 const BASIC_PASS = 'open-sesame';
 
 let handle: ServerHandle;
+let webUiModule: WebUiModule;
 
 function basicAuthHeader(user: string, pass: string): string {
   return `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
@@ -59,13 +60,13 @@ beforeAll(async () => {
 
   // Bun.serve supports port=0 → OS picks a free port; we read it back from
   // the server. Avoids collisions when the test harness retries.
-  const mod = new WebUiModule({
+  webUiModule = new WebUiModule({
     port: 0,
     host: '127.0.0.1',
     basicAuth: { username: BASIC_USER, password: BASIC_PASS },
     staticDir: staticRoot,
   });
-  await mod.start({} as ModuleContext);
+  await webUiModule.start({} as ModuleContext);
 
   const port = __getSharedServerPortForTests();
   if (!port) throw new Error('webui server not bound; did start() succeed?');
@@ -74,7 +75,7 @@ beforeAll(async () => {
     port,
     staticRoot,
     cleanup: async () => {
-      await mod.stop();
+      await webUiModule.stop();
       await __resetSharedServerForTests();
       rmSync(tmp, { recursive: true, force: true });
       rmSync(sibling, { recursive: true, force: true });
@@ -123,6 +124,191 @@ describe('WebUiModule HTTP', () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain('console.log');
+  });
+
+  test('retrieval trace routes require auth and expose the in-memory viewer', async () => {
+    for (const path of ['/debug/retrieval', '/debug/retrieval/view']) {
+      const unauthenticated = await fetch(`http://127.0.0.1:${handle.port}${path}`);
+      expect(unauthenticated.status).toBe(401);
+      expect(unauthenticated.headers.get('cache-control')).toBe('no-store');
+    }
+
+    const headers = { authorization: basicAuthHeader(BASIC_USER, BASIC_PASS) };
+    const unbound = await fetch(`http://127.0.0.1:${handle.port}/debug/retrieval`, { headers });
+    expect(unbound.status).toBe(503);
+    expect(unbound.headers.get('cache-control')).toBe('no-store');
+    expect(await unbound.json()).toEqual({ error: 'app not bound yet' });
+
+    const viewer = await fetch(`http://127.0.0.1:${handle.port}/debug/retrieval/view`, { headers });
+    expect(viewer.status).toBe(200);
+    expect(viewer.headers.get('cache-control')).toBe('no-store');
+    const viewerHtml = await viewer.text();
+    expect(viewerHtml).toContain('Retrieval traces');
+    expect(viewerHtml).toContain('Selected lessons');
+    expect(viewerHtml).toContain('Candidate lessons');
+    expect(viewerHtml).toContain('Raw JSON (diagnostic)');
+    expect(viewerHtml).toContain("'agent: ' + (trace.agentName || 'unknown')");
+    expect(viewerHtml).toContain("reasoning ? reasoning.effort : 'default'");
+    expect(viewerHtml).not.toContain('reasoning.context');
+    expect(viewerHtml).toContain('node.textContent = String(text)');
+    expect(viewerHtml).not.toContain('.innerHTML');
+    expect(viewerHtml).not.toContain('\\u201C');
+    expect(viewerHtml).not.toContain('\\u201D');
+
+    const signIn = await fetch(`http://127.0.0.1:${handle.port}/auth/basic`, {
+      headers,
+      redirect: 'manual',
+    });
+    const cookie = (signIn.headers.get('set-cookie') ?? '').split(';', 1)[0];
+    expect(signIn.status).toBe(302);
+    expect(cookie.startsWith('fkm_obs=')).toBe(true);
+
+    const sessionJson = await fetch(`http://127.0.0.1:${handle.port}/debug/retrieval`, {
+      headers: { cookie },
+    });
+    expect(sessionJson.status).toBe(503);
+    expect(sessionJson.headers.get('cache-control')).toBe('no-store');
+    const sessionViewer = await fetch(
+      `http://127.0.0.1:${handle.port}/debug/retrieval/view`,
+      { headers: { cookie } },
+    );
+    expect(sessionViewer.status).toBe(200);
+    expect(sessionViewer.headers.get('cache-control')).toBe('no-store');
+  });
+
+  test('bound retrieval JSON is no-store, redacted by default, and inputs require exact 1', async () => {
+    let observedOptions: { limit?: number; includeInputs?: boolean } | undefined;
+    const malicious = '</script><img src=x onerror="globalThis.pwned=true">';
+    const retrieval = {
+      name: 'retrieval',
+      getRetrievalTraces: (options: { limit?: number; includeInputs?: boolean } = {}) => {
+        observedOptions = options;
+        return [{
+          schemaVersion: 1,
+          id: 1,
+          startedAt: '2026-07-31T00:00:00.000Z',
+          agentName: 'test-agent',
+          config: {
+            model: 'test-retrieval-model',
+            requestedReasoning: { effort: 'high' },
+            minConfidence: 0.3,
+            maxCandidates: 20,
+            maxInjectedLessons: 5,
+          },
+          context: {
+            hash: 'abc', messageCount: 1, messageIds: ['m1'],
+            ...(options.includeInputs ? { input: 'private recent conversation' } : {}),
+          },
+          cache: { hit: false },
+          candidates: [{
+            id: 'malicious-lesson', content: malicious, confidence: 0.9,
+            tags: [malicious], evidence: [], created: 1, updated: 1,
+            deprecated: false, matches: [],
+          }],
+          relevantLessonIds: [],
+          injected: { lessonIds: [], lessons: [] },
+          outcome: 'no-concepts',
+        }];
+      },
+    };
+    const framework = {
+      getAllAgents: () => [],
+      getAllModules: () => [retrieval],
+      getSessionUsage: () => { throw new Error('no usage in HTTP harness'); },
+      onTrace: () => {},
+    };
+    webUiModule.setApp({ framework } as never);
+
+    const headers = { authorization: basicAuthHeader(BASIC_USER, BASIC_PASS) };
+    try {
+      const defaultRes = await fetch(
+        `http://127.0.0.1:${handle.port}/debug/retrieval?limit=7`, { headers },
+      );
+      expect(defaultRes.status).toBe(200);
+      expect(defaultRes.headers.get('cache-control')).toBe('no-store');
+      const defaultBody = await defaultRes.json() as Record<string, unknown>;
+      expect(defaultBody.enabled).toBe(true);
+      expect(defaultBody.includeInputs).toBe(false);
+      expect(JSON.stringify(defaultBody)).not.toContain('private recent conversation');
+      const returnedTraces = defaultBody.traces as Array<{
+        candidates: Array<{ content: string }>;
+      }>;
+      expect(returnedTraces[0].candidates[0].content).toBe(malicious);
+      expect(observedOptions).toEqual({ limit: 7, includeInputs: false });
+
+      const viewerRes = await fetch(
+        `http://127.0.0.1:${handle.port}/debug/retrieval/view`, { headers },
+      );
+      const viewerHtml = await viewerRes.text();
+      // Static viewer markup does not inline trace data; dynamic values use text sinks.
+      expect(viewerHtml).not.toContain(malicious);
+      expect(viewerHtml).toContain('textContent');
+      expect(viewerHtml).not.toContain('.innerHTML');
+
+      for (const alias of ['true', 'yes', '01']) {
+        const res = await fetch(
+          `http://127.0.0.1:${handle.port}/debug/retrieval?includeInputs=${alias}`, { headers },
+        );
+        const body = await res.json() as Record<string, unknown>;
+        expect(body.includeInputs).toBe(false);
+        expect(JSON.stringify(body)).not.toContain('private recent conversation');
+      }
+
+      const exactRes = await fetch(
+        `http://127.0.0.1:${handle.port}/debug/retrieval?includeInputs=1`, { headers },
+      );
+      const exactBody = await exactRes.json() as Record<string, unknown>;
+      expect(exactBody.includeInputs).toBe(true);
+      expect(JSON.stringify(exactBody)).toContain('private recent conversation');
+      expect(observedOptions).toEqual({ limit: 20, includeInputs: true });
+    } finally {
+      await webUiModule.stop();
+    }
+  });
+
+  test('bound app without retrieval reports tracing disabled', async () => {
+    const framework = {
+      getAllAgents: () => [],
+      getAllModules: () => [],
+      getSessionUsage: () => { throw new Error('no usage in HTTP harness'); },
+      onTrace: () => {},
+    };
+    webUiModule.setApp({ framework } as never);
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/debug/retrieval`, {
+        headers: { authorization: basicAuthHeader(BASIC_USER, BASIC_PASS) },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(await res.json()).toEqual({
+        schemaVersion: 1, enabled: false, includeInputs: false, traces: [],
+      });
+    } finally {
+      await webUiModule.stop();
+    }
+  });
+
+  test('retrieval JSON errors are also no-store', async () => {
+    const framework = {
+      getAllAgents: () => [],
+      getAllModules: () => [{
+        name: 'retrieval',
+        getRetrievalTraces: () => { throw new Error('trace listing failed'); },
+      }],
+      getSessionUsage: () => { throw new Error('no usage in HTTP harness'); },
+      onTrace: () => {},
+    };
+    webUiModule.setApp({ framework } as never);
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/debug/retrieval`, {
+        headers: { authorization: basicAuthHeader(BASIC_USER, BASIC_PASS) },
+      });
+      expect(res.status).toBe(500);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(await res.json()).toEqual({ error: 'trace listing failed' });
+    } finally {
+      await webUiModule.stop();
+    }
   });
 
   // Path containment: a request for /../<sibling-of-staticRoot>/secret.txt
