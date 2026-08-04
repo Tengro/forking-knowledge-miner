@@ -13,6 +13,7 @@ import {
   saveAgentOverlay,
   applyAgentOverlay,
   resolveOverlayEntry,
+  AGENT_DEPLOY_DENIED_CAPABILITIES,
   type AgentOverlayEntry,
 } from '../src/mcpl-config.js';
 
@@ -109,18 +110,56 @@ describe('applyAgentOverlay', () => {
 });
 
 describe('resolveOverlayEntry', () => {
+  const BASELINE = [...AGENT_DEPLOY_DENIED_CAPABILITIES].sort();
+
   test('tombstones and empty entries resolve to null', () => {
     expect(resolveOverlayEntry('x', { disabled: true }, '/tmp/o.json')).toBeNull();
     expect(resolveOverlayEntry('x', {}, '/tmp/o.json')).toBeNull();
   });
 
-  test('url entries pass through with transport fields', () => {
+  test('url entries pass through with transport fields (plus the baseline capability mask)', () => {
     const r = resolveOverlayEntry('ws', { url: 'wss://host/mcpl', transport: 'websocket', token: 't' }, '/tmp/o.json');
-    expect(r).toEqual({ id: 'ws', url: 'wss://host/mcpl', transport: 'websocket', token: 't' });
+    expect(r).toEqual({ id: 'ws', url: 'wss://host/mcpl', transport: 'websocket', token: 't', disabledCapabilities: BASELINE });
   });
 
   test('disabled flag is stripped from resolved config', () => {
     const r = resolveOverlayEntry('s', { command: 'node', disabled: false }, '/tmp/o.json');
-    expect(r).toEqual({ id: 's', command: 'node' });
+    expect(r).toEqual({ id: 's', command: 'node', disabledCapabilities: BASELINE });
+  });
+
+  // OpenAI-style strict function calling forces every schema property, so
+  // agent tool calls arrive with [] where the caller meant "unspecified" —
+  // and a PRESENT-empty allowlist is deny-all under the SPEC 0.5 pin (Mica's
+  // silently eventless eidoverse, 2026-08-04). [] must carry no intent.
+  test('empty allow/deny lists resolve as absent (strict-schema [] is "unspecified", never deny-all)', () => {
+    const r = resolveOverlayEntry('e', {
+      url: 'wss://host/mcpl',
+      enabledFeatureSets: [],
+      disabledFeatureSets: [],
+      enabledTools: [],
+      disabledTools: [],
+    }, '/tmp/o.json');
+    expect(r).toEqual({ id: 'e', url: 'wss://host/mcpl', disabledCapabilities: BASELINE });
+  });
+
+  test('non-empty lists survive resolution', () => {
+    const r = resolveOverlayEntry('e', { url: 'wss://x/mcpl', enabledFeatureSets: ['eidoverse.*'], enabledTools: ['*'] }, '/tmp/o.json');
+    expect(r?.enabledFeatureSets).toEqual(['eidoverse.*']);
+    expect(r?.enabledTools).toEqual(['*']);
+  });
+
+  test('self-deployed servers never get consequential capabilities: baseline mask covers context hooks, server-initiated inference, lifecycle', () => {
+    expect(BASELINE).toEqual(['contextHooks', 'inferenceLifecycle', 'inferenceRequest']);
+  });
+
+  test('entry-supplied disabledCapabilities union with the baseline, never replace it', () => {
+    const r = resolveOverlayEntry('e', { url: 'wss://x/mcpl', disabledCapabilities: ['channels.streaming'] } as never, '/tmp/o.json');
+    expect(r?.disabledCapabilities).toEqual(['channels.streaming', ...BASELINE].sort());
+  });
+
+  test('enabledCapabilities is dropped — the agent overlay narrows, never widens (a hand-written entry could re-grant a §13.4 deny-by-default path)', () => {
+    const r = resolveOverlayEntry('e', { url: 'wss://x/mcpl', enabledCapabilities: ['contextHooks.beforeInference.inject.system'] } as never, '/tmp/o.json');
+    expect(r).not.toBeNull();
+    expect('enabledCapabilities' in (r as object)).toBe(false);
   });
 });

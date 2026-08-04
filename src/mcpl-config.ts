@@ -135,9 +135,56 @@ export function saveAgentOverlay(
 }
 
 /**
+ * Capabilities an agent-deployed server is never granted by default: the
+ * consequential surfaces — context hooks (observation of and injection into
+ * the agent's own inference), server-initiated inference, and inference
+ * lifecycle. Bare parents on purpose: the config mask's subtree matching
+ * denies everything beneath them, present and future (afterInference, undo,
+ * state land under these the day the vocabulary grows them). A world/chat
+ * server needs none of this — channels + tools is the whole job. An operator
+ * who wants a self-deployed server to hold one of these moves the server
+ * into the recipe, where `enabledCapabilities` is theirs to write.
+ */
+export const AGENT_DEPLOY_DENIED_CAPABILITIES: readonly string[] = [
+  'contextHooks',
+  'inferenceRequest',
+  'inferenceLifecycle',
+];
+
+/** The allow/deny list fields where an EMPTY array carries no intent (see
+ *  resolveOverlayEntry — OpenAI strict function calling forces every schema
+ *  property, so agent tool calls arrive with `[]` meaning "unspecified"). */
+const OVERLAY_LIST_FIELDS = [
+  'enabledFeatureSets',
+  'disabledFeatureSets',
+  'enabledTools',
+  'disabledTools',
+] as const;
+
+/**
  * Resolve an overlay entry into a server config object (id + fields, relative
  * `./`/`../` args resolved against the overlay file's directory). Returns
  * null for tombstones and entries with neither command nor url.
+ *
+ * The overlay is the AGENT's file, so resolution is also where host policy
+ * for self-deployed servers lives (applied at boot AND at deploy — existing
+ * files heal without a re-deploy):
+ *
+ *  - Empty allow/deny lists are treated as absent. OpenAI-style strict
+ *    function calling forces every schema property, so GPT-family residents
+ *    calling mcpl_deploy emit `[]` where they meant "unspecified" — and for
+ *    the allowlists PRESENT-empty is deny-all under the §5.3 pin (Mica's
+ *    silently eventless eidoverse, 2026-08-04). An agent that truly wants
+ *    deny-all says `disabledTools: ["*"]` / `disabledFeatureSets: ["*"]`.
+ *
+ *  - `enabledCapabilities` is dropped: the agent's file can narrow, never
+ *    widen — a hand-written entry here could re-grant §13.4 deny-by-default
+ *    paths.
+ *
+ *  - `disabledCapabilities` always carries at least
+ *    AGENT_DEPLOY_DENIED_CAPABILITIES (unioned with anything the entry
+ *    already denies): self-deployed servers get channels + tools and
+ *    nothing consequential by default.
  */
 export function resolveOverlayEntry(
   id: string,
@@ -148,9 +195,19 @@ export function resolveOverlayEntry(
   if (!entry.command && !entry.url) return null;
   const overlayDir = dirname(resolve(overlayPath));
   const { disabled: _d, ...fields } = entry;
+  const rec = fields as Record<string, unknown>;
+  for (const k of OVERLAY_LIST_FIELDS) {
+    if (Array.isArray(rec[k]) && (rec[k] as unknown[]).length === 0) delete rec[k];
+  }
+  delete rec.enabledCapabilities;
+  const denied = new Set<string>([
+    ...AGENT_DEPLOY_DENIED_CAPABILITIES,
+    ...(Array.isArray(rec.disabledCapabilities) ? (rec.disabledCapabilities as unknown[]).map(String) : []),
+  ]);
   return {
     id,
-    ...fields,
+    ...rec,
+    disabledCapabilities: [...denied].sort(),
     ...(entry.args
       ? {
           args: entry.args.map(arg =>

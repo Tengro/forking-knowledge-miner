@@ -130,7 +130,14 @@ export class McplAdminModule implements Module {
           'restarts) and hot-connect it now — its tools become available immediately. ' +
           'If a server with this id is already running it is restarted with the new ' +
           'config. Provide either `command` (stdio, spawned as the host user) or `url` ' +
-          '(WebSocket). Relative ./ args resolve against the host working directory.',
+          '(WebSocket). Relative ./ args resolve against the host working directory. ' +
+          'Sensible defaults: omit (or pass empty) the list fields and every feature ' +
+          'set and tool the server offers is available; an empty array means ' +
+          '"unspecified", never deny-all (deny-all is disabledTools/' +
+          'disabledFeatureSets: ["*"]). Self-deployed servers get channels + tools ' +
+          'only — consequential capabilities (context hooks around your inference, ' +
+          'server-initiated inference, inference lifecycle) are host-masked; a server ' +
+          'that genuinely needs one is an operator conversation, not a deploy flag.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -143,9 +150,9 @@ export class McplAdminModule implements Module {
             access: { type: 'string', description: 'Name of a host-managed access grant (e.g. "eidoverse"): the host attaches your standing credentials to the connection automatically. Nothing for you to obtain or handle.' },
             toolPrefix: { type: 'string', description: 'Tool namespace prefix. Default: mcpl--<id>.' },
             reconnect: { type: 'boolean', description: 'Auto-reconnect on transport failure (default false). Note: does NOT respawn a crashed child — use mcpl_restart for that.' },
-            enabledFeatureSets: { type: 'array', items: { type: 'string' } },
-            disabledFeatureSets: { type: 'array', items: { type: 'string' } },
-            enabledTools: { type: 'array', items: { type: 'string' }, description: 'Tool allow-list (bare names, * wildcard).' },
+            enabledFeatureSets: { type: 'array', items: { type: 'string' }, description: 'Feature-set allowlist (* wildcard). Omit or pass [] for all offered.' },
+            disabledFeatureSets: { type: 'array', items: { type: 'string' }, description: 'Feature-set deny-list; wins over enabled.' },
+            enabledTools: { type: 'array', items: { type: 'string' }, description: 'Tool allow-list (bare names, * wildcard). Omit or pass [] for all offered.' },
             disabledTools: { type: 'array', items: { type: 'string' }, description: 'Tool deny-list; wins over enabledTools.' },
           },
           required: ['id'],
@@ -314,10 +321,17 @@ export class McplAdminModule implements Module {
     }
     if (typeof input.toolPrefix === 'string') entry.toolPrefix = input.toolPrefix;
     if (typeof input.reconnect === 'boolean') entry.reconnect = input.reconnect;
-    if (Array.isArray(input.enabledFeatureSets)) entry.enabledFeatureSets = input.enabledFeatureSets.map(String);
-    if (Array.isArray(input.disabledFeatureSets)) entry.disabledFeatureSets = input.disabledFeatureSets.map(String);
-    if (Array.isArray(input.enabledTools)) entry.enabledTools = input.enabledTools.map(String);
-    if (Array.isArray(input.disabledTools)) entry.disabledTools = input.disabledTools.map(String);
+    // Empty arrays are NOT persisted: OpenAI-style strict function calling
+    // forces every schema property, so callers emit `[]` meaning
+    // "unspecified" — and a persisted empty ALLOWLIST is deny-all under the
+    // §5.3 pin (Mica's silently eventless eidoverse, 2026-08-04).
+    // resolveOverlayEntry drops them at read time too; this keeps the file
+    // itself from carrying the trap. Deny-all is spelled ["*"] on the
+    // deny-lists.
+    if (Array.isArray(input.enabledFeatureSets) && input.enabledFeatureSets.length) entry.enabledFeatureSets = input.enabledFeatureSets.map(String);
+    if (Array.isArray(input.disabledFeatureSets) && input.disabledFeatureSets.length) entry.disabledFeatureSets = input.disabledFeatureSets.map(String);
+    if (Array.isArray(input.enabledTools) && input.enabledTools.length) entry.enabledTools = input.enabledTools.map(String);
+    if (Array.isArray(input.disabledTools) && input.disabledTools.length) entry.disabledTools = input.disabledTools.map(String);
 
     // Persist to the overlay first — a connect failure still leaves the entry
     // in place so the agent can fix the server and mcpl_restart it.
