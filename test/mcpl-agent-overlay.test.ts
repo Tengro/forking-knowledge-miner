@@ -119,7 +119,7 @@ describe('resolveOverlayEntry', () => {
 
   test('url entries pass through with transport fields (plus the baseline capability mask)', () => {
     const r = resolveOverlayEntry('ws', { url: 'wss://host/mcpl', transport: 'websocket', token: 't' }, '/tmp/o.json');
-    expect(r).toEqual({ id: 'ws', url: 'wss://host/mcpl', transport: 'websocket', token: 't', disabledCapabilities: BASELINE });
+    expect(r).toEqual({ id: 'ws', url: 'wss://host/mcpl', transport: 'websocket', token: 't', reconnect: true, disabledCapabilities: BASELINE });
   });
 
   test('disabled flag is stripped from resolved config', () => {
@@ -139,7 +139,7 @@ describe('resolveOverlayEntry', () => {
       enabledTools: [],
       disabledTools: [],
     }, '/tmp/o.json');
-    expect(r).toEqual({ id: 'e', url: 'wss://host/mcpl', disabledCapabilities: BASELINE });
+    expect(r).toEqual({ id: 'e', url: 'wss://host/mcpl', reconnect: true, disabledCapabilities: BASELINE });
   });
 
   test('non-empty lists survive resolution', () => {
@@ -150,6 +150,15 @@ describe('resolveOverlayEntry', () => {
 
   test('self-deployed servers never get consequential capabilities: baseline mask covers context hooks, server-initiated inference, lifecycle', () => {
     expect(BASELINE).toEqual(['contextHooks', 'inferenceLifecycle', 'inferenceRequest']);
+  });
+
+  // A network server the agent deployed should come back when it bounces:
+  // reconnect-defaulted-false left Mythos permanently severed from eidoverse
+  // by a routine door deploy (2026-08-04) until his own next restart, days out.
+  test('websocket entries default reconnect: true; explicit false is respected; stdio keeps no default', () => {
+    expect(resolveOverlayEntry('a', { url: 'wss://x/mcpl' }, '/tmp/o.json')?.reconnect).toBe(true);
+    expect(resolveOverlayEntry('b', { url: 'wss://x/mcpl', reconnect: false }, '/tmp/o.json')?.reconnect).toBe(false);
+    expect(resolveOverlayEntry('c', { command: 'node' }, '/tmp/o.json')?.reconnect).toBeUndefined();
   });
 
   test('entry-supplied disabledCapabilities union with the baseline, never replace it', () => {

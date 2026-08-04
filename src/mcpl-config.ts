@@ -200,6 +200,16 @@ export function resolveOverlayEntry(
     if (Array.isArray(rec[k]) && (rec[k] as unknown[]).length === 0) delete rec[k];
   }
   delete rec.enabledCapabilities;
+  // A network server the agent deployed should come back when it bounces.
+  // reconnect defaulted to false, so an entry that never said `reconnect:
+  // true` was severed PERMANENTLY by any server restart — with no signal to
+  // anyone — until the agent's own next restart, which for a long-lived
+  // resident is days away (Mythos, eventless in eidoverse after the
+  // 2026-08-04 door deploy). Websocket entries now default to reconnect
+  // unless the entry explicitly says false. Stdio entries keep the old
+  // default: reconnect does not respawn a dead child anyway (mcpl_restart
+  // is that path), so `true` there would promise something it can't do.
+  if (entry.url && rec.reconnect === undefined) rec.reconnect = true;
   const denied = new Set<string>([
     ...AGENT_DEPLOY_DENIED_CAPABILITIES,
     ...(Array.isArray(rec.disabledCapabilities) ? (rec.disabledCapabilities as unknown[]).map(String) : []),
