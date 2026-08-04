@@ -2065,6 +2065,7 @@ const COMMANDS: CommandHint[] = [
   { name: '/restore', blurb: 'switch to checkpoint' },
   { name: '/undo', blurb: 'revert before last agent turn' },
   { name: '/redo', blurb: 're-apply last undone action' },
+  { name: '/nudge', blurb: 'run inference on current context, no new events' },
   { name: '/history', blurb: 'recent messages' },
   { name: '/lessons', blurb: 'list active lessons' },
   { name: '/export', blurb: 'export lessons to ./output/' },

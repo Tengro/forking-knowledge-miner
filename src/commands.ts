@@ -4,6 +4,7 @@
  * Commands:
  *   /undo          — Revert to state before last agent turn
  *   /redo          — Re-apply last undone action
+ *   /nudge [agent] — Run inference on current context (no new events)
  *   /checkpoint N  — Save current state as named checkpoint
  *   /restore N     — Branch from checkpoint, switch to it
  *   /branches      — List all Chronicle branches
@@ -147,6 +148,7 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
           { text: '  /export                Export lessons to ./output/ (JSON + markdown)', style: 'system' },
           { text: '  /undo                  Revert last agent turn', style: 'system' },
           { text: '  /redo                  Re-apply undone action', style: 'system' },
+          { text: '  /nudge [agent]         Run inference on current context (no new events)', style: 'system' },
           { text: '  /checkpoint <name>     Save current state', style: 'system' },
           { text: '  /restore <name>        Restore to checkpoint', style: 'system' },
           { text: '  /branches              List Chronicle branches', style: 'system' },
@@ -188,6 +190,9 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
 
     case 'undo':
       return handleUndo(app);
+
+    case 'nudge':
+      return handleNudge(app, args[0]);
 
     case 'redo':
       return handleRedo(app);
@@ -648,6 +653,28 @@ export function handleExport(app: AppContext): CommandResult {
       { text: `  ${jsonPath}`, style: 'system' },
       { text: `  ${mdPath}`, style: 'system' },
     ],
+  };
+}
+
+/**
+ * /nudge [agent] — admin-level: queue an inference turn on the agent's
+ * CURRENT context without adding any message or event (framework
+ * `nudgeAgent`). The zero-pollution complement to /undo: rewind, then nudge,
+ * and the agent takes another swing at exactly what it already sees.
+ */
+function handleNudge(app: AppContext, agentName?: string): CommandResult {
+  const r = app.framework.nudgeAgent(agentName, 'host-console');
+  if (!r.ok) {
+    return { lines: [{ text: `Nudge failed: ${r.error}`, style: 'system' }] };
+  }
+  const when = r.agentStatus === 'idle'
+    ? 'running now'
+    : `queued — runs when current turn settles (agent is ${r.agentStatus})`;
+  return {
+    lines: [{
+      text: `Nudged ${r.agentName}: inference on current context, no new events (${when}).`,
+      style: 'system',
+    }],
   };
 }
 
