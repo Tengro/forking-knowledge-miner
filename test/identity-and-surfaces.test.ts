@@ -124,6 +124,52 @@ describe('identity module', () => {
     expect(badPath.success).toBe(false);
   });
 
+  it('request: binary responses are described safely or saved byte-exactly to workspace', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f]);
+    let saved: { path: string; data: Buffer; mime: string } | null = null;
+    const mod = new IdentityModule({
+      keyPath: join(dir, 'k.pem'),
+      home: 'id.test',
+      services: { orrery: 'https://orrery.test' },
+      fetchImpl: (async (url: any) => {
+        const u = String(url);
+        if (u.includes('/enroll')) return new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
+        if (u.includes('/token')) return new Response(JSON.stringify({ token: 'aid1.fresh.secret' }), { status: 200 });
+        if (u === 'https://orrery.test/api/assets/img/file') {
+          return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+        }
+        return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } });
+      }) as typeof fetch,
+    });
+    await mod.handleToolCall(call('accept_invite', { invite: 'i', name: 'A' }));
+
+    const described = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/assets/img/file' }));
+    expect(described.success).toBe(true);
+    expect((described.data as any).body).toBe(null);
+    expect((described.data as any).binary).toMatchObject({ size: png.length, contentType: 'image/png' });
+    expect(JSON.stringify(described.data)).not.toContain('�PNG');
+
+    await mod.start({
+      getModule: (name: string) => name === 'workspace' ? {
+        writeBinary: async (path: string, data: Buffer, mime: string) => {
+          saved = { path, data: Buffer.from(data), mime };
+          return { success: true, data: { path, size: data.length, mimeType: mime } };
+        },
+      } : null,
+    } as any);
+    const written = await mod.handleToolCall(call('request', {
+      service: 'orrery', path: '/api/assets/img/file', saveAs: 'files/artifacts/candidate.png',
+    }));
+    expect(written.success).toBe(true);
+    expect((written.data as any).saved).toMatchObject({
+      path: 'files/artifacts/candidate.png', size: png.length, contentType: 'image/png',
+    });
+    expect(saved?.path).toBe('files/artifacts/candidate.png');
+    expect(saved?.mime).toBe('image/png');
+    expect(saved?.data.equals(png)).toBe(true);
+  });
+
   it('host-facing accessFor: requires registration, then exchanges per call', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ident-'));
     let mints = 0;

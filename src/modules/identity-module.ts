@@ -33,6 +33,7 @@ import {
   createPublicKey,
   generateKeyPairSync,
   sign as cryptoSign,
+  createHash,
   type KeyObject,
 } from 'node:crypto';
 import type {
@@ -41,6 +42,7 @@ import type {
   ToolCall,
   ToolResult,
   ToolDefinition,
+  WorkspaceModule,
 } from '@animalabs/agent-framework';
 
 export interface IdentityModuleConfig {
@@ -72,6 +74,7 @@ const DEFAULT_SERVICES: Record<string, string> = {
 
 const REQUEST_BODY_MAX = 256 * 1024;
 const RESPONSE_INLINE_MAX = 24 * 1024;
+const RESPONSE_BODY_MAX = 64 * 1024 * 1024;
 
 /** Persisted beside the key after a successful registration. */
 interface IdentityRecord {
@@ -96,8 +99,10 @@ export class IdentityModule implements Module {
     this.recordPath = config.keyPath.replace(/\.pem$/, '') + '.json';
   }
 
-  async start(_ctx: ModuleContext): Promise<void> {}
-  async stop(): Promise<void> {}
+  private ctx: ModuleContext | null = null;
+
+  async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+  async stop(): Promise<void> { this.ctx = null; }
 
   getTools(): ToolDefinition[] {
     return []; // utilities-only, by design — see module header
@@ -118,7 +123,8 @@ export class IdentityModule implements Module {
         description:
           'Call a connected service’s API (e.g. "orrery") with your standing access ' +
           'attached by the host — nothing for you to obtain, renew, or handle; renewal ' +
-          'is automatic. Give the service name and a path; returns {status, body}.',
+          'is automatic. Give the service name and a path; returns {status, body}. ' +
+          'For binary responses, pass saveAs with a workspace path (e.g. files/artifacts/image.png).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -126,6 +132,7 @@ export class IdentityModule implements Module {
             path: { type: 'string', description: 'API path starting with "/", e.g. "/api/ops".' },
             method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'Default GET.' },
             body: { type: 'object', description: 'JSON body for POST/PUT.' },
+            saveAs: { type: 'string', description: 'Optional workspace path for the raw response bytes, e.g. files/artifacts/image.png. Required to retrieve binary bodies without loss.' },
           },
           required: ['service', 'path'],
         },
@@ -156,7 +163,7 @@ export class IdentityModule implements Module {
         case 'accept_invite':
           return await this.acceptInvite(call.input as { invite?: unknown; name?: unknown });
         case 'request':
-          return await this.request(call.input as { service?: unknown; path?: unknown; method?: unknown; body?: unknown });
+          return await this.request(call.input as { service?: unknown; path?: unknown; method?: unknown; body?: unknown; saveAs?: unknown });
         default:
           return fail(`Unknown identity utility: ${call.name}`);
       }
@@ -285,6 +292,7 @@ export class IdentityModule implements Module {
     path?: unknown;
     method?: unknown;
     body?: unknown;
+    saveAs?: unknown;
   }): Promise<ToolResult> {
     const services = { ...DEFAULT_SERVICES, ...this.config.services };
     const service = typeof input.service === 'string' ? input.service : '';
@@ -319,13 +327,55 @@ export class IdentityModule implements Module {
         },
         ...(bodyStr !== undefined ? { body: bodyStr } : {}),
       });
-      const text = await res.text();
-      let body: unknown = text;
-      try {
-        body = JSON.parse(text);
-      } catch {
-        /* not JSON — return as text */
+      const bytes = Buffer.from(await res.arrayBuffer());
+      if (bytes.byteLength > RESPONSE_BODY_MAX) {
+        return fail(`response too large (${bytes.byteLength} > ${RESPONSE_BODY_MAX})`);
       }
+      const declaredType = res.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() || '';
+      const contentType = declaredType || 'application/octet-stream';
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
+
+      if (typeof input.saveAs === 'string' && input.saveAs.length > 0) {
+        const workspace = this.ctx?.getModule<WorkspaceModule>('workspace');
+        if (!workspace) return fail('identity request: workspace module is not available for saveAs');
+        const written = await workspace.writeBinary(input.saveAs, bytes, contentType);
+        if (!written.success) return fail(`identity request: could not save response: ${written.error ?? 'unknown'}`);
+        return ok({
+          status: res.status,
+          saved: { path: input.saveAs, size: bytes.byteLength, contentType, sha256 },
+        });
+      }
+
+      const text = bytes.toString('utf8');
+      let parsed: unknown;
+      let parsedJson = false;
+      try {
+        parsed = JSON.parse(text);
+        parsedJson = true;
+      } catch {
+        /* not JSON */
+      }
+      const textual = declaredType.startsWith('text/')
+        || declaredType === 'application/json'
+        || declaredType.endsWith('+json')
+        || declaredType === 'application/xml'
+        || declaredType.endsWith('+xml')
+        // Some tiny internal/fake services omit content-type on JSON. A full
+        // successful parse is a safer fallback than treating valid JSON as
+        // opaque bytes; arbitrary binary almost never parses as one JSON value.
+        || (!declaredType && parsedJson);
+      if (!textual) {
+        return ok({
+          status: res.status,
+          body: null,
+          binary: {
+            size: bytes.byteLength, contentType, sha256,
+            note: 'Binary response omitted from text context; repeat the request with saveAs to write it byte-exactly to a workspace mount.',
+          },
+        });
+      }
+
+      let body: unknown = parsedJson ? parsed : text;
       const raw = typeof body === 'string' ? body : JSON.stringify(body);
       if (raw.length > RESPONSE_INLINE_MAX) {
         body = `${raw.slice(0, RESPONSE_INLINE_MAX)}… [truncated ${raw.length - RESPONSE_INLINE_MAX} chars]`;
