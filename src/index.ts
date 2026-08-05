@@ -274,6 +274,7 @@ async function createFramework(
           watch: m.watch ?? 'never', // FKM: no chokidar watchers by default
         };
         if (m.ignore) mount.ignore = m.ignore;
+        if (m.maxFileSize !== undefined) mount.maxFileSize = m.maxFileSize;
         if (m.wakeOnChange !== undefined) mount.wakeOnChange = m.wakeOnChange;
         if (m.autoMaterialize !== undefined) mount.autoMaterialize = m.autoMaterialize;
         return mount;

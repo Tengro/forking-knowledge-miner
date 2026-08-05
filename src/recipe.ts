@@ -392,8 +392,9 @@ export interface RecipeCredentialFileField {
 
 /**
  * Subset of MountConfig exposed to recipes.
- * Intentionally omits watchDebounceMs, followSymlinks, and maxFileSize —
- * these are implementation details best left to framework defaults.
+ * Intentionally omits watchDebounceMs and followSymlinks. The maximum file
+ * size is operator-configurable because binary service artifacts may
+ * legitimately exceed the conservative framework default.
  */
 export interface RecipeWorkspaceMount {
   name: string;
@@ -401,6 +402,8 @@ export interface RecipeWorkspaceMount {
   mode?: 'read-write' | 'read-only';
   watch?: 'always' | 'on-agent-action' | 'never';
   ignore?: string[];
+  /** Maximum file size in bytes (defaults to the framework's 5 MiB limit). */
+  maxFileSize?: number;
   /**
    * Request inference when files in this mount change. Pair with
    * `watch: 'always'` so chokidar actually observes the mount.
