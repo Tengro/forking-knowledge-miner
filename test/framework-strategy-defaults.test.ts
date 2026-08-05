@@ -61,6 +61,25 @@ describe('standard-recipe memory defaults', () => {
     expect(config.foldingStrategy).toBeUndefined();
   });
 
+  test('productionBudgetTokens is passed through exactly and omission stays omitted', () => {
+    const configured = buildFrameworkStrategy(
+      recipe({
+        name: 'Mira',
+        strategy: { type: 'autobiographical', productionBudgetTokens: 123_456 },
+      }),
+      'some-model',
+      'America/Los_Angeles',
+    );
+    expect(configView(configured).productionBudgetTokens).toBe(123_456);
+
+    const omitted = buildFrameworkStrategy(
+      recipe({ name: 'Mira', strategy: { type: 'autobiographical' } }),
+      'some-model',
+      'America/Los_Angeles',
+    );
+    expect(configView(omitted).productionBudgetTokens).toBeUndefined();
+  });
+
   test('explicit recipe values override the defaults', () => {
     const strategy = buildFrameworkStrategy(
       recipe({
